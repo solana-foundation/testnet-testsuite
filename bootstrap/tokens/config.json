@@ -1,0 +1,9 @@
+[
+  {
+    "mainnetPubkey": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_USDC_MINT"
+  }
+]

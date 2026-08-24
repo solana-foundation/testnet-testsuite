@@ -1,0 +1,22 @@
+{
+  "name": "testnet-testsuite",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bootstrap:tokens": "tsx bootstrap/tokens/deploy.ts",
+    "bootstrap:tokens:local": "tsx bootstrap/tokens/deploy.ts --mainnet-rpc http://localhost:8899 --testnet-rpc http://localhost:7899",
+    "surfpool:mainnet": "surfpool start",
+    "surfpool:testnet": "surfpool start --rpc-url https://api.testnet.solana.com --port 7899 --ws-port 7900",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "prettier": "^3.6.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}
