@@ -1,0 +1,130 @@
+# Base config for all services. Profile files (local.toml, testnet.toml) override
+# per-cluster values; env vars override everything (MTM_RPC__HTTP_URL=... etc).
+
+[rpc]
+http_url = "http://127.0.0.1:8899"
+ws_url = "ws://127.0.0.1:8900"
+commitment = "confirmed"
+
+# --- oracle service -----------------------------------------------------------
+
+[oracle]
+listen_addr = "127.0.0.1:8080"
+metrics_addr = "127.0.0.1:9100"
+
+[oracle.hermes]
+base_url = "https://hermes.pyth.network"
+poll_interval_ms = 1000
+# Hermes requires an API key since the 2026-08-26 Pyth upgrade — set via env:
+# MTM_ORACLE__HERMES__API_KEY (Bearer token from pythdata.app)
+
+# CoinGecko: reference-grade aggregator (floats, minutes-fresh, no conf).
+# Demo tier = 10k calls/MONTH; the 5-min default batches all ids in one call
+# (~8.6k/month). Optional key via env: MTM_ORACLE__COINGECKO__API_KEY.
+[oracle.coingecko]
+poll_interval_ms = 300000
+
+# Binance: real-time top-of-book websocket — keyless, no monthly caps.
+# Book updates coalesce to one tick per symbol per flush interval.
+[oracle.binance]
+flush_interval_ms = 250
+
+[oracle.pusher]
+enabled = false # parked — see docs/testnet-oracle-strategy.md
+
+# Real market-data inputs. Pyth feed ids (hex, no 0x prefix):
+# https://pyth.network/price-feeds
+[[oracle.underlyings]]
+symbol = "SOL/USD"
+pyth_feed_id = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"
+
+[[oracle.underlyings]]
+symbol = "BTC/USD"
+pyth_feed_id = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
+
+[[oracle.underlyings]]
+symbol = "ETH/USD"
+pyth_feed_id = "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+
+[[oracle.underlyings]]
+symbol = "SOLCG/USD"
+coingecko_id = "solana"
+
+# USDT-quoted (≈USD) — real-time top of book
+[[oracle.underlyings]]
+symbol = "SOL/USDT"
+binance_symbol = "SOLUSDT"
+
+[[oracle.underlyings]]
+symbol = "BTC/USDT"
+binance_symbol = "BTCUSDT"
+
+[[oracle.underlyings]]
+symbol = "ETH/USDT"
+binance_symbol = "ETHUSDT"
+
+# --- instrument registry (docs/instrument-pricing.md) ---------------------------
+# On testnet profiles, set `mint` to the bootstrap/tokens mint address and omit
+# `symbol` — the mint address becomes the instrument symbol (custom tokens are
+# keyed by address to avoid duplicate-ticker confusion). The readable symbols
+# below are local-dev demos.
+
+[[oracle.instruments]] # 1:1 majors
+symbol = "tSOL/USD"
+base = { kind = "underlying", feed = "SOL/USD" }
+
+[[oracle.instruments]]
+symbol = "tBTC/USD"
+base = { kind = "underlying", feed = "BTC/USD" }
+
+[[oracle.instruments]]
+symbol = "tETH/USD"
+base = { kind = "underlying", feed = "ETH/USD" }
+
+# CoinGecko-sourced SOL twin — cross-source sanity check against tSOL
+[[oracle.instruments]]
+symbol = "tSOLCG/USD"
+base = { kind = "underlying", feed = "SOLCG/USD" }
+
+# Binance-sourced real-time SOL (mid of top-of-book, conf = half-spread)
+[[oracle.instruments]]
+symbol = "tSOLBN/USD"
+base = { kind = "underlying", feed = "SOL/USDT" }
+
+# Lagged+noisy twin of the Binance feed — live arb ground truth vs tSOLBN
+[[oracle.instruments]]
+symbol = "tSOLBNL/USD"
+base = { kind = "underlying", feed = "SOL/USDT" }
+transforms = [
+    { kind = "lag", ms = 10000 },
+    { kind = "noise", sigma_bps = 6, halflife_s = 45, seed = 11 },
+]
+
+# Lagged + noisy SOL twin: ground-truth arb opportunities vs tSOL
+[[oracle.instruments]]
+symbol = "tSOLB/USD"
+base = { kind = "underlying", feed = "SOL/USD" }
+transforms = [
+    { kind = "lag", ms = 15000 },
+    { kind = "noise", sigma_bps = 8, halflife_s = 60, seed = 7 },
+]
+
+# Fully synthetic memecoin (seeded random walk)
+[[oracle.instruments]]
+symbol = "tMEME/USD"
+base = { kind = "gbm", initial = "0.0200", daily_vol_bps = 1500, seed = 42, tick_ms = 1000 }
+
+# Test stablecoin: peg with a gentle wobble
+[[oracle.instruments]]
+symbol = "tUSDC/USD"
+base = { kind = "peg", target = "1.0000" }
+transforms = [{ kind = "noise", sigma_bps = 2, halflife_s = 600, seed = 9 }]
+
+# Majors index, rebased to 100 at first evaluation
+[[oracle.instruments]]
+symbol = "tMAJ3/USD"
+base = { kind = "basket", rebase = "100.00", legs = [
+    { feed = "SOL/USD", weight = "0.4" },
+    { feed = "BTC/USD", weight = "0.3" },
+    { feed = "ETH/USD", weight = "0.3" },
+] }

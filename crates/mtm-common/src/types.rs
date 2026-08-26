@@ -3,14 +3,16 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Trading pair identifier, e.g. "SOL/USD". Normalized to uppercase.
+/// Instrument identifier. For pairs this is "BASE/QUOTE" (uppercase by
+/// convention); for custom testnet tokens it is the mint address itself —
+/// so it is CASE-SENSITIVE and never normalized (base58 would corrupt).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Symbol(String);
 
 impl Symbol {
     pub fn new(s: impl AsRef<str>) -> Self {
-        Self(s.as_ref().to_uppercase())
+        Self(s.as_ref().to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -70,7 +72,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn symbol_normalizes_case() {
-        assert_eq!(Symbol::new("sol/usd").as_str(), "SOL/USD");
+    fn symbol_preserves_case() {
+        // mint addresses are symbols — base58 must survive untouched
+        assert_eq!(
+            Symbol::new("7pMcAg9x3GJqUxWZcntjZiy5UJPXfPZFoVwuCPCBpMcx").as_str(),
+            "7pMcAg9x3GJqUxWZcntjZiy5UJPXfPZFoVwuCPCBpMcx"
+        );
     }
 }

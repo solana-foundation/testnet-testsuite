@@ -1,0 +1,5 @@
+# Profile: local (solana-test-validator). Matches default.toml; kept explicit.
+
+[rpc]
+http_url = "http://127.0.0.1:8899"
+ws_url = "ws://127.0.0.1:8900"

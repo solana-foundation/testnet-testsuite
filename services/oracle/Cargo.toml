@@ -6,6 +6,32 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+mtm-chain = { workspace = true }
+mtm-common = { workspace = true }
+mtm-telemetry = { workspace = true }
+oracle-client = { workspace = true }
+
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rand_distr = { workspace = true }
+rust_decimal = { workspace = true }
+
+anyhow = { workspace = true }
+axum = { workspace = true }
+dotenvy = { workspace = true }
+futures = { workspace = true }
+metrics = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+figment = { workspace = true }
 
 [lints]
 workspace = true
