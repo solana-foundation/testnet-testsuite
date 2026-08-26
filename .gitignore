@@ -3,3 +3,8 @@ dist/
 .env
 .env.*
 *.log
+.surfpool
+.anchor
+/target
+/test-ledger
+/keys/*.json
