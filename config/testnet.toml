@@ -1,0 +1,6 @@
+# Profile: testnet — the primary target cluster for this project.
+# Public endpoints are rate-limited; swap in a dedicated RPC when generating real traffic.
+
+[rpc]
+http_url = "https://api.testnet.solana.com"
+ws_url = "wss://api.testnet.solana.com"

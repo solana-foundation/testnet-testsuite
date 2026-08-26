@@ -2,6 +2,7 @@
 //! everything in the workspace depends on it.
 
 pub mod config;
+pub mod time;
 pub mod types;
 
 pub use types::{Cluster, Symbol};
