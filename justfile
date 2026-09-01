@@ -196,6 +196,13 @@ down:
 logs service="oracle":
     {{compose}} -f ops/compose.yaml logs -f {{service}}
 
+# --- codegen ----------------------------------------------------------------------
+
+# regenerate program SDKs from the IDLs in crates/sdks/*/idl (codama)
+gen-sdks:
+    cd codegen && pnpm install && pnpm run generate
+    cargo fmt --all
+
 # --- ops ------------------------------------------------------------------------
 
 install-tools:
