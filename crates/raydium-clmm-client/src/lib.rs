@@ -40,6 +40,25 @@ const TICK_ARRAY_DISCOVERY_LIMIT: usize = 24;
 
 pub type Result<T> = std::result::Result<T, RaydiumClmmError>;
 
+/// Derive the canonical pool address for a config and an unordered mint pair.
+pub fn derive_pool_address(
+    program_id: Pubkey,
+    amm_config: Pubkey,
+    mint_a: Pubkey,
+    mint_b: Pubkey,
+) -> Result<Pubkey> {
+    let (mint_0, mint_1) = if mint_a < mint_b {
+        (mint_a, mint_b)
+    } else if mint_a > mint_b {
+        (mint_b, mint_a)
+    } else {
+        return Err(RaydiumClmmError::InvalidInput(
+            "pool mints must be different".to_owned(),
+        ));
+    };
+    Ok(pool_address_for(program_id, amm_config, mint_0, mint_1))
+}
+
 #[derive(Clone)]
 pub struct RaydiumClmmClient {
     chain: ChainClient,
@@ -1594,15 +1613,7 @@ impl RaydiumClmmClient {
     }
 
     fn pool_address(&self, config: Pubkey, mint_0: Pubkey, mint_1: Pubkey) -> Pubkey {
-        pda(
-            &[
-                states::POOL_SEED.as_bytes(),
-                config.as_ref(),
-                mint_0.as_ref(),
-                mint_1.as_ref(),
-            ],
-            self.program_id,
-        )
+        pool_address_for(self.program_id, config, mint_0, mint_1)
     }
 
     fn amm_config_address(&self, index: u16) -> Pubkey {
@@ -1708,6 +1719,18 @@ impl RaydiumClmmClient {
             self.program_id,
         )
     }
+}
+
+fn pool_address_for(program_id: Pubkey, config: Pubkey, mint_0: Pubkey, mint_1: Pubkey) -> Pubkey {
+    pda(
+        &[
+            states::POOL_SEED.as_bytes(),
+            config.as_ref(),
+            mint_0.as_ref(),
+            mint_1.as_ref(),
+        ],
+        program_id,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

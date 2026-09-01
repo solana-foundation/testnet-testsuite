@@ -2962,6 +2962,7 @@ dependencies = [
  "rust_decimal",
  "serde_json",
  "solana-commitment-config",
+ "solana-instruction 3.4.1",
  "solana-keypair",
  "solana-pubkey 4.2.1",
  "solana-signer 3.0.1",

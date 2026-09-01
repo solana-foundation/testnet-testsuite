@@ -208,17 +208,21 @@ program.
 
 `raydium-clmm-orchestrator` is the application layer above the action client. It
 accepts injected payer and mint-authority signers plus decimal mints, prices, and
-amounts. `run_full_flow` then funds the payer and executes:
+amounts. Pool creation and user actions are deliberately separate:
 
 ```text
-create pool → open position → increase liquidity → exact-in swap →
-exact-out swap → withdraw all liquidity → collect → close position
+create pool
+
+fund user → open position → increase liquidity → exact-in swap → exact-out swap
+→ withdraw all liquidity → collect → close position
 ```
 
-The typed `FullFlowOutcome` retains every action quote, derived/created address,
-signature, confirmation slot, and simulated compute-unit count. The library does
-not read environment variables; only the thin `raydium-clmm-orchestrator` CLI
-resolves JSON-encoded keypairs from named environment variables.
+`create_pool_flow` only creates a pool. `run_user_flow` only operates a supplied
+existing pool. Each typed outcome retains the action quotes, derived/created
+addresses, signatures, confirmation slots, and simulated compute-unit counts.
+The library does not read environment variables; only the thin
+`raydium-clmm-orchestrator` CLI resolves JSON-encoded keypairs from named
+environment variables.
 
 Start and provision the local Surfpool with:
 
@@ -242,26 +246,36 @@ NO_DNA=1 just bootstrap-tokens-dev \
 
 The default configuration command creates config index 0 at
 `7qcaBohkMCzE9xQPzNXKbWyMdtqsmvSJmhqmgNs9tuCK` for the current dev program key.
-The flow CLI derives the program, USDC, RAY, payer, and mint-authority public keys
-from the corresponding Doppler keypairs unless explicit `--program-id`,
-`--mint-a`, or `--mint-b` values are supplied:
+Use `create-pools` to create every unordered pair of directly supplied mint
+public keys:
 
 ```sh
-NO_DNA=1 just raydium-clmm-flow-dev \
-  --amm-config 7qcaBohkMCzE9xQPzNXKbWyMdtqsmvSJmhqmgNs9tuCK
-
-# On a mainnet-backed Surfpool, use Raydium's forked canonical program/config.
-NO_DNA=1 just raydium-clmm-flow-dev \
-  --program-id CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK \
-  --amm-config 4BLNHtVe942GSs4teSZqGX24xwKNkqU7bGgNn3iUiUpw
+NO_DNA=1 just raydium-clmm-create-pools-dev \
+  --amm-config 7qcaBohkMCzE9xQPzNXKbWyMdtqsmvSJmhqmgNs9tuCK \
+  --mint MINT_A --mint MINT_B --mint MINT_C
 ```
 
-Run `cargo run -p raydium-clmm-orchestrator-service -- flow --help` for funding
-amounts, position range, swap amounts, slippage, compute budget, priority fee,
-commitment, and keypair-variable overrides. Run the same command with
-`admin --help` for AMM-config options. Pool creation remains intentionally
-non-idempotent; use fresh mints/configuration or a fresh Surfpool for each
-complete run.
+Use `user-flow` for actions against existing pools. Supply the same mint public
+keys with repeated `--mint`; the CLI derives every unordered pair's canonical
+pool address for the selected AMM config. It generates a fresh user keypair for
+every pair, sends it SOL from `KEYPAIR_FAUCET`, returns its two token balances and
+token-account rent to the faucet after the position closes, and returns its
+entire remaining SOL balance in a faucet-fee-paid transaction:
+
+```sh
+NO_DNA=1 just raydium-clmm-user-flow-dev \
+  --program-id CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK \
+  --amm-config 4BLNHtVe942GSs4teSZqGX24xwKNkqU7bGgNn3iUiUpw \
+  --mint MINT_A --mint MINT_B --mint MINT_C
+```
+
+Use the matching `-testnet` recipe to run either command with Doppler's `prd`
+configuration and `https://api.testnet.solana.com`.
+
+Run `cargo run -p raydium-clmm-orchestrator-service -- create-pools --help` or
+`user-flow --help` for all options. Pool creation remains intentionally
+non-idempotent; use fresh mints/configuration or a fresh Surfpool when creating
+new pools.
 
 ## Conventions
 

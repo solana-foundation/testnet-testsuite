@@ -44,12 +44,38 @@ bootstrap-tokens *ARGS:
 bootstrap-tokens-dev *ARGS:
     doppler run --project testnet-testsuite --config dev -- pnpm bootstrap:tokens --apply {{ARGS}}
 
-# Execute the complete Raydium CLMM lifecycle with Doppler-injected signers.
-# Pass --amm-config plus any flow overrides after the recipe name.
-raydium-clmm-flow-dev *ARGS:
+# Create every unordered pair of mints supplied with repeated --mint flags.
+raydium-clmm-create-pools *ARGS:
+    cargo run -p raydium-clmm-orchestrator-service -- create-pools \
+        --mint $(echo $PUBKEY_TOKEN_JUP_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_RAY_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_USDC_MINT) \
+        {{ARGS}}
+
+raydium-clmm-create-pools-dev *ARGS:
     doppler run --project testnet-testsuite --config dev -- \
-        cargo run -p raydium-clmm-orchestrator-service -- flow \
-            --rpc-url http://localhost:8899 {{ARGS}}
+        just raydium-clmm-create-pools --rpc-url http://localhost:8899 {{ARGS}}
+
+raydium-clmm-create-pools-testnet *ARGS:
+    doppler run --project testnet-testsuite --config prd -- \
+        just raydium-clmm-create-pools --rpc-url https://api.testnet.solana.com {{ARGS}}
+
+# Exercise every existing unordered pair supplied with --mint using a new faucet-funded user.
+# Pass --amm-config plus any user-flow overrides.
+raydium-clmm-user-flow *ARGS:
+    cargo run -p raydium-clmm-orchestrator-service -- user-flow \
+        --mint $(echo $PUBKEY_TOKEN_JUP_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_RAY_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_USDC_MINT) \
+        {{ARGS}}
+
+raydium-clmm-user-flow-dev *ARGS:
+    doppler run --project testnet-testsuite --config dev -- \
+        just raydium-clmm-user-flow --rpc-url http://localhost:8899 {{ARGS}}
+
+raydium-clmm-user-flow-testnet *ARGS:
+    doppler run --project testnet-testsuite --config prd -- \
+        just raydium-clmm-user-flow --rpc-url https://api.testnet.solana.com {{ARGS}}
 
 # Create or validate the canonical AMM config using a named admin signer.
 configure-raydium-clmm-dev-with ADMIN_KEYPAIR_VAR *ARGS:
