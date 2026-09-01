@@ -18,6 +18,7 @@ raydium-clmm-orchestrator = { workspace = true }
 rust_decimal = { workspace = true }
 serde_json = { workspace = true }
 solana-commitment-config = { workspace = true }
+solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signer = { workspace = true }

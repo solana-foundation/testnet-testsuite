@@ -32,6 +32,18 @@ const MINT_DECIMALS_OFFSET: usize = 44;
 
 pub type Result<T> = std::result::Result<T, OrchestrationError>;
 
+/// Derive the canonical pool address for a config and unordered mint pair.
+pub fn derive_pool_address(
+    program_id: Pubkey,
+    amm_config: Pubkey,
+    mint_a: Pubkey,
+    mint_b: Pubkey,
+) -> Result<Pubkey> {
+    Ok(raydium_clmm_client::derive_pool_address(
+        program_id, amm_config, mint_a, mint_b,
+    )?)
+}
+
 /// Admin-only orchestration for canonical Raydium program configuration.
 #[derive(Clone)]
 pub struct RaydiumClmmAdminOrchestrator {
@@ -102,18 +114,28 @@ impl Default for OrchestrationConfig {
     }
 }
 
-/// Human-readable parameters for one complete single-pool lifecycle.
+/// Human-readable parameters for creating one pool.
 #[derive(Clone, Copy, Debug)]
-pub struct FullFlowParams {
+pub struct PoolCreationParams {
     pub amm_config: Pubkey,
     pub mint_a: Pubkey,
     pub mint_b: Pubkey,
-    /// UI units minted to the payer before the flow begins.
-    pub funding_a: Decimal,
-    /// UI units minted to the payer before the flow begins.
-    pub funding_b: Decimal,
     /// Mint B per mint A. The orchestrator normalizes it to pool mint order.
     pub initial_price: Decimal,
+    pub open_time: Option<u64>,
+}
+
+/// Human-readable parameters for one user lifecycle on an existing pool.
+#[derive(Clone, Copy, Debug)]
+pub struct UserFlowParams {
+    pub amm_config: Pubkey,
+    pub pool: Pubkey,
+    pub mint_a: Pubkey,
+    pub mint_b: Pubkey,
+    /// UI units minted to the user before the flow begins.
+    pub funding_a: Decimal,
+    /// UI units minted to the user before the flow begins.
+    pub funding_b: Decimal,
     /// Lower price in mint B per mint A.
     pub lower_price: Decimal,
     /// Upper price in mint B per mint A.
@@ -126,7 +148,6 @@ pub struct FullFlowParams {
     pub exact_in_amount: Decimal,
     /// UI amount of mint A requested from the exact-output mint B to mint A swap.
     pub exact_out_amount: Decimal,
-    pub open_time: Option<u64>,
     pub with_metadata: bool,
 }
 
@@ -140,9 +161,13 @@ pub struct FundingOutcome {
 }
 
 #[derive(Clone, Debug)]
-pub struct FullFlowOutcome {
-    pub funding: FundingOutcome,
+pub struct PoolCreationOutcome {
     pub create_pool: CreatePoolOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub struct UserFlowOutcome {
+    pub funding: FundingOutcome,
     pub open_position: PositionOutcome,
     pub increase_liquidity: PositionOutcome,
     pub swap_exact_in: SwapOutcome,
@@ -199,13 +224,45 @@ impl RaydiumClmmOrchestrator {
         self.payer.pubkey()
     }
 
-    /// Fund the payer, create a pool and position, exercise both swap modes,
-    /// collect and withdraw everything, then close the position NFT.
-    pub async fn run_full_flow(&self, params: FullFlowParams) -> Result<FullFlowOutcome> {
-        validate_flow_params(params)?;
+    /// Create one Raydium CLMM pool. Pool creation is intentionally
+    /// non-idempotent and must be performed only once for a mint pair/config.
+    pub async fn create_pool_flow(
+        &self,
+        params: PoolCreationParams,
+    ) -> Result<PoolCreationOutcome> {
+        validate_pool_creation_params(params)?;
         let span = info_span!(
-            "raydium_clmm_full_flow",
+            "raydium_clmm_pool_creation",
             amm_config = %params.amm_config,
+            mint_a = %params.mint_a,
+            mint_b = %params.mint_b,
+            payer = %self.payer(),
+        );
+        let _entered = span.enter();
+
+        self.validate_prerequisites(params.amm_config).await?;
+        let create_pool = self
+            .client
+            .create_pool(CreatePoolParams {
+                amm_config: params.amm_config,
+                mint_a: params.mint_a,
+                mint_b: params.mint_b,
+                initial_price: params.initial_price,
+                open_time: params.open_time,
+            })
+            .await?;
+        info!(pool = %create_pool.accounts.pool, "Raydium CLMM pool created");
+        Ok(PoolCreationOutcome { create_pool })
+    }
+
+    /// Fund the user, exercise an existing pool, then withdraw, collect, and
+    /// close the user's position NFT. This flow never creates a pool.
+    pub async fn run_user_flow(&self, params: UserFlowParams) -> Result<UserFlowOutcome> {
+        validate_user_flow_params(params)?;
+        let span = info_span!(
+            "raydium_clmm_user_flow",
+            amm_config = %params.amm_config,
+            pool = %params.pool,
             mint_a = %params.mint_a,
             mint_b = %params.mint_b,
             payer = %self.payer(),
@@ -222,27 +279,16 @@ impl RaydiumClmmOrchestrator {
                 params.funding_b,
             )
             .await?;
-        let create_pool = self
-            .client
-            .create_pool(CreatePoolParams {
-                amm_config: params.amm_config,
-                mint_a: params.mint_a,
-                mint_b: params.mint_b,
-                initial_price: params.initial_price,
-                open_time: params.open_time,
-            })
-            .await?;
         let (lower_price, upper_price) = normalized_range(
             params.mint_a,
             params.mint_b,
             params.lower_price,
             params.upper_price,
         )?;
-        let pool = create_pool.accounts.pool;
         let open_position = self
             .client
             .open_position(OpenPositionParams {
-                pool,
+                pool: params.pool,
                 lower_price,
                 upper_price,
                 input: TokenAmount {
@@ -266,7 +312,7 @@ impl RaydiumClmmOrchestrator {
         let swap_exact_in = self
             .client
             .swap_exact_in(SwapExactInParams {
-                pool,
+                pool: params.pool,
                 input_mint: params.mint_a,
                 output_mint: params.mint_b,
                 amount_in: params.exact_in_amount,
@@ -275,7 +321,7 @@ impl RaydiumClmmOrchestrator {
         let swap_exact_out = self
             .client
             .swap_exact_out(SwapExactOutParams {
-                pool,
+                pool: params.pool,
                 input_mint: params.mint_b,
                 output_mint: params.mint_a,
                 amount_out: params.exact_out_amount,
@@ -291,10 +337,9 @@ impl RaydiumClmmOrchestrator {
         let collect_position = self.client.collect_position(position_mint).await?;
         let close_position = self.client.close_position(position_mint).await?;
 
-        info!(%pool, %position_mint, "Raydium CLMM full flow complete");
-        Ok(FullFlowOutcome {
+        info!(pool = %params.pool, %position_mint, "Raydium CLMM user flow complete");
+        Ok(UserFlowOutcome {
             funding,
-            create_pool,
             open_position,
             increase_liquidity,
             swap_exact_in,
@@ -555,7 +600,16 @@ fn normalized_range(
     Ok((normalized_lower, normalized_upper))
 }
 
-fn validate_flow_params(params: FullFlowParams) -> Result<()> {
+fn validate_pool_creation_params(params: PoolCreationParams) -> Result<()> {
+    if params.mint_a == params.mint_b {
+        return Err(OrchestrationError::InvalidInput(
+            "mint_a and mint_b must differ".to_owned(),
+        ));
+    }
+    ensure_positive(params.initial_price, "initial_price")
+}
+
+fn validate_user_flow_params(params: UserFlowParams) -> Result<()> {
     if params.mint_a == params.mint_b {
         return Err(OrchestrationError::InvalidInput(
             "mint_a and mint_b must differ".to_owned(),
@@ -564,7 +618,6 @@ fn validate_flow_params(params: FullFlowParams) -> Result<()> {
     for (name, value) in [
         ("funding_a", params.funding_a),
         ("funding_b", params.funding_b),
-        ("initial_price", params.initial_price),
         ("lower_price", params.lower_price),
         ("upper_price", params.upper_price),
         ("open_amount", params.open_amount),
@@ -577,11 +630,6 @@ fn validate_flow_params(params: FullFlowParams) -> Result<()> {
     if params.lower_price >= params.upper_price {
         return Err(OrchestrationError::InvalidInput(
             "lower_price must be less than upper_price".to_owned(),
-        ));
-    }
-    if params.initial_price <= params.lower_price || params.initial_price >= params.upper_price {
-        return Err(OrchestrationError::InvalidInput(
-            "initial_price must lie strictly inside the position range".to_owned(),
         ));
     }
     Ok(())
