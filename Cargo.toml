@@ -11,6 +11,7 @@ members = [
     "crates/orca-whirlpool-orchestrator",
     "crates/raydium-clmm-client",
     "crates/raydium-clmm-orchestrator",
+    "crates/sdks/manifest",
     "services/oracle",
     "services/orca-whirlpool-orchestrator",
     "services/raydium-clmm-orchestrator",
@@ -46,6 +47,16 @@ rand = "0.10"
 rand_chacha = "0.10"
 rand_distr = "0.6"
 rust_decimal = "1"
+
+# codama-generated SDK deps (crates/sdks/*)
+borsh = { version = "1", features = ["derive"] }
+num-derive = "0.5"
+num-traits = "0.2"
+solana-account-info = "3"
+solana-address = { version = "2", features = ["borsh", "curve25519"] }
+solana-cpi = "3"
+solana-program-error = "3"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 solana-rpc-client = "4.2.1"

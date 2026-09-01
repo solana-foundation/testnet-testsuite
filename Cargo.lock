@@ -2337,6 +2337,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "manifest-sdk"
+version = "0.1.0"
+dependencies = [
+ "borsh 1.8.1",
+ "num-derive 0.5.1",
+ "num-traits",
+ "solana-account-info 3.1.1",
+ "solana-address 2.9.0",
+ "solana-cpi 3.1.0",
+ "solana-instruction 3.5.1",
+ "solana-program-error 3.0.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
