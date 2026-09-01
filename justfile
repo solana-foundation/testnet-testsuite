@@ -42,7 +42,59 @@ bootstrap-tokens *ARGS:
     doppler run --project testnet-testsuite --config prd -- pnpm bootstrap:tokens {{ARGS}}
 
 bootstrap-tokens-dev *ARGS:
-    doppler run --project testnet-testsuite --config dev -- pnpm bootstrap:tokens:local {{ARGS}}
+    doppler run --project testnet-testsuite --config dev -- pnpm bootstrap:tokens --apply {{ARGS}}
+
+# Execute the complete Raydium CLMM lifecycle with Doppler-injected signers.
+# Pass --amm-config plus any flow overrides after the recipe name.
+raydium-clmm-flow-dev *ARGS:
+    doppler run --project testnet-testsuite --config dev -- \
+        cargo run -p raydium-clmm-orchestrator-service -- flow \
+            --rpc-url http://localhost:8899 {{ARGS}}
+
+# Create or validate the canonical AMM config using a named admin signer.
+configure-raydium-clmm-dev-with ADMIN_KEYPAIR_VAR *ARGS:
+    doppler run --project testnet-testsuite --config dev -- \
+        cargo run -p raydium-clmm-orchestrator-service -- admin \
+            --rpc-url http://localhost:8899 \
+            --admin-keypair-env "{{ADMIN_KEYPAIR_VAR}}" \
+            {{ARGS}}
+
+# Use the funded program authority as the default local admin.
+configure-raydium-clmm-dev *ARGS:
+    just configure-raydium-clmm-dev-with "KEYPAIR_PROGRAM_AUTHORITY" {{ARGS}}
+
+# --- program deployments (doppler-managed secrets) ----------------------------------
+
+# Deploy a program using a Doppler-injected keypair.
+# PROGRAM_KEYPAIR_VAR is the *name* of the Doppler secret, not its value.
+deploy-program CONFIG PROGRAM_KEYPAIR_VAR SO_PATH URL="localhost":
+    doppler run --project testnet-testsuite --config "{{CONFIG}}" -- \
+        bash -c ' \
+            set -euo pipefail; \
+            : "${!1:?missing Doppler secret: $1}"; \
+            : "${KEYPAIR_PROGRAM_AUTHORITY:?missing in config}"; \
+            : "${KEYPAIR_FAUCET:?missing in config}"; \
+            umask 077; \
+            if [ -d /dev/shm ] && [ -w /dev/shm ]; then \
+                d=$(mktemp -d /dev/shm/kp.XXXXXX); \
+            else \
+                d=$(mktemp -d); \
+            fi; \
+            trap "rm -rf $d" EXIT INT TERM; \
+            printf %s "${!1}" > "$d/program.json"; \
+            printf %s "$KEYPAIR_PROGRAM_AUTHORITY" > "$d/authority.json"; \
+            printf %s "$KEYPAIR_FAUCET" > "$d/faucet.json"; \
+            solana program deploy \
+                --url "$3" \
+                --program-id "$d/program.json" \
+                --upgrade-authority "$d/authority.json" \
+                --fee-payer "$d/faucet.json" \
+                "$2" \
+        ' _ "{{PROGRAM_KEYPAIR_VAR}}" "{{SO_PATH}}" "{{URL}}"
+
+deploy-program-testnet PROGRAM_KEYPAIR_VAR SO_PATH: (deploy-program "prd" PROGRAM_KEYPAIR_VAR SO_PATH "testnet")
+deploy-program-dev PROGRAM_KEYPAIR_VAR SO_PATH: (deploy-program "dev" PROGRAM_KEYPAIR_VAR SO_PATH "localhost")
+
 
 # --- ops ------------------------------------------------------------------------
 
