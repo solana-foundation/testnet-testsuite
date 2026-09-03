@@ -1,0 +1,69 @@
+# Base stack: oracle + observability. Default profile is testnet.
+#   testnet: just up testnet    (MTM_PROFILE=testnet docker compose -f ops/compose.yaml up -d --build)
+#   local:   just up local      (adds ops/compose.local.yaml — RPC points at surfpool on the HOST,
+#                                start it first: pnpm surfpool:mainnet)
+# Secrets (when the bots land): wrap with `doppler run --` so keypairs arrive as env.
+
+name: mtm
+
+services:
+  oracle:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: mtm:latest
+    restart: unless-stopped
+    environment:
+      MTM_PROFILE: ${MTM_PROFILE:-testnet}
+      # bind beyond loopback inside the container network (never published raw)
+      MTM_ORACLE__LISTEN_ADDR: 0.0.0.0:8080
+      MTM_ORACLE__METRICS_ADDR: 0.0.0.0:9100
+      # Hermes requires a key since the 2026-08-26 Pyth upgrade (pythdata.app)
+      MTM_ORACLE__HERMES__API_KEY: ${PYTH_API_KEY:-}
+      # optional; keyless works at the default 5-min cadence
+      MTM_ORACLE__COINGECKO__API_KEY: ${COINGECKO_API_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ../config:/app/config:ro
+    ports:
+      # host loopback only — the oracle has no auth
+      - "127.0.0.1:8080:8080"
+    # no healthcheck: distroless image has no shell/curl; rely on restart policy
+
+  # --- bots: uncomment when arb/mm rejoin the workspace --------------------------
+  # arb:
+  #   image: mtm:latest
+  #   entrypoint: ["/usr/local/bin/arb"]
+  #   restart: unless-stopped
+  #   depends_on: [oracle]
+  #   environment:
+  #     MTM_PROFILE: ${MTM_PROFILE:-testnet}
+  #     MTM_ARB__ORACLE_HTTP_URL: http://oracle:8080
+  #     MTM_ARB__METRICS_ADDR: 0.0.0.0:9101
+  #   volumes:
+  #     - ../config:/app/config:ro
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  prometheus-data:
+  grafana-data:

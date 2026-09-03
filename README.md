@@ -1,14 +1,17 @@
 # Testnet test suite
 
-Solana testnet traffic/testing stack: an oracle service (Pyth pull → HTTP/WSS API →
-on-chain pusher), an arbitrage bot, a market maker, and shared infrastructure crates.
-Primary target cluster is **testnet** — the point is generating realistic traffic
-against it.
+Solana testnet traffic/testing stack. This bootstrap contains an oracle service
+(Pyth pull → HTTP/WSS API → on-chain pusher, WIP) and a token bootstrap script;
+trading bots (arb, market maker) come next. Primary target cluster is **testnet** —
+the point is generating realistic traffic against it.
 
 ## Layout
 
 | Path | What |
 |---|---|
+| `crates/mtm-common` | Shared leaf types (`Symbol`) + layered config loading |
+| `crates/mtm-math` | Canonical fixed-point `Price` (i128 mantissa × 10^expo) + rust_decimal bridge |
+| `crates/mtm-chain` | Off-chain Solana toolkit: RPC clients, keypairs, (soon) tx pipeline |
 | `crates/oracle-client` | Typed client for the oracle service; owns the API wire types |
 | `services/oracle` | Polls Hermes → serves `/v1/prices` + `/v1/ws` → pushes on-chain (WIP) |
 | `programs/` | On-chain programs (empty for now — Anchor workspace lands here later) |
@@ -26,7 +29,27 @@ just oracle testnet       # ... against testnet
 ```
 
 Profiles: `MTM_PROFILE` selects `config/{profile}.toml` (default `local`).
-Any value can be overridden via env: `MTM_RPC__HTTP_URL=... just arb testnet`.
+Any value can be overridden via env: `MTM_RPC__HTTP_URL=... just oracle testnet`.
+
+## Running the stack (containerized)
+
+Sustained runs use Docker Compose: the oracle plus Prometheus (`:9090`) and
+Grafana (`:3000`, admin/admin unless `GRAFANA_PASSWORD` is set), all bound to
+host loopback only.
+
+```sh
+just up testnet           # build image + start against testnet
+pnpm surfpool:mainnet &   # local profile needs surfpool on the HOST first
+just up local             # ... then start against it
+just logs oracle
+just down
+```
+
+The image is a cargo-chef multi-stage build (dependency layer cached — source
+rebuilds are fast) on a distroless runtime; TLS roots are compiled into the
+binaries so no OS cert store is needed. Config is mounted from `config/`, so
+instrument edits only need a container restart, not a rebuild. When the bots
+need secrets: `doppler run -- just up testnet`.
 
 ## Token bootstrap
 

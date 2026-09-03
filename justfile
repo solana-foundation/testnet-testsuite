@@ -44,6 +44,26 @@ bootstrap-tokens *ARGS:
 bootstrap-tokens-dev *ARGS:
     doppler run --project testnet-testsuite --config dev -- pnpm bootstrap:tokens:local {{ARGS}}
 
+# --- containerized stack (oracle + prometheus + grafana) -------------------------
+# MTM_COMPOSE selects the engine: "docker compose" (default) or "nerdctl compose"
+# for containerd-native environments (e.g. Kata sandboxes).
+
+compose := env("MTM_COMPOSE", "docker compose")
+
+# bring the stack up: `just up testnet` or `just up local` (start surfpool first)
+up profile="testnet":
+    @if [ "{{profile}}" = "local" ]; then \
+        {{compose}} -f ops/compose.yaml -f ops/compose.local.yaml up -d --build; \
+    else \
+        MTM_PROFILE={{profile}} {{compose}} -f ops/compose.yaml up -d --build; \
+    fi
+
+down:
+    {{compose}} -f ops/compose.yaml down
+
+logs service="oracle":
+    {{compose}} -f ops/compose.yaml logs -f {{service}}
+
 # --- ops ------------------------------------------------------------------------
 
 install-tools:
