@@ -3,6 +3,7 @@
 //! fees + retries and account subscription streams (ws now, geyser later).
 
 pub mod keys;
+pub mod tx;
 
 use std::sync::Arc;
 

@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: oracle
+    static_configs:
+      - targets: ["oracle:9100"]
+  # when the bots land:
+  # - job_name: arb
+  #   static_configs: [{ targets: ["arb:9101"] }]
+  # - job_name: mm
+  #   static_configs: [{ targets: ["mm:9102"] }]

@@ -1,0 +1,11 @@
+# Local-profile overrides: RPC points at surfpool running on the HOST.
+# Start it first: pnpm surfpool:mainnet (8899) / pnpm surfpool:testnet (7899).
+
+services:
+  oracle:
+    environment:
+      MTM_PROFILE: local
+      MTM_RPC__HTTP_URL: http://host.docker.internal:8899
+      MTM_RPC__WS_URL: ws://host.docker.internal:8900
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

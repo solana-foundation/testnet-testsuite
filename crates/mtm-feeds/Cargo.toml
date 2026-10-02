@@ -1,5 +1,5 @@
 [package]
-name = "oracle-client"
+name = "mtm-feeds"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,12 @@ publish.workspace = true
 [dependencies]
 mtm-common = { workspace = true }
 mtm-math = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true

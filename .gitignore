@@ -8,3 +8,4 @@ dist/
 /target
 /test-ledger
 /keys/*.json
+.pnpm-store/
