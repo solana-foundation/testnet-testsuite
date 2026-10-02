@@ -23,7 +23,10 @@ pub enum PriceData {
         ask: Price,
         ask_qty: Price,
     },
-    Trade { price: Price, qty: Price },
+    Trade {
+        price: Price,
+        qty: Price,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

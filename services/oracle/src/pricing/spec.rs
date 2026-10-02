@@ -80,7 +80,9 @@ pub enum TransformConfig {
         anchor: String,
         initial: String,
     },
-    Lag { ms: u64 },
+    Lag {
+        ms: u64,
+    },
     Noise {
         sigma_bps: u32,
         halflife_s: u64,
