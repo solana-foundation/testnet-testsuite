@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn parses_book_ticker_envelope() {
-        // shape per Binance spot docs (verified in docs/pricing-types.md research)
+        // shape per Binance spot docs
         let json = r#"{"stream":"solusdt@bookTicker","data":
             {"u":400900217,"s":"SOLUSDT","b":"96.75000000","B":"31.21000000","a":"96.76000000","A":"40.66000000"}}"#;
         let envelope: StreamMessage = serde_json::from_str(json).expect("parses");

@@ -15,7 +15,7 @@ metrics_addr = "127.0.0.1:9100"
 [oracle.hermes]
 base_url = "https://hermes.pyth.network"
 poll_interval_ms = 1000
-# Hermes requires an API key since the 2026-08-26 Pyth upgrade — set via env:
+# API key (required) via env:
 # MTM_ORACLE__HERMES__API_KEY (Bearer token from pythdata.app)
 
 # CoinGecko: reference-grade aggregator (floats, minutes-fresh, no conf).
@@ -30,7 +30,7 @@ poll_interval_ms = 300000
 flush_interval_ms = 250
 
 [oracle.pusher]
-enabled = false # parked — see docs/testnet-oracle-strategy.md
+enabled = false # parked until a testnet oracle program exists
 
 # Real market-data inputs. Pyth feed ids (hex, no 0x prefix):
 # https://pyth.network/price-feeds

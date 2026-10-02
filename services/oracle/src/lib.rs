@@ -1,6 +1,6 @@
 //! Oracle service: ingests real market data (Pyth Hermes), runs the pricing
 //! engine over the instrument registry, and serves the results over HTTP/WSS.
-//! On-chain pushing is parked (docs/testnet-oracle-strategy.md).
+//! On-chain pushing is parked until a testnet oracle program exists.
 
 pub mod api;
 pub mod binance;

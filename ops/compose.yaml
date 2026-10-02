@@ -10,7 +10,7 @@ services:
   oracle:
     build:
       context: ..
-      dockerfile: Dockerfile
+      dockerfile: ops/oracle-service.dockerfile
     image: mtm:latest
     restart: unless-stopped
     environment:
@@ -18,7 +18,7 @@ services:
       # bind beyond loopback inside the container network (never published raw)
       MTM_ORACLE__LISTEN_ADDR: 0.0.0.0:8080
       MTM_ORACLE__METRICS_ADDR: 0.0.0.0:9100
-      # Hermes requires a key since the 2026-08-26 Pyth upgrade (pythdata.app)
+      # required; Bearer token from pythdata.app
       MTM_ORACLE__HERMES__API_KEY: ${PYTH_API_KEY:-}
       # optional; keyless works at the default 5-min cadence
       MTM_ORACLE__COINGECKO__API_KEY: ${COINGECKO_API_KEY:-}

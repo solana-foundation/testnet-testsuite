@@ -1,5 +1,5 @@
 //! Minimal Pyth Hermes REST client (pull-oracle price service).
-//! API reference: https://hermes.pyth.network/docs
+//! API reference: https://docs.pyth.network/price-feeds/core/how-pyth-works/hermes
 //!
 //! The `binary` blobs returned here are what eventually gets posted on-chain
 //! through the Pyth receiver program (see services/oracle pusher).

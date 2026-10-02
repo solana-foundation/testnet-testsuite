@@ -1,4 +1,4 @@
-# Multi-stage build for the mtm Rust workspace.
+# Oracle service image. Build context is the repo root (see ops/compose.yaml).
 # cargo-chef caches the (large, solana-heavy) dependency layer so source-only
 # rebuilds take seconds instead of minutes.
 
