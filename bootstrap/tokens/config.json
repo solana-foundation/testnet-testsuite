@@ -5,5 +5,19 @@
     "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
     "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
     "mint": "KEYPAIR_TOKEN_USDC_MINT"
+  },
+  {
+    "mainnetPubkey": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_JUP_MINT"
+  },
+  {
+    "mainnetPubkey": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_RAY_MINT"
   }
 ]
