@@ -78,7 +78,7 @@ just raydium-clmm-create-pools-dev --amm-config <config-pubkey-from-last-command
 for testnet, run
 
 ```sh
-just deploy-program "KEYPAIR_RAYDIUM_CLMM" "../raydium-clmm/target/deploy/raydium_clmm.so"
+just deploy-program-testnet "KEYPAIR_RAYDIUM_CLMM" "../raydium-clmm/target/deploy/raydium_clmm.so"
 just configure-raydium-clmm
 ```
 
