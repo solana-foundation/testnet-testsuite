@@ -1,4 +1,12 @@
-use std::{collections::BTreeSet, env, str::FromStr, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    env, fs,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -107,6 +115,9 @@ struct UserFlowArgs {
     faucet_keypair_env: String,
     #[arg(long, default_value = "KEYPAIR_TOKEN_MINT_AUTHORITY")]
     mint_authority_keypair_env: String,
+    /// Directory for ephemeral user keypairs, retained when a flow or recovery fails.
+    #[arg(long, default_value = ".raydium-clmm-recovery")]
+    recovery_dir: PathBuf,
     /// Lamports sent by the faucet to each ephemeral user before its flow.
     #[arg(long, default_value_t = 1_000_000_000)]
     user_lamports: u64,
@@ -259,19 +270,37 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
     let chain = connected_chain(&args.rpc_url, args.transaction.commitment).await?;
     let config = orchestration_config(&args.transaction);
     let submission = submission_config(&args.transaction);
-    let users: Vec<(UserPool, Arc<dyn Signer + Send + Sync>)> = pools
-        .into_iter()
-        .map(|pool| {
-            (
-                pool,
-                Arc::new(Keypair::new()) as Arc<dyn Signer + Send + Sync>,
+    fs::create_dir_all(&args.recovery_dir)
+        .with_context(|| format!("create recovery directory {}", args.recovery_dir.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(&args.recovery_dir, fs::Permissions::from_mode(0o700)).with_context(
+        || {
+            format!(
+                "restrict recovery directory {}",
+                args.recovery_dir.display()
             )
-        })
+        },
+    )?;
+    let users: Vec<(UserPool, Arc<Keypair>)> = pools
+        .into_iter()
+        .map(|pool| (pool, Arc::new(Keypair::new())))
         .collect();
     let mut funded_users: Vec<(UserPool, Arc<dyn Signer + Send + Sync>, TransactionOutcome)> =
         Vec::with_capacity(users.len());
     for (pool, user) in users {
         let user_pubkey = user.pubkey();
+        let recovery_path = args.recovery_dir.join(format!("{user_pubkey}.json"));
+        let bytes = serde_json::to_vec(&user.to_bytes())?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&recovery_path)
+            .with_context(|| format!("save recovery keypair to {}", recovery_path.display()))?
+            .write_all(&bytes)
+            .with_context(|| format!("write recovery keypair to {}", recovery_path.display()))?;
+        tracing::info!(pool = %pool.pool, user = %user_pubkey, recovery_file = %recovery_path.display(), "saved ephemeral user recovery keypair");
+        let user: Arc<dyn Signer + Send + Sync> = user;
         let startup_funding = transfer_lamports(
             &chain,
             faucet.as_ref(),
@@ -338,6 +367,8 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
         let outcome = flow.context("run Raydium CLMM user flow")?;
         let (token_returns, lamports_returned, lamport_return) =
             recovery.context("return ephemeral user funds to KEYPAIR_FAUCET")?;
+        fs::remove_file(&recovery_path)
+            .with_context(|| format!("remove recovered keypair {}", recovery_path.display()))?;
         runs.push(UserFlowRun {
             pool,
             user: user_pubkey,
