@@ -83,5 +83,5 @@ just configure-raydium-clmm-prd
 ```
 
 ```sh
-just raydium-clmm-create-pools --amm-config <config-pubkey-from-last-command>
+just raydium-clmm-create-pools-testnet --amm-config <config-pubkey-from-last-command>
 ```
