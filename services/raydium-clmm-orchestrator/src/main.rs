@@ -364,6 +364,12 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
             submission,
         )
         .await;
+        if let Err(error) = &recovery {
+            tracing::error!(pool = %pool.pool, user = %user_pubkey, error = %error, "failed to return ephemeral user funds; recovery keypair retained");
+        }
+        if let Err(error) = &flow {
+            tracing::error!(pool = %pool.pool, user = %user_pubkey, error = %error, "ephemeral user flow failed");
+        }
         let outcome = flow.context("run Raydium CLMM user flow")?;
         let (token_returns, lamports_returned, lamport_return) =
             recovery.context("return ephemeral user funds to KEYPAIR_FAUCET")?;
