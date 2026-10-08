@@ -79,7 +79,7 @@ for testnet, run
 
 ```sh
 just deploy-program-testnet "KEYPAIR_RAYDIUM_CLMM" "../raydium-clmm/target/deploy/raydium_clmm.so"
-just configure-raydium-clmm
+just configure-raydium-clmm-prd
 ```
 
 ```sh

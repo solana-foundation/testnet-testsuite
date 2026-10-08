@@ -78,16 +78,20 @@ raydium-clmm-user-flow-testnet *ARGS:
         just raydium-clmm-user-flow --rpc-url https://api.testnet.solana.com {{ARGS}}
 
 # Create or validate the canonical AMM config using a named admin signer.
-configure-raydium-clmm-dev-with ADMIN_KEYPAIR_VAR *ARGS:
-    doppler run --project testnet-testsuite --config dev -- \
+configure-raydium-clmm-with CONFIG ADMIN_KEYPAIR_VAR RPC_URL *ARGS:
+    doppler run --project testnet-testsuite --config "{{CONFIG}}" -- \
         cargo run -p raydium-clmm-orchestrator-service -- admin \
-            --rpc-url http://localhost:8899 \
+            --rpc-url "{{RPC_URL}}" \
             --admin-keypair-env "{{ADMIN_KEYPAIR_VAR}}" \
             {{ARGS}}
 
 # Use the funded program authority as the default local admin.
 configure-raydium-clmm-dev *ARGS:
-    just configure-raydium-clmm-dev-with "KEYPAIR_PROGRAM_AUTHORITY" {{ARGS}}
+    just configure-raydium-clmm-with dev "KEYPAIR_PROGRAM_AUTHORITY" http://localhost:8899 {{ARGS}}
+
+# Use the funded program authority as the default testnet admin.
+configure-raydium-clmm-prd *ARGS:
+    just configure-raydium-clmm-with prd "KEYPAIR_PROGRAM_AUTHORITY" https://api.testnet.solana.com {{ARGS}}
 
 # --- program deployments (doppler-managed secrets) ----------------------------------
 
