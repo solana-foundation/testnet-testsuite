@@ -415,6 +415,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "futures",
+ "metrics",
+ "mtm-chain",
+ "mtm-common",
+ "mtm-scenario",
+ "mtm-telemetry",
+ "mtm-venues",
+ "oracle-client",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "solana-account-decoder-client-types",
+ "solana-instruction 3.5.1",
+ "solana-keypair",
+ "solana-message 4.6.0",
+ "solana-pubkey 4.4.0",
+ "solana-pubsub-client",
+ "solana-rpc-client-api",
+ "solana-signer 3.0.1",
+ "solana-transaction",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3852,20 +3882,26 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "manifest-dex-client",
  "manifest-dex-orchestrator",
  "mtm-chain",
  "mtm-common",
  "mtm-dex-harness",
  "mtm-scenario",
  "oracle-client",
+ "orca-whirlpool-client",
  "orca-whirlpool-orchestrator",
+ "raydium-clmm-client",
  "raydium-clmm-orchestrator",
+ "reqwest 0.13.1",
  "rust_decimal",
  "rustls",
  "serde",
  "serde_json",
  "solana-commitment-config",
  "solana-pubkey 4.4.0",
+ "solana-rpc-client",
+ "solana-signature 3.6.0",
  "solana-signer 3.0.1",
  "tokio",
  "tracing",
@@ -5441,6 +5477,30 @@ checksum = "e2b8ba5d677d77a76d557b59ce7ecf9a8578743089cb25c73990752c5f005885"
 dependencies = [
  "rand 0.9.5",
  "solana-address 2.9.0",
+]
+
+[[package]]
+name = "solana-pubsub-client"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc21c0fef16bfd41e177afe75cb942f8f8c9076d45d3bf14eeaf172aad354580"
+dependencies = [
+ "crossbeam-channel",
+ "futures-util",
+ "log",
+ "serde",
+ "serde_json",
+ "solana-account-decoder-client-types",
+ "solana-clock 3.2.1",
+ "solana-pubkey 4.4.0",
+ "solana-rpc-client-types",
+ "solana-signature 3.6.0",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.28.0",
+ "tungstenite 0.28.0",
+ "url",
 ]
 
 [[package]]
@@ -7351,6 +7411,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-stream"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite 0.28.0",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "tokio-tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7607,6 +7694,26 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
+ "sha1 0.10.7",
+ "thiserror 2.0.21",
+ "utf-8",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
@@ -7735,6 +7842,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"
