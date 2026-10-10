@@ -24,7 +24,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, MathematicalOps, ToPrimitive};
 use solana_account::Account;
 use solana_commitment_config::CommitmentConfig;
-use solana_instruction::Instruction;
+use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -567,6 +567,35 @@ impl RaydiumClmmClient {
         .await
     }
 
+    /// Fetch everything a swap on `pool` needs, in both directions. Quoting
+    /// and instruction building on the snapshot are pure, so callers (the
+    /// router) can price many sizes and build for any owner from one fetch.
+    pub async fn load_swap_snapshot(&self, pool: Pubkey) -> Result<SwapSnapshot> {
+        let bundle = self.load_pool(pool).await?;
+        let config: AmmConfig =
+            self.decode_program_account(bundle.amm_config, &bundle.config_account)?;
+        if bundle.pool.get_dynamic_fee_info().is_some() {
+            return Err(RaydiumClmmError::Quote(
+                "dynamic-fee pools are outside this single-pool quote implementation".to_owned(),
+            ));
+        }
+        let zero_for_one = self
+            .load_swap_tick_arrays(&bundle, true)
+            .await
+            .map_err(|error| error.to_string());
+        let one_for_zero = self
+            .load_swap_tick_arrays(&bundle, false)
+            .await
+            .map_err(|error| error.to_string());
+        Ok(SwapSnapshot {
+            program_id: self.program_id,
+            bundle,
+            config,
+            zero_for_one,
+            one_for_zero,
+        })
+    }
+
     async fn swap(
         &self,
         pool_key: Pubkey,
@@ -582,31 +611,8 @@ impl RaydiumClmmClient {
         };
         self.run(action, pool_key, async move {
             ensure_positive(amount, "swap amount")?;
-            let bundle = self.load_pool(pool_key).await?;
-            let zero_for_one = match (input_mint, output_mint) {
-                (input, output) if input == bundle.mint_0.key && output == bundle.mint_1.key => {
-                    true
-                }
-                (input, output) if input == bundle.mint_1.key && output == bundle.mint_0.key => {
-                    false
-                }
-                _ => {
-                    return Err(RaydiumClmmError::InvalidInput(
-                        "swap mints do not match the pool".to_owned(),
-                    ));
-                }
-            };
-            let input = if zero_for_one {
-                &bundle.mint_0
-            } else {
-                &bundle.mint_1
-            };
-            let output = if zero_for_one {
-                &bundle.mint_1
-            } else {
-                &bundle.mint_0
-            };
-            let epoch = bundle.epoch;
+            let snapshot = self.load_swap_snapshot(pool_key).await?;
+            let (input, output) = snapshot.direction(input_mint, output_mint)?.1;
             let requested_raw = ui_to_raw(
                 amount,
                 if exact_in {
@@ -615,165 +621,35 @@ impl RaydiumClmmClient {
                     output.decimals
                 },
             )?;
-            let (instruction_amount, quote_amount) = if exact_in {
-                let input_fee = transfer_fee(input, epoch, requested_raw)?;
-                (
-                    requested_raw,
-                    requested_raw.checked_sub(input_fee).ok_or_else(|| {
-                        RaydiumClmmError::Quote("input transfer fee exceeds amount".to_owned())
-                    })?,
-                )
-            } else {
-                let output_fee = inverse_transfer_fee(output, epoch, requested_raw)?;
-                let gross_output = requested_raw.checked_add(output_fee).ok_or_else(|| {
-                    RaydiumClmmError::Quote("output transfer fee overflow".to_owned())
-                })?;
-                (requested_raw, gross_output)
-            };
-            let config: AmmConfig =
-                self.decode_program_account(bundle.amm_config, &bundle.config_account)?;
-            if bundle.pool.get_dynamic_fee_info().is_some() {
-                return Err(RaydiumClmmError::Quote(
-                    "dynamic-fee pools are outside this single-pool quote implementation"
-                        .to_owned(),
-                ));
-            }
-            let (mut arrays, array_keys) =
-                self.load_swap_tick_arrays(&bundle, zero_for_one).await?;
-            let (calculated, used_starts) = quote::quote_swap(
-                quote_amount,
-                zero_for_one,
+            let quote = snapshot.quote(
+                input_mint,
+                output_mint,
+                requested_raw,
                 exact_in,
-                &config,
-                &bundle.pool,
-                &bundle.bitmap,
-                &mut arrays,
-            )
-            .map_err(RaydiumClmmError::Quote)?;
-            if used_starts.len() > MAX_SWAP_TICK_ARRAYS {
-                return Err(RaydiumClmmError::Quote(format!(
-                    "swap requires {} tick arrays; the single-pool transaction limit is {}",
-                    used_starts.len(),
-                    MAX_SWAP_TICK_ARRAYS
-                )));
-            }
-            let used_keys: Vec<Pubkey> = used_starts
-                .iter()
-                .map(|start| self.tick_array_address(pool_key, *start))
-                .collect();
-            if !used_keys.iter().all(|key| array_keys.contains(key)) {
-                return Err(RaydiumClmmError::MalformedAccount {
-                    address: pool_key,
-                    reason: "quote selected an unfetched tick array".to_owned(),
-                });
-            }
-            let (other_amount_threshold, expected_input_raw, expected_output_raw) = if exact_in {
-                // The program checks the threshold against the output account's
-                // balance change, which is net of the output mint's transfer fee.
-                let output_fee = transfer_fee(output, epoch, calculated)?;
-                let net_output = calculated.checked_sub(output_fee).ok_or_else(|| {
-                    RaydiumClmmError::Quote("output transfer fee exceeds quote".to_owned())
-                })?;
-                (
-                    apply_slippage(net_output, self.slippage_bps, false)?,
-                    requested_raw,
-                    net_output,
-                )
-            } else {
-                let slipped = apply_slippage(calculated, self.slippage_bps, true)?;
-                let input_fee = inverse_transfer_fee(input, epoch, slipped)?;
-                let expected_input_fee = inverse_transfer_fee(input, epoch, calculated)?;
-                (
-                    slipped.checked_add(input_fee).ok_or_else(|| {
-                        RaydiumClmmError::Quote("maximum input overflow".to_owned())
-                    })?,
-                    calculated.checked_add(expected_input_fee).ok_or_else(|| {
-                        RaydiumClmmError::Quote("expected input overflow".to_owned())
-                    })?,
-                    requested_raw,
-                )
-            };
+                self.slippage_bps,
+            )?;
             let input_ata = associated_token_address(self.payer(), input.key, input.token_program);
             let output_ata =
                 associated_token_address(self.payer(), output.key, output.token_program);
             let ata_accounts = self.fetch_optional(&[input_ata, output_ata]).await?;
             let input_balance =
                 self.validate_token_account(input_ata, ata_accounts[0].as_ref(), input, true)?;
-            if input_balance < other_amount_threshold.max(instruction_amount) {
+            let required = quote.max_input_raw();
+            if input_balance < required {
                 return Err(RaydiumClmmError::InsufficientBalance {
                     mint: input.key,
-                    required: other_amount_threshold.max(instruction_amount),
+                    required,
                     available: input_balance,
                 });
             }
             self.validate_token_account(output_ata, ata_accounts[1].as_ref(), output, false)?;
-            let mut instructions = vec![
-                ata_instruction(self.payer(), input),
-                ata_instruction(self.payer(), output),
-            ];
-            used_keys.first().ok_or_else(|| {
-                RaydiumClmmError::Quote("swap quote used no tick arrays".to_owned())
-            })?;
-            let mut remaining = vec![LegacyAccountMeta::new_readonly(
-                legacy_pubkey(bundle.tick_array_bitmap),
-                false,
-            )];
-            remaining.extend(
-                used_keys
-                    .iter()
-                    .map(|key| LegacyAccountMeta::new(legacy_pubkey(*key), false)),
-            );
-            let (input_vault, output_vault) = if zero_for_one {
-                (bundle.token_vault_0, bundle.token_vault_1)
-            } else {
-                (bundle.token_vault_1, bundle.token_vault_0)
-            };
-            instructions.push(self.raydium_instruction(
-                raydium_clmm_interface::accounts::SwapSingleV2 {
-                    payer: legacy_pubkey(self.payer()),
-                    amm_config: legacy_pubkey(bundle.amm_config),
-                    pool_state: legacy_pubkey(pool_key),
-                    input_token_account: legacy_pubkey(input_ata),
-                    output_token_account: legacy_pubkey(output_ata),
-                    input_vault: legacy_pubkey(input_vault),
-                    output_vault: legacy_pubkey(output_vault),
-                    observation_state: legacy_pubkey(bundle.observation),
-                    token_program: spl_token::id(),
-                    token_program_2022: spl_token_2022::id(),
-                    memo_program: spl_memo::id(),
-                    input_vault_mint: legacy_pubkey(input.key),
-                    output_vault_mint: legacy_pubkey(output.key),
-                },
-                raydium_clmm_interface::instruction::SwapV2 {
-                    amount: instruction_amount,
-                    other_amount_threshold,
-                    sqrt_price_limit_x64: 0,
-                    is_base_input: exact_in,
-                },
-                remaining,
-            ));
+            let instructions = snapshot.swap_instructions(self.payer(), &quote)?;
+            let accounts = snapshot.swap_accounts(self.payer(), &quote)?;
             let transaction = self.submit(instructions, &[]).await?;
             Ok(SwapOutcome {
                 transaction,
-                quote: SwapQuote {
-                    exact_in,
-                    input_mint,
-                    output_mint,
-                    expected_input_raw,
-                    expected_output_raw,
-                    other_amount_threshold,
-                    tick_arrays: used_keys.clone(),
-                },
-                accounts: SwapAccounts {
-                    pool: pool_key,
-                    input_token_account: input_ata,
-                    output_token_account: output_ata,
-                    input_vault,
-                    output_vault,
-                    observation: bundle.observation,
-                    tick_array_bitmap: bundle.tick_array_bitmap,
-                    tick_arrays: used_keys,
-                },
+                quote,
+                accounts,
             })
         })
         .await
@@ -1705,14 +1581,7 @@ impl RaydiumClmmClient {
     }
 
     fn tick_array_address(&self, pool: Pubkey, start: i32) -> Pubkey {
-        pda(
-            &[
-                states::TICK_ARRAY_SEED.as_bytes(),
-                pool.as_ref(),
-                &start.to_be_bytes(),
-            ],
-            self.program_id,
-        )
+        tick_array_address_for(self.program_id, pool, start)
     }
 
     fn tick_array_bitmap_address(&self, pool: Pubkey) -> Pubkey {
@@ -1731,6 +1600,270 @@ impl RaydiumClmmClient {
             self.program_id,
         )
     }
+}
+
+/// Pool, config, mints, and tick arrays for both swap directions, fetched
+/// together. Built by [`RaydiumClmmClient::load_swap_snapshot`].
+#[derive(Clone)]
+pub struct SwapSnapshot {
+    program_id: Pubkey,
+    bundle: PoolBundle,
+    config: AmmConfig,
+    zero_for_one: std::result::Result<(VecDeque<TickArrayState>, Vec<Pubkey>), String>,
+    one_for_zero: std::result::Result<(VecDeque<TickArrayState>, Vec<Pubkey>), String>,
+}
+
+impl SwapSnapshot {
+    pub fn pool(&self) -> Pubkey {
+        self.bundle.key
+    }
+
+    pub fn program_id(&self) -> Pubkey {
+        self.program_id
+    }
+
+    /// Pool mints in pool order.
+    pub fn mints(&self) -> (Pubkey, Pubkey) {
+        (self.bundle.mint_0.key, self.bundle.mint_1.key)
+    }
+
+    pub fn token_programs(&self) -> (Pubkey, Pubkey) {
+        (
+            self.bundle.mint_0.token_program,
+            self.bundle.mint_1.token_program,
+        )
+    }
+
+    /// Trade fee in hundredths of a basis point (1,000,000 denominator).
+    pub fn trade_fee_rate(&self) -> u32 {
+        self.config.trade_fee_rate
+    }
+
+    /// `(zero_for_one, (input, output))` for a mint pair.
+    fn direction(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) -> Result<(bool, (&MintInfo, &MintInfo))> {
+        let bundle = &self.bundle;
+        if input_mint == bundle.mint_0.key && output_mint == bundle.mint_1.key {
+            Ok((true, (&bundle.mint_0, &bundle.mint_1)))
+        } else if input_mint == bundle.mint_1.key && output_mint == bundle.mint_0.key {
+            Ok((false, (&bundle.mint_1, &bundle.mint_0)))
+        } else {
+            Err(RaydiumClmmError::InvalidInput(
+                "swap mints do not match the pool".to_owned(),
+            ))
+        }
+    }
+
+    /// Quote a swap in raw atoms: `amount_raw` is the input for exact-in and
+    /// the output for exact-out. Transfer fees use the snapshot's epoch.
+    pub fn quote(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount_raw: u64,
+        exact_in: bool,
+        slippage_bps: u16,
+    ) -> Result<SwapQuote> {
+        if amount_raw == 0 {
+            return Err(RaydiumClmmError::InvalidInput(
+                "swap amount must be greater than zero".to_owned(),
+            ));
+        }
+        if slippage_bps > 10_000 {
+            return Err(RaydiumClmmError::InvalidInput(
+                "slippage_bps cannot exceed 10,000".to_owned(),
+            ));
+        }
+        let bundle = &self.bundle;
+        let (zero_for_one, (input, output)) = self.direction(input_mint, output_mint)?;
+        let epoch = bundle.epoch;
+        let (instruction_amount, quote_amount) = if exact_in {
+            let input_fee = transfer_fee(input, epoch, amount_raw)?;
+            (
+                amount_raw,
+                amount_raw.checked_sub(input_fee).ok_or_else(|| {
+                    RaydiumClmmError::Quote("input transfer fee exceeds amount".to_owned())
+                })?,
+            )
+        } else {
+            let output_fee = inverse_transfer_fee(output, epoch, amount_raw)?;
+            let gross_output = amount_raw.checked_add(output_fee).ok_or_else(|| {
+                RaydiumClmmError::Quote("output transfer fee overflow".to_owned())
+            })?;
+            (amount_raw, gross_output)
+        };
+        let (arrays, array_keys) = if zero_for_one {
+            &self.zero_for_one
+        } else {
+            &self.one_for_zero
+        }
+        .as_ref()
+        .map_err(|error| RaydiumClmmError::Quote(error.clone()))?;
+        let mut arrays = arrays.clone();
+        let (calculated, used_starts) = quote::quote_swap(
+            quote_amount,
+            zero_for_one,
+            exact_in,
+            &self.config,
+            &bundle.pool,
+            &bundle.bitmap,
+            &mut arrays,
+        )
+        .map_err(RaydiumClmmError::Quote)?;
+        if used_starts.len() > MAX_SWAP_TICK_ARRAYS {
+            return Err(RaydiumClmmError::Quote(format!(
+                "swap requires {} tick arrays; the single-pool transaction limit is {}",
+                used_starts.len(),
+                MAX_SWAP_TICK_ARRAYS
+            )));
+        }
+        let used_keys: Vec<Pubkey> = used_starts
+            .iter()
+            .map(|start| tick_array_address_for(self.program_id, bundle.key, *start))
+            .collect();
+        if used_keys.is_empty() || !used_keys.iter().all(|key| array_keys.contains(key)) {
+            return Err(RaydiumClmmError::MalformedAccount {
+                address: bundle.key,
+                reason: "quote selected an unfetched tick array".to_owned(),
+            });
+        }
+        let (other_amount_threshold, expected_input_raw, expected_output_raw) = if exact_in {
+            // The program checks the threshold against the output account's
+            // balance change, which is net of the output mint's transfer fee.
+            let output_fee = transfer_fee(output, epoch, calculated)?;
+            let net_output = calculated.checked_sub(output_fee).ok_or_else(|| {
+                RaydiumClmmError::Quote("output transfer fee exceeds quote".to_owned())
+            })?;
+            (
+                apply_slippage(net_output, slippage_bps, false)?,
+                amount_raw,
+                net_output,
+            )
+        } else {
+            let slipped = apply_slippage(calculated, slippage_bps, true)?;
+            let input_fee = inverse_transfer_fee(input, epoch, slipped)?;
+            let expected_input_fee = inverse_transfer_fee(input, epoch, calculated)?;
+            (
+                slipped
+                    .checked_add(input_fee)
+                    .ok_or_else(|| RaydiumClmmError::Quote("maximum input overflow".to_owned()))?,
+                calculated
+                    .checked_add(expected_input_fee)
+                    .ok_or_else(|| RaydiumClmmError::Quote("expected input overflow".to_owned()))?,
+                amount_raw,
+            )
+        };
+        if exact_in && expected_output_raw == 0 {
+            return Err(RaydiumClmmError::Quote(
+                "swap amount quotes to zero output".to_owned(),
+            ));
+        }
+        Ok(SwapQuote {
+            exact_in,
+            input_mint,
+            output_mint,
+            instruction_amount,
+            expected_input_raw,
+            expected_output_raw,
+            other_amount_threshold,
+            tick_arrays: used_keys,
+        })
+    }
+
+    /// Accounts of `SwapSingleV2` for `owner`, in instruction order, followed
+    /// by the bitmap extension and the quote's tick arrays.
+    pub fn swap_account_metas(&self, owner: Pubkey, quote: &SwapQuote) -> Result<Vec<AccountMeta>> {
+        let accounts = self.swap_accounts(owner, quote)?;
+        let (_, (input, output)) = self.direction(quote.input_mint, quote.output_mint)?;
+        let mut metas = raydium_clmm_interface::accounts::SwapSingleV2 {
+            payer: legacy_pubkey(owner),
+            amm_config: legacy_pubkey(self.bundle.amm_config),
+            pool_state: legacy_pubkey(self.bundle.key),
+            input_token_account: legacy_pubkey(accounts.input_token_account),
+            output_token_account: legacy_pubkey(accounts.output_token_account),
+            input_vault: legacy_pubkey(accounts.input_vault),
+            output_vault: legacy_pubkey(accounts.output_vault),
+            observation_state: legacy_pubkey(self.bundle.observation),
+            token_program: spl_token::id(),
+            token_program_2022: spl_token_2022::id(),
+            memo_program: spl_memo::id(),
+            input_vault_mint: legacy_pubkey(input.key),
+            output_vault_mint: legacy_pubkey(output.key),
+        }
+        .to_account_metas(None);
+        metas.push(LegacyAccountMeta::new_readonly(
+            legacy_pubkey(self.bundle.tick_array_bitmap),
+            false,
+        ));
+        metas.extend(
+            quote
+                .tick_arrays
+                .iter()
+                .map(|key| LegacyAccountMeta::new(legacy_pubkey(*key), false)),
+        );
+        Ok(instruction(LegacyInstruction {
+            program_id: legacy_pubkey(self.program_id),
+            accounts: metas,
+            data: vec![],
+        })
+        .accounts)
+    }
+
+    pub fn swap_accounts(&self, owner: Pubkey, quote: &SwapQuote) -> Result<SwapAccounts> {
+        let (zero_for_one, (input, output)) =
+            self.direction(quote.input_mint, quote.output_mint)?;
+        let (input_vault, output_vault) = if zero_for_one {
+            (self.bundle.token_vault_0, self.bundle.token_vault_1)
+        } else {
+            (self.bundle.token_vault_1, self.bundle.token_vault_0)
+        };
+        Ok(SwapAccounts {
+            pool: self.bundle.key,
+            input_token_account: associated_token_address(owner, input.key, input.token_program),
+            output_token_account: associated_token_address(owner, output.key, output.token_program),
+            input_vault,
+            output_vault,
+            observation: self.bundle.observation,
+            tick_array_bitmap: self.bundle.tick_array_bitmap,
+            tick_arrays: quote.tick_arrays.clone(),
+        })
+    }
+
+    /// Idempotent ATA creation for both mints plus one `SwapV2` for `owner`.
+    pub fn swap_instructions(&self, owner: Pubkey, quote: &SwapQuote) -> Result<Vec<Instruction>> {
+        let (_, (input, output)) = self.direction(quote.input_mint, quote.output_mint)?;
+        let accounts = self.swap_account_metas(owner, quote)?;
+        let data = raydium_clmm_interface::instruction::SwapV2 {
+            amount: quote.instruction_amount,
+            other_amount_threshold: quote.other_amount_threshold,
+            sqrt_price_limit_x64: 0,
+            is_base_input: quote.exact_in,
+        }
+        .data();
+        Ok(vec![
+            ata_instruction(owner, input),
+            ata_instruction(owner, output),
+            Instruction {
+                program_id: self.program_id,
+                accounts,
+                data,
+            },
+        ])
+    }
+}
+
+fn tick_array_address_for(program_id: Pubkey, pool: Pubkey, start: i32) -> Pubkey {
+    pda(
+        &[
+            states::TICK_ARRAY_SEED.as_bytes(),
+            pool.as_ref(),
+            &start.to_be_bytes(),
+        ],
+        program_id,
+    )
 }
 
 fn pool_address_for(program_id: Pubkey, config: Pubkey, mint_0: Pubkey, mint_1: Pubkey) -> Pubkey {
@@ -1910,10 +2043,23 @@ pub struct SwapQuote {
     pub exact_in: bool,
     pub input_mint: Pubkey,
     pub output_mint: Pubkey,
+    /// `amount` sent to the program: input for exact-in, output for exact-out.
+    pub instruction_amount: u64,
     pub expected_input_raw: u64,
     pub expected_output_raw: u64,
     pub other_amount_threshold: u64,
     pub tick_arrays: Vec<Pubkey>,
+}
+
+impl SwapQuote {
+    /// Most the swap may debit from the input account.
+    pub fn max_input_raw(&self) -> u64 {
+        if self.exact_in {
+            self.instruction_amount
+        } else {
+            self.other_amount_threshold
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1957,6 +2103,7 @@ pub enum RaydiumClmmError {
     },
 }
 
+#[derive(Clone)]
 struct MintInfo {
     key: Pubkey,
     token_program: Pubkey,
@@ -1964,6 +2111,7 @@ struct MintInfo {
     data: Vec<u8>,
 }
 
+#[derive(Clone)]
 struct PoolBundle {
     pool: PoolState,
     config_account: Account,
