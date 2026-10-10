@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use futures::StreamExt;
 use mtm_chain::ChainClient;
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::{keypair_from_environment, signer_from_environment};
@@ -29,6 +30,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solana_commitment_config::CommitmentConfig;
+use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 
 #[derive(Debug, Parser)]
@@ -57,6 +59,8 @@ enum Command {
     },
     /// Print every scenario pool and wallet with its balances.
     Status,
+    /// Print how many tokens (oracle symbols) the scenario prices.
+    TokenCount,
     /// Record every participant's holdings (wallet, seats, LP positions) and
     /// the oracle prices, for `report`.
     Snapshot {
@@ -77,6 +81,9 @@ enum Command {
         compute_sample_every: u64,
     },
 }
+
+/// role, wallet, SOL target, token targets, funding mode
+type FundingTarget<'s> = (String, Pubkey, Decimal, Vec<(&'s Token, Decimal)>, Funding);
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -119,6 +126,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
+        Command::TokenCount => json!(scenario.tokens.len()),
         Command::Snapshot { out } => {
             let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
             // Compact: at tens of thousands of participants a pretty
@@ -302,69 +310,73 @@ async fn bootstrap(
         }));
     }
 
-    // 3. wallets
-    let mut wallets = Vec::new();
+    // 3. wallets: one funding transaction per wallet, sent concurrently
+    let mut targets: Vec<FundingTarget<'_>> = Vec::new();
     if !no_fund {
-        for maker in &scenario.config.makers {
-            let wallet = scenario.maker_wallet(&maker.name).pubkey();
-            let tokens = maker
-                .inventory
+        let resolve = |inventory: &std::collections::BTreeMap<String, Decimal>| {
+            inventory
                 .iter()
                 .map(|(name, amount)| Ok((scenario.token(name)?, *amount)))
-                .collect::<Result<Vec<_>>>()?;
-            let outcome = top_up(
-                chain,
-                faucet.as_ref(),
-                mint_authority.as_ref(),
-                &wallet,
+                .collect::<Result<Vec<_>>>()
+        };
+        for maker in &scenario.config.makers {
+            targets.push((
+                format!("maker/{}", maker.name),
+                scenario.maker_wallet(&maker.name).pubkey(),
                 maker.sol,
-                &tokens,
+                resolve(&maker.inventory)?,
                 Funding::Endowment,
-            )
-            .await?;
-            wallets.push(json!({ "role": format!("maker/{}", maker.name), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
+            ));
         }
         for bot in scenario.config.arb.iter().flat_map(|arb| &arb.bots) {
-            let wallet = scenario.arb_wallet(&bot.name).pubkey();
-            let tokens = bot
-                .inventory
-                .iter()
-                .map(|(name, amount)| Ok((scenario.token(name)?, *amount)))
-                .collect::<Result<Vec<_>>>()?;
-            let outcome = top_up(
-                chain,
-                faucet.as_ref(),
-                mint_authority.as_ref(),
-                &wallet,
+            targets.push((
+                format!("arb/{}", bot.name),
+                scenario.arb_wallet(&bot.name).pubkey(),
                 bot.sol,
-                &tokens,
+                resolve(&bot.inventory)?,
                 Funding::Endowment,
-            )
-            .await?;
-            wallets.push(json!({ "role": format!("arb/{}", bot.name), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
+            ));
         }
         if let Some(flow) = &scenario.config.flow {
-            let tokens = flow
-                .inventory
-                .iter()
-                .map(|(name, amount)| Ok((scenario.token(name)?, *amount)))
-                .collect::<Result<Vec<_>>>()?;
+            let tokens = resolve(&flow.inventory)?;
             for index in 0..flow.takers {
-                let wallet = scenario.taker_wallet(index).pubkey();
+                targets.push((
+                    format!("taker/{index}"),
+                    scenario.taker_wallet(index).pubkey(),
+                    flow.sol,
+                    tokens.clone(),
+                    Funding::TopUp,
+                ));
+            }
+        }
+    }
+    let concurrency: usize = std::env::var("SCENARIO_FUNDING_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let wallets: Vec<Value> = futures::stream::iter(targets.iter().map(
+        |(role, wallet, sol, tokens, funding)| {
+            let (faucet, mint_authority) = (&faucet, &mint_authority);
+            async move {
                 let outcome = top_up(
                     chain,
                     faucet.as_ref(),
                     mint_authority.as_ref(),
-                    &wallet,
-                    flow.sol,
-                    &tokens,
-                    Funding::TopUp,
+                    wallet,
+                    *sol,
+                    tokens,
+                    *funding,
                 )
                 .await?;
-                wallets.push(json!({ "role": format!("taker/{index}"), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
+                Ok::<_, anyhow::Error>(json!({ "role": role, "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }))
             }
-        }
-    }
+        },
+    ))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<_>>()?;
     Ok(json!({
         "orcaWhirlpoolsConfig": { "address": orca_config.whirlpools_config.to_string(), "created": orca_config.created_config },
         "raydiumAmmConfig": { "address": raydium_config.amm_config.to_string(), "created": raydium_config.created },

@@ -9,6 +9,12 @@
 #                                       "mtm — market-making scenario")
 #   scenario.sh snapshot FILE [local|testnet]   participant holdings at oracle prices
 #   scenario.sh report START END [local|testnet] PnL, transactions, trades between snapshots
+#   scenario.sh measure NAME SECONDS [local|testnet] snapshot → sample load → snapshot → report
+#                                       into .scenario/runs/NAME-{t0,t1,load,report}.json
+#
+# SCENARIO_SCALE=x10|x100|assets layers config/scale-<scale>.toml (generated
+# by scale.py) over the profile; SCENARIO_TOKENS_CONFIG picks the token
+# bootstrap config (the asset scale uses bootstrap/scenario/tokens-assets.json).
 #   scenario.sh down                    stop every service started by `up`/`observe`
 #                                       (TERM, then KILL after 30 s)
 #
@@ -24,6 +30,7 @@ args=()
 case "$cmd" in
   snapshot) args=("${2:?snapshot FILE}"); shift ;;
   report) args=("${2:?report START END}" "${3:?report START END}"); shift 2 ;;
+  measure) args=("${2:?measure NAME SECONDS}" "${3:?measure NAME SECONDS}"); shift 2 ;;
 esac
 target="${2:-local}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -42,6 +49,7 @@ case "$target" in
     ;;
   *) echo "unknown target: $target (local|testnet)" >&2; exit 2 ;;
 esac
+[[ -n "${SCENARIO_SCALE:-}" ]] && export MTM_PROFILE="$MTM_PROFILE,scale-$SCENARIO_SCALE"
 export MTM_RPC__HTTP_URL="$rpc"
 if [[ -n "${SCENARIO_WS_URL:-}" ]]; then
   export MTM_RPC__WS_URL="$SCENARIO_WS_URL"
@@ -134,6 +142,7 @@ tokens() {
   local runner=(pnpm bootstrap:tokens)
   [[ -x node_modules/.bin/tsx ]] && runner=(node_modules/.bin/tsx bootstrap/tokens/deploy.ts)
   "${runner[@]}" --apply --skip-existing --testnet-rpc "$rpc" \
+    ${SCENARIO_TOKENS_CONFIG:+--config "$SCENARIO_TOKENS_CONFIG"} \
     ${SCENARIO_MAINNET_RPC:+--mainnet-rpc "$SCENARIO_MAINNET_RPC"}
 }
 
@@ -231,8 +240,9 @@ case "$cmd" in
     start oracle "$bin/oracle"
     wait_http http://127.0.0.1:8180/health oracle
     # Pools are created at live oracle prices: wait for the first prices.
-    for _ in $(seq 1 60); do
-      [[ "$(curl -sf http://127.0.0.1:8180/v1/prices | grep -o '"symbol"' | wc -l)" -ge 3 ]] && break
+    want="$("$bin/scenario" token-count 2>/dev/null || echo 3)"
+    for _ in $(seq 1 120); do
+      [[ "$(curl -sf http://127.0.0.1:8180/v1/prices | grep -o '"symbol"' | wc -l)" -ge "$want" ]] && break
       sleep 1
     done
     "$bin/scenario" bootstrap | tee "$state/bootstrap.json"
@@ -265,6 +275,32 @@ case "$cmd" in
     "$bin/scenario" report --start "${args[0]}" --end "${args[1]}" \
       --prometheus "${SCENARIO_PROMETHEUS:-http://127.0.0.1:9190}"
     ;;
+  measure)
+    # Participants are frozen (SIGSTOP) while each snapshot reads, so every
+    # wallet, seat, and position is read in the same chain state.
+    name="${args[0]}" seconds="${args[1]}" runs="$state/runs"
+    mkdir -p "$runs"
+    participants=(flow arb mm)
+    signal() {
+      for n in "${participants[@]}"; do
+        [[ -f "$state/pids/$n" ]] && kill "-$1" "$(cat "$state/pids/$n")" 2>/dev/null || true
+      done
+    }
+    frozen_snapshot() {
+      signal STOP
+      sleep "${SCENARIO_SETTLE_S:-3}" # let in-flight transactions land
+      "$bin/scenario" snapshot --out "$1" >&2 || { signal CONT; return 1; }
+      signal CONT
+    }
+    trap 'signal CONT' EXIT
+    frozen_snapshot "$runs/$name-t0.json"
+    python3 -I "$root/bootstrap/scenario/sample.py" --seconds "$seconds" --rpc "$rpc" \
+      --out "$runs/$name-load.json" >/dev/null
+    frozen_snapshot "$runs/$name-t1.json"
+    "$bin/scenario" report --start "$runs/$name-t0.json" --end "$runs/$name-t1.json" \
+      --prometheus "${SCENARIO_PROMETHEUS:-http://127.0.0.1:9190}" >"$runs/$name-report.json"
+    echo "wrote $runs/$name-{t0,t1,load,report}.json"
+    ;;
   down)
     # Takers first, so nothing trades against makers that are unwinding.
     for name in arb flow mm router oracle grafana prometheus; do
@@ -276,5 +312,5 @@ case "$cmd" in
       $compose -f ops/compose.scenario.yaml down # volumes are kept
     fi
     ;;
-  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|snapshot|report|down)" >&2; exit 2 ;;
+  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|snapshot|report|measure|down)" >&2; exit 2 ;;
 esac

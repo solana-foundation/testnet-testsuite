@@ -3902,8 +3902,6 @@ dependencies = [
  "serde_json",
  "solana-commitment-config",
  "solana-pubkey 4.4.0",
- "solana-rpc-client",
- "solana-signature 3.6.0",
  "solana-signer 3.0.1",
  "thiserror 2.0.21",
  "tokio",

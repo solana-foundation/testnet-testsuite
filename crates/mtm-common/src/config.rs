@@ -25,11 +25,14 @@ fn default_commitment() -> String {
 }
 
 pub fn load<T: for<'de> Deserialize<'de>>() -> Result<T, Box<figment::Error>> {
-    let profile = std::env::var("MTM_PROFILE").unwrap_or_else(|_| "local".to_string());
+    // `MTM_PROFILE=a,b` layers b.toml over a.toml (e.g. a scale overlay).
+    let profiles = std::env::var("MTM_PROFILE").unwrap_or_else(|_| "local".to_string());
     let root = config_root();
-    Figment::new()
-        .merge(Toml::file(root.join("default.toml")))
-        .merge(Toml::file(root.join(format!("{profile}.toml"))))
+    let mut figment = Figment::new().merge(Toml::file(root.join("default.toml")));
+    for profile in profiles.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        figment = figment.merge(Toml::file(root.join(format!("{profile}.toml"))));
+    }
+    figment
         .merge(Env::prefixed("MTM_").split("__"))
         .extract()
         .map_err(Box::new)
