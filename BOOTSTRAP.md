@@ -93,7 +93,7 @@ Build the `testnet` branch of the `whirlpools` fork with the program ID of
 `KEYPAIR_ORCA_WHIRLPOOL` (see [docs/dex-forks.md](./docs/dex-forks.md)):
 
 ```sh
-cargo build-sbf --tools-version v1.41 --manifest-path ../whirlpools/programs/whirlpool/Cargo.toml
+cargo build-sbf --tools-version v1.37 --manifest-path ../whirlpools/programs/whirlpool/Cargo.toml
 ```
 
 For surfnet deployment, run:

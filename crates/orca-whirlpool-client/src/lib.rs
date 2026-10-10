@@ -854,6 +854,9 @@ impl OrcaWhirlpoolClient {
                 info!(action, %target, latency_ms = started.elapsed().as_millis(), "Orca action complete")
             }
             Err(problem) => {
+                if let OrcaWhirlpoolError::SimulationFailure { logs, .. } = problem {
+                    error!(action, %target, ?logs, "Orca simulation logs");
+                }
                 error!(action, %target, error = %problem, latency_ms = started.elapsed().as_millis(), "Orca action failed")
             }
         }
