@@ -12,3 +12,4 @@ dist/
 .raydium-clmm-recovery/
 .orca-whirlpool-recovery/
 .manifest-recovery/
+.scenario/

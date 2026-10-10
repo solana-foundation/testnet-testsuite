@@ -135,3 +135,10 @@ for testnet, run
 just deploy-program-testnet "KEYPAIR_MANIFEST" "../manifest/target/deploy/manifest.so"
 just manifest-create-markets-testnet
 ```
+
+### Market-making scenario
+
+With the programs above deployed, `just scenario-up-dev` (or
+`just scenario-testnet`) bootstraps tokens, venue configs, pools at oracle
+prices, and maker/taker wallets, then runs the oracle, router, makers, and
+flow. Details and the replay guarantees: [bootstrap/scenario/README.md](./bootstrap/scenario/README.md).

@@ -5,6 +5,7 @@ members = [
     "crates/mtm-common",
     "crates/mtm-dex-harness",
     "crates/mtm-math",
+    "crates/mtm-scenario",
     "crates/mtm-venues",
     "crates/mtm-telemetry",
     "crates/manifest-dex-client",
@@ -16,11 +17,14 @@ members = [
     "crates/raydium-clmm-orchestrator",
     "crates/router-client",
     "crates/sdks/manifest",
+    "services/flow",
     "services/manifest-dex-orchestrator",
+    "services/mm",
     "services/oracle",
     "services/orca-whirlpool-orchestrator",
     "services/raydium-clmm-orchestrator",
     "services/router",
+    "services/scenario",
 ]
 
 [workspace.package]
@@ -34,6 +38,7 @@ mtm-chain = { path = "crates/mtm-chain" }
 mtm-common = { path = "crates/mtm-common" }
 mtm-dex-harness = { path = "crates/mtm-dex-harness" }
 mtm-math = { path = "crates/mtm-math" }
+mtm-scenario = { path = "crates/mtm-scenario" }
 mtm-venues = { path = "crates/mtm-venues" }
 manifest-dex-client = { path = "crates/manifest-dex-client" }
 manifest-dex-orchestrator = { path = "crates/manifest-dex-orchestrator" }
