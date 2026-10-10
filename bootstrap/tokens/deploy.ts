@@ -52,6 +52,7 @@ interface Options {
   readonly mainnetRpc: string;
   readonly testnetRpc: string;
   readonly payerKeypairEnv: string;
+  readonly skipExisting: boolean;
 }
 
 /** Parses and validates command-line options without performing network I/O. */
@@ -61,10 +62,15 @@ export function parseOptions(args: readonly string[]): Options {
   let mainnetRpc = DEFAULT_MAINNET_RPC;
   let testnetRpc = DEFAULT_TESTNET_RPC;
   let payerKeypairEnv = "KEYPAIR_FAUCET";
+  let skipExisting = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--apply") {
       apply = true;
+      continue;
+    }
+    if (argument === "--skip-existing") {
+      skipExisting = true;
       continue;
     }
     const value = args[index + 1];
@@ -82,6 +88,7 @@ export function parseOptions(args: readonly string[]): Options {
     mainnetRpc,
     testnetRpc,
     payerKeypairEnv,
+    skipExisting,
   };
 }
 
@@ -307,10 +314,20 @@ async function deployToken(
     );
   const sourceMetadata = decodeMetadata(sourceMetadataAccount.data);
   const keypairs = loadKeypairs(config, options.payerKeypairEnv);
-  if (await testnet.getAccountInfo(keypairs.mint.publicKey, "confirmed"))
+  if (await testnet.getAccountInfo(keypairs.mint.publicKey, "confirmed")) {
+    if (options.skipExisting) {
+      console.log(
+        JSON.stringify({
+          action: "skip-existing",
+          mint: keypairs.mint.publicKey.toBase58(),
+        }),
+      );
+      return;
+    }
     throw new Error(
-      `Testnet mint ${keypairs.mint.publicKey.toBase58()} already exists; refusing to overwrite it.`,
+      `Testnet mint ${keypairs.mint.publicKey.toBase58()} already exists; refusing to overwrite it (pass --skip-existing to leave it).`,
     );
+  }
   const rent = await testnet.getMinimumBalanceForRentExemption(
     MINT_SIZE,
     "confirmed",
