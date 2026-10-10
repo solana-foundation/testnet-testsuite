@@ -664,12 +664,19 @@ impl OrcaWhirlpoolClient {
         .await
     }
 
-    /// Quote and build a swap without submitting it. The returned instructions
-    /// create the payer's ATAs idempotently, then swap; callers composing their
-    /// own transaction (the router) own the compute budget.
-    pub async fn swap_instructions(&self, params: SwapInstructionParams) -> Result<SwapPlan> {
-        let bundle = self.load_pool(params.pool).await?;
-        self.plan_swap(&bundle, params).await
+    /// Fetch the pool, mints, and the five tick arrays around the current
+    /// tick. Quoting and instruction building on the snapshot are pure, so
+    /// callers (the router) can price many sizes and build for any owner.
+    pub async fn load_swap_snapshot(&self, pool: Pubkey) -> Result<SwapSnapshot> {
+        let bundle = self.load_pool(pool).await?;
+        let (tick_arrays, facades) = self.load_swap_tick_arrays(&bundle).await?;
+        Ok(SwapSnapshot {
+            program_id: self.program_id,
+            oracle: self.oracle_address(pool),
+            bundle,
+            tick_arrays,
+            facades,
+        })
     }
 
     async fn swap(
@@ -687,154 +694,43 @@ impl OrcaWhirlpoolClient {
         };
         self.run(action, pool, async move {
             ensure_positive(amount, "swap amount")?;
-            let bundle = self.load_pool(pool).await?;
+            let snapshot = self.load_swap_snapshot(pool).await?;
+            let bundle = &snapshot.bundle;
             let specified = if exact_in {
                 bundle.mint_for(input_mint)?
             } else {
                 bundle.mint_for(output_mint)?
             };
             let amount_raw = ui_to_raw(amount, specified.decimals)?;
-            let plan = self
-                .plan_swap(
-                    &bundle,
-                    SwapInstructionParams {
-                        pool,
-                        input_mint,
-                        output_mint,
-                        amount_raw,
-                        exact_in,
-                        slippage_bps: self.slippage_bps,
-                    },
-                )
-                .await?;
-            let input_balance = if plan.a_to_b {
+            let quote = snapshot.quote(
+                input_mint,
+                output_mint,
+                amount_raw,
+                exact_in,
+                self.slippage_bps,
+            )?;
+            let input_balance = if input_mint == bundle.mint_a.key {
                 bundle.balance_a
             } else {
                 bundle.balance_b
             };
-            if input_balance < plan.quote.max_input_raw {
+            if input_balance < quote.max_input_raw {
                 return Err(OrcaWhirlpoolError::InsufficientBalance {
                     mint: input_mint,
-                    required: plan.quote.max_input_raw,
+                    required: quote.max_input_raw,
                     available: input_balance,
                 });
             }
-            let transaction = self.submit(plan.instructions.clone(), &[]).await?;
+            let instructions = snapshot.swap_instructions(self.payer(), &quote)?;
+            let accounts = snapshot.swap_accounts(self.payer(), &quote)?;
+            let transaction = self.submit(instructions, &[]).await?;
             Ok(SwapOutcome {
                 transaction,
-                quote: plan.quote,
-                accounts: plan.accounts,
+                quote,
+                accounts,
             })
         })
         .await
-    }
-
-    async fn plan_swap(
-        &self,
-        bundle: &PoolBundle,
-        params: SwapInstructionParams,
-    ) -> Result<SwapPlan> {
-        if params.amount_raw == 0 {
-            return Err(OrcaWhirlpoolError::InvalidInput(
-                "swap amount must be greater than zero".to_owned(),
-            ));
-        }
-        if params.slippage_bps > 10_000 {
-            return Err(OrcaWhirlpoolError::InvalidInput(
-                "slippage_bps cannot exceed 10,000".to_owned(),
-            ));
-        }
-        let a_to_b = match (params.input_mint, params.output_mint) {
-            (input, output) if input == bundle.mint_a.key && output == bundle.mint_b.key => true,
-            (input, output) if input == bundle.mint_b.key && output == bundle.mint_a.key => false,
-            _ => {
-                return Err(OrcaWhirlpoolError::InvalidInput(
-                    "swap mints do not match the pool".to_owned(),
-                ));
-            }
-        };
-        let (tick_arrays, facades) = self.load_swap_tick_arrays(bundle).await?;
-        let quote = bounded_swap_quote(
-            bundle,
-            facades,
-            params.amount_raw,
-            a_to_b,
-            params.exact_in,
-            params.slippage_bps,
-        )?;
-        let BoundedSwapQuote {
-            expected_input_raw,
-            expected_output_raw,
-            other_amount_threshold,
-            max_input_raw,
-        } = quote;
-        let oracle = self.oracle_address(bundle.key);
-        let mut instructions = self.position_ata_instructions(bundle);
-        let swap = orca::SwapV2 {
-            token_program_a: legacy_pubkey(bundle.mint_a.token_program),
-            token_program_b: legacy_pubkey(bundle.mint_b.token_program),
-            memo_program: legacy_pubkey(spl::MEMO_PROGRAM_ID),
-            token_authority: legacy_pubkey(self.payer()),
-            whirlpool: legacy_pubkey(bundle.key),
-            token_mint_a: legacy_pubkey(bundle.mint_a.key),
-            token_mint_b: legacy_pubkey(bundle.mint_b.key),
-            token_owner_account_a: legacy_pubkey(bundle.user_token_a),
-            token_vault_a: legacy_pubkey(bundle.token_vault_a),
-            token_owner_account_b: legacy_pubkey(bundle.user_token_b),
-            token_vault_b: legacy_pubkey(bundle.token_vault_b),
-            tick_array0: legacy_pubkey(tick_arrays[0]),
-            tick_array1: legacy_pubkey(tick_arrays[1]),
-            tick_array2: legacy_pubkey(tick_arrays[2]),
-            oracle: legacy_pubkey(oracle),
-        }
-        .instruction_with_remaining_accounts(
-            orca::SwapV2InstructionArgs {
-                amount: params.amount_raw,
-                other_amount_threshold,
-                sqrt_price_limit: 0,
-                amount_specified_is_input: params.exact_in,
-                a_to_b,
-                remaining_accounts_info: Some(orca::RemainingAccountsInfo {
-                    slices: vec![orca::RemainingAccountsSlice {
-                        accounts_type: orca::AccountsType::SupplementalTickArrays,
-                        length: 2,
-                    }],
-                }),
-            },
-            &[
-                legacy_meta(AccountMeta::new(tick_arrays[3], false)),
-                legacy_meta(AccountMeta::new(tick_arrays[4], false)),
-            ],
-        );
-        instructions.push(instruction(swap, self.program_id));
-        let (input_token_account, output_token_account) = if a_to_b {
-            (bundle.user_token_a, bundle.user_token_b)
-        } else {
-            (bundle.user_token_b, bundle.user_token_a)
-        };
-        Ok(SwapPlan {
-            a_to_b,
-            instructions,
-            quote: SwapQuote {
-                exact_in: params.exact_in,
-                input_mint: params.input_mint,
-                output_mint: params.output_mint,
-                expected_input_raw,
-                expected_output_raw,
-                other_amount_threshold,
-                max_input_raw,
-                tick_arrays: tick_arrays.to_vec(),
-            },
-            accounts: SwapAccounts {
-                pool: bundle.key,
-                input_token_account,
-                output_token_account,
-                token_vault_a: bundle.token_vault_a,
-                token_vault_b: bundle.token_vault_b,
-                oracle,
-                tick_arrays: tick_arrays.to_vec(),
-            },
-        })
     }
 
     async fn run<T, F>(&self, action: &'static str, target: Pubkey, future: F) -> Result<T>
@@ -1435,6 +1331,210 @@ impl OrcaWhirlpoolClient {
     }
 }
 
+/// Pool, mints, and tick arrays fetched together by
+/// [`OrcaWhirlpoolClient::load_swap_snapshot`].
+#[derive(Clone)]
+pub struct SwapSnapshot {
+    program_id: Pubkey,
+    oracle: Pubkey,
+    bundle: PoolBundle,
+    tick_arrays: [Pubkey; 5],
+    facades: [TickArrayFacade; 5],
+}
+
+impl SwapSnapshot {
+    pub fn pool(&self) -> Pubkey {
+        self.bundle.key
+    }
+
+    pub fn program_id(&self) -> Pubkey {
+        self.program_id
+    }
+
+    /// Pool mints in pool order (A, B).
+    pub fn mints(&self) -> (Pubkey, Pubkey) {
+        (self.bundle.mint_a.key, self.bundle.mint_b.key)
+    }
+
+    pub fn token_programs(&self) -> (Pubkey, Pubkey) {
+        (
+            self.bundle.mint_a.token_program,
+            self.bundle.mint_b.token_program,
+        )
+    }
+
+    /// Trade fee in hundredths of a basis point (1,000,000 denominator).
+    pub fn fee_rate(&self) -> u16 {
+        self.bundle.whirlpool.fee_rate
+    }
+
+    fn a_to_b(&self, input_mint: Pubkey, output_mint: Pubkey) -> Result<bool> {
+        let bundle = &self.bundle;
+        if input_mint == bundle.mint_a.key && output_mint == bundle.mint_b.key {
+            Ok(true)
+        } else if input_mint == bundle.mint_b.key && output_mint == bundle.mint_a.key {
+            Ok(false)
+        } else {
+            Err(OrcaWhirlpoolError::InvalidInput(
+                "swap mints do not match the pool".to_owned(),
+            ))
+        }
+    }
+
+    /// Quote a swap in raw atoms: `amount_raw` is the input for exact-in and
+    /// the output for exact-out.
+    pub fn quote(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount_raw: u64,
+        exact_in: bool,
+        slippage_bps: u16,
+    ) -> Result<SwapQuote> {
+        if amount_raw == 0 {
+            return Err(OrcaWhirlpoolError::InvalidInput(
+                "swap amount must be greater than zero".to_owned(),
+            ));
+        }
+        if slippage_bps > 10_000 {
+            return Err(OrcaWhirlpoolError::InvalidInput(
+                "slippage_bps cannot exceed 10,000".to_owned(),
+            ));
+        }
+        let a_to_b = self.a_to_b(input_mint, output_mint)?;
+        let BoundedSwapQuote {
+            expected_input_raw,
+            expected_output_raw,
+            other_amount_threshold,
+            max_input_raw,
+        } = bounded_swap_quote(
+            &self.bundle,
+            self.facades,
+            amount_raw,
+            a_to_b,
+            exact_in,
+            slippage_bps,
+        )?;
+        Ok(SwapQuote {
+            exact_in,
+            input_mint,
+            output_mint,
+            instruction_amount: amount_raw,
+            expected_input_raw,
+            expected_output_raw,
+            other_amount_threshold,
+            max_input_raw,
+            tick_arrays: self.tick_arrays.to_vec(),
+        })
+    }
+
+    /// `SwapV2` accounts for `owner` in instruction order, followed by the two
+    /// supplemental tick arrays.
+    pub fn swap_account_metas(&self, owner: Pubkey) -> Vec<AccountMeta> {
+        self.swap_instruction(owner, 0, 0, true, true).accounts
+    }
+
+    pub fn swap_accounts(&self, owner: Pubkey, quote: &SwapQuote) -> Result<SwapAccounts> {
+        let a_to_b = self.a_to_b(quote.input_mint, quote.output_mint)?;
+        let (user_a, user_b) = self.owner_accounts(owner);
+        let (input_token_account, output_token_account) = if a_to_b {
+            (user_a, user_b)
+        } else {
+            (user_b, user_a)
+        };
+        Ok(SwapAccounts {
+            pool: self.bundle.key,
+            input_token_account,
+            output_token_account,
+            token_vault_a: self.bundle.token_vault_a,
+            token_vault_b: self.bundle.token_vault_b,
+            oracle: self.oracle,
+            tick_arrays: self.tick_arrays.to_vec(),
+        })
+    }
+
+    /// Idempotent ATA creation for both mints plus one `SwapV2` for `owner`.
+    pub fn swap_instructions(&self, owner: Pubkey, quote: &SwapQuote) -> Result<Vec<Instruction>> {
+        let a_to_b = self.a_to_b(quote.input_mint, quote.output_mint)?;
+        let mut instructions: Vec<Instruction> = [&self.bundle.mint_a, &self.bundle.mint_b]
+            .into_iter()
+            .map(|mint| {
+                spl::create_associated_token_account_idempotent(
+                    &owner,
+                    &owner,
+                    &mint.key,
+                    &mint.token_program,
+                )
+            })
+            .collect();
+        instructions.push(self.swap_instruction(
+            owner,
+            quote.instruction_amount,
+            quote.other_amount_threshold,
+            quote.exact_in,
+            a_to_b,
+        ));
+        Ok(instructions)
+    }
+
+    fn owner_accounts(&self, owner: Pubkey) -> (Pubkey, Pubkey) {
+        let bundle = &self.bundle;
+        (
+            spl::associated_token_address(&owner, &bundle.mint_a.key, &bundle.mint_a.token_program),
+            spl::associated_token_address(&owner, &bundle.mint_b.key, &bundle.mint_b.token_program),
+        )
+    }
+
+    fn swap_instruction(
+        &self,
+        owner: Pubkey,
+        amount: u64,
+        other_amount_threshold: u64,
+        exact_in: bool,
+        a_to_b: bool,
+    ) -> Instruction {
+        let bundle = &self.bundle;
+        let (user_a, user_b) = self.owner_accounts(owner);
+        let swap = orca::SwapV2 {
+            token_program_a: legacy_pubkey(bundle.mint_a.token_program),
+            token_program_b: legacy_pubkey(bundle.mint_b.token_program),
+            memo_program: legacy_pubkey(spl::MEMO_PROGRAM_ID),
+            token_authority: legacy_pubkey(owner),
+            whirlpool: legacy_pubkey(bundle.key),
+            token_mint_a: legacy_pubkey(bundle.mint_a.key),
+            token_mint_b: legacy_pubkey(bundle.mint_b.key),
+            token_owner_account_a: legacy_pubkey(user_a),
+            token_vault_a: legacy_pubkey(bundle.token_vault_a),
+            token_owner_account_b: legacy_pubkey(user_b),
+            token_vault_b: legacy_pubkey(bundle.token_vault_b),
+            tick_array0: legacy_pubkey(self.tick_arrays[0]),
+            tick_array1: legacy_pubkey(self.tick_arrays[1]),
+            tick_array2: legacy_pubkey(self.tick_arrays[2]),
+            oracle: legacy_pubkey(self.oracle),
+        }
+        .instruction_with_remaining_accounts(
+            orca::SwapV2InstructionArgs {
+                amount,
+                other_amount_threshold,
+                sqrt_price_limit: 0,
+                amount_specified_is_input: exact_in,
+                a_to_b,
+                remaining_accounts_info: Some(orca::RemainingAccountsInfo {
+                    slices: vec![orca::RemainingAccountsSlice {
+                        accounts_type: orca::AccountsType::SupplementalTickArrays,
+                        length: 2,
+                    }],
+                }),
+            },
+            &[
+                legacy_meta(AccountMeta::new(self.tick_arrays[3], false)),
+                legacy_meta(AccountMeta::new(self.tick_arrays[4], false)),
+            ],
+        );
+        instruction(swap, self.program_id)
+    }
+}
+
 /// Tick-array PDA. Orca seeds the start index as its decimal string.
 pub fn tick_array_address_for(program_id: Pubkey, pool: Pubkey, start: i32) -> Pubkey {
     pda(
@@ -1545,26 +1645,6 @@ pub struct SwapExactOutParams {
     pub amount_out: Decimal,
 }
 
-/// Raw-atom swap request for instruction building without submission.
-#[derive(Clone, Copy, Debug)]
-pub struct SwapInstructionParams {
-    pub pool: Pubkey,
-    pub input_mint: Pubkey,
-    pub output_mint: Pubkey,
-    /// Input atoms for exact-in, output atoms for exact-out.
-    pub amount_raw: u64,
-    pub exact_in: bool,
-    pub slippage_bps: u16,
-}
-
-#[derive(Clone, Debug)]
-pub struct SwapPlan {
-    pub a_to_b: bool,
-    pub instructions: Vec<Instruction>,
-    pub quote: SwapQuote,
-    pub accounts: SwapAccounts,
-}
-
 #[derive(Clone, Debug)]
 pub struct CreatePoolOutcome {
     pub transaction: TransactionOutcome,
@@ -1673,6 +1753,8 @@ pub struct SwapQuote {
     pub exact_in: bool,
     pub input_mint: Pubkey,
     pub output_mint: Pubkey,
+    /// `amount` sent to the program: input for exact-in, output for exact-out.
+    pub instruction_amount: u64,
     pub expected_input_raw: u64,
     pub expected_output_raw: u64,
     /// Minimum output (exact-in) or maximum input (exact-out) enforced on-chain.
@@ -1721,6 +1803,7 @@ pub enum OrcaWhirlpoolError {
     },
 }
 
+#[derive(Clone)]
 struct MintInfo {
     key: Pubkey,
     token_program: Pubkey,
@@ -1729,6 +1812,7 @@ struct MintInfo {
     data: Vec<u8>,
 }
 
+#[derive(Clone)]
 struct PoolBundle {
     whirlpool: orca::Whirlpool,
     mint_a: MintInfo,
@@ -2174,22 +2258,6 @@ mod tests {
         assert!((-62_150..=-62_140).contains(&tick), "tick {tick}");
     }
 
-    fn bundle_with(bundle: &PoolBundle) -> PoolBundle {
-        let mint = |info: &MintInfo| MintInfo {
-            key: info.key,
-            token_program: info.token_program,
-            decimals: info.decimals,
-            freeze_authority: info.freeze_authority,
-            data: info.data.clone(),
-        };
-        PoolBundle {
-            whirlpool: bundle.whirlpool.clone(),
-            mint_a: mint(&bundle.mint_a),
-            mint_b: mint(&bundle.mint_b),
-            ..*bundle
-        }
-    }
-
     #[test]
     fn empty_pool_quotes_terminate_with_an_error() {
         let span = tick_array_span(64);
@@ -2251,7 +2319,7 @@ mod tests {
                 liquidity: 1_000_000_000_000,
                 ..bundle.whirlpool.clone()
             },
-            ..bundle_with(&bundle)
+            ..bundle.clone()
         };
         liquid.transfer_fee_b = Some(TransferFee::new(25));
         for a_to_b in [true, false] {
