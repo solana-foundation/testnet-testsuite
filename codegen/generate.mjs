@@ -49,7 +49,9 @@ function fixupIdl(idl) {
       const d = ix.discriminant?.value;
       if (d === undefined) continue;
       if (byDisc.has(d)) {
-        console.warn(`  WARNING: ${ix.name} and ${byDisc.get(d)} share discriminant ${d}`);
+        console.warn(
+          `  WARNING: ${ix.name} and ${byDisc.get(d)} share discriminant ${d}`,
+        );
       }
       byDisc.set(d, ix.name);
     }
@@ -69,7 +71,10 @@ for (const target of TARGETS) {
   const idl = fixupIdl(JSON.parse(readFileSync(here(target.idl), "utf8")));
   const name = idl.metadata?.name ?? idl.name;
   console.log(`generating ${name} -> ${target.crate}/src/generated`);
-  rmSync(here(`${target.crate}/src/generated`), { recursive: true, force: true });
+  rmSync(here(`${target.crate}/src/generated`), {
+    recursive: true,
+    force: true,
+  });
   const codama = createFromRoot(rootNodeFromAnchor(idl));
   codama.accept(
     renderVisitor(here(target.crate), {
