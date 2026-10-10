@@ -1,0 +1,79 @@
+[
+  {
+    "mainnetPubkey": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_USDC_MINT"
+  },
+  {
+    "mainnetPubkey": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_JUP_MINT"
+  },
+  {
+    "mainnetPubkey": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_RAY_MINT"
+  },
+  {
+    "mainnetPubkey": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_BONK_MINT"
+  },
+  {
+    "mainnetPubkey": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_WIF_MINT"
+  },
+  {
+    "mainnetPubkey": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_PYTH_MINT"
+  },
+  {
+    "mainnetPubkey": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_JTO_MINT"
+  },
+  {
+    "mainnetPubkey": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_ORCA_MINT"
+  },
+  {
+    "mainnetPubkey": "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_RENDER_MINT"
+  },
+  {
+    "mainnetPubkey": "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_W_MINT"
+  },
+  {
+    "mainnetPubkey": "TNSRxcUxoT9xBG3de7PiJyTDYu7kskLqcpddxnEJAS6",
+    "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+    "mint": "KEYPAIR_TOKEN_TNSR_MINT"
+  }
+]
