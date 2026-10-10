@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/mtm-chain",
     "crates/mtm-common",
+    "crates/mtm-dex-harness",
     "crates/mtm-math",
     "crates/mtm-telemetry",
     "crates/oracle-client",
@@ -21,6 +22,7 @@ publish = false
 [workspace.dependencies]
 mtm-chain = { path = "crates/mtm-chain" }
 mtm-common = { path = "crates/mtm-common" }
+mtm-dex-harness = { path = "crates/mtm-dex-harness" }
 mtm-math = { path = "crates/mtm-math" }
 mtm-telemetry = { path = "crates/mtm-telemetry" }
 oracle-client = { path = "crates/oracle-client" }

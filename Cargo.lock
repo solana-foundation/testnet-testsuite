@@ -2492,6 +2492,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mtm-dex-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mtm-chain",
+ "rust_decimal",
+ "serde_json",
+ "solana-commitment-config",
+ "solana-instruction 3.5.1",
+ "solana-keypair",
+ "solana-pubkey 4.4.0",
+ "solana-signature 3.6.0",
+ "solana-signer 3.0.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mtm-math"
 version = "0.1.0"
 dependencies = [
