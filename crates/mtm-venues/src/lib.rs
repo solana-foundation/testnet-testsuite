@@ -236,7 +236,33 @@ impl PoolSnapshot {
     }
 
     /// Quote one leg. `amount` is the input (exact-in) or output (exact-out).
+    ///
+    /// Venue math runs on live, untrusted pool state; a panic inside it
+    /// (e.g. an arithmetic overflow in a venue's quote library) is reported
+    /// as a quote error instead of unwinding into the caller.
     pub fn quote(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount: u64,
+        exact_in: bool,
+        slippage_bps: u16,
+    ) -> Result<LegQuote, VenueError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.quote_unguarded(input_mint, output_mint, amount, exact_in, slippage_bps)
+        }))
+        .unwrap_or_else(|_| {
+            metrics::counter!("venue_quote_panics_total", "venue" => self.kind().as_str())
+                .increment(1);
+            Err(VenueError::Venue {
+                venue: self.kind().as_str(),
+                pool: self.pool(),
+                reason: "venue quote math panicked".to_owned(),
+            })
+        })
+    }
+
+    fn quote_unguarded(
         &self,
         input_mint: Pubkey,
         output_mint: Pubkey,

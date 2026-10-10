@@ -89,6 +89,30 @@ async fn planned(
     ),
     (StatusCode, String),
 > {
+    let started = std::time::Instant::now();
+    let result = plan_request(state, req).await;
+    let execution = format!("{:?}", req.execution);
+    metrics::histogram!("router_quote_seconds", "execution" => execution.clone())
+        .record(started.elapsed().as_secs_f64());
+    if let Err((status, _)) = &result {
+        metrics::counter!("router_quote_errors_total", "execution" => execution, "status" => status.as_u16().to_string())
+            .increment(1);
+    }
+    result
+}
+
+async fn plan_request(
+    state: &AppState,
+    req: &QuoteRequest,
+) -> Result<
+    (
+        Request,
+        PlannedRoute<mtm_venues::PoolSnapshot>,
+        Book<mtm_venues::PoolSnapshot>,
+        u64,
+    ),
+    (StatusCode, String),
+> {
     validate(req)?;
     let mut request = Request::parse(req).map_err(engine_status)?;
     request.jupiter_overhead_cu = state.jupiter_overhead_cu;
