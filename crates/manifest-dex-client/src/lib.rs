@@ -580,7 +580,28 @@ impl ManifestClient {
         market: Pubkey,
         orders: &[OrderSpec],
     ) -> Result<OrdersOutcome> {
-        self.run("place_orders", market, async move {
+        self.run("place_orders", market, self.batch(market, orders, false))
+            .await
+    }
+
+    /// Cancel every resting order of the payer's seat and place `orders`, in
+    /// one atomic `BatchUpdate` so the book never shows a gap.
+    pub async fn replace_orders(
+        &self,
+        market: Pubkey,
+        orders: &[OrderSpec],
+    ) -> Result<OrdersOutcome> {
+        self.run("replace_orders", market, self.batch(market, orders, true))
+            .await
+    }
+
+    async fn batch(
+        &self,
+        market: Pubkey,
+        orders: &[OrderSpec],
+        cancel_existing: bool,
+    ) -> Result<OrdersOutcome> {
+        {
             if orders.is_empty() {
                 return Err(ManifestError::InvalidInput(
                     "at least one order is required".to_owned(),
@@ -611,7 +632,17 @@ impl ManifestClient {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let ix = self.batch_update(market, seat.index, vec![], params);
+            let cancels = if cancel_existing {
+                book.orders_of(seat.index)
+                    .map(|order| CancelOrderParams {
+                        order_sequence_number: order.sequence_number,
+                        order_index_hint: Some(order.index),
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+            let ix = self.batch_update(market, seat.index, cancels, params);
             let transaction = self.submit(vec![ix], &[]).await?;
             let after = self.load_market(market).await?;
             let resting = after.book.orders_of(seat.index).copied().collect();
@@ -619,8 +650,7 @@ impl ManifestClient {
                 transaction: Some(transaction),
                 resting,
             })
-        })
-        .await
+        }
     }
 
     /// Cancel every resting order owned by the payer's seat.
