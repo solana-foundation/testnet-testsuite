@@ -2,7 +2,7 @@
 //! Raydium CLMM, Orca Whirlpool, and Manifest forks: ExactIn with same-pair
 //! splits and 2-hop bridge routes, single-hop ExactOut, executed either as
 //! top-level venue instructions or through a Jupiter aggregator fork.
-//! Unsigned v0 transactions with a hard size guard; ALTs arrive with M3.
+//! Unsigned v1 transactions, with routes fitted to the v1 limits.
 
 pub mod api;
 pub mod assemble;

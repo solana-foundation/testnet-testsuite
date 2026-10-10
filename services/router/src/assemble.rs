@@ -4,9 +4,11 @@
 //! segments in order (per-leg amounts and minimums come from the engine).
 //! `jupiter` execution emits one `route_v2` of the configured Jupiter fork with
 //! every leg as a route step. Both prepend idempotent ATA creation for every
-//! mint the route touches. ALTs are not wired yet, so a hard size guard
-//! rejects routes that do not fit one raw v0 transaction. Transactions are
-//! UNSIGNED; the caller signs as payer.
+//! mint the route touches. Transactions are v1 (SIMD-0385): up to 4,096
+//! bytes, 64 addresses, and 64 instructions, with the compute budget in the
+//! message config instead of ComputeBudget instructions. There are no
+//! lookup tables in v1, so every touched account counts against the 64.
+//! Transactions are UNSIGNED; the caller signs as payer.
 
 use std::collections::HashSet;
 
@@ -14,10 +16,10 @@ use anyhow::Context;
 use base64::Engine;
 use mtm_venues::{PoolSnapshot, jupiter};
 use router_client::Execution;
-use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_hash::Hash;
 use solana_instruction::Instruction;
 use solana_message::VersionedMessage;
-use solana_message::v0::Message as MessageV0;
+use solana_message::v1::{self, TransactionConfig};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -27,8 +29,9 @@ use crate::engine::Segment;
 
 pub const ATA_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-/// v0 transaction wire limit
-pub const MAX_TX_BYTES: usize = 1232;
+/// Maximum account data a route may load (the runtime's 64 MiB ceiling).
+/// V1 treats an unset limit as zero, so it is always sent explicitly.
+pub const DEFAULT_LOADED_ACCOUNTS_DATA_SIZE_LIMIT: u32 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Assembled {
@@ -199,51 +202,194 @@ fn create_ata_idempotent(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) 
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "route needs {bytes} bytes (limit {MAX_TX_BYTES}): too many legs without address lookup tables"
-)]
-pub struct Oversized {
-    pub bytes: usize,
+/// Hard per-transaction limits of v1 messages (SIMD-0385). V1 has no
+/// address lookup tables, so every account the route touches counts
+/// against `MAX_ADDRESSES`.
+pub const MAX_TX_BYTES: usize = v1::MAX_TRANSACTION_SIZE;
+pub const MAX_ACCOUNTS: usize = v1::MAX_ADDRESSES as usize;
+pub const MAX_INSTRUCTIONS: usize = v1::MAX_INSTRUCTIONS as usize;
+/// Runtime cap on a transaction's compute-unit limit.
+pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+
+/// A route that does not fit one v1 transaction. The API narrows the plan
+/// and retries on any of these.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum RouteTooLarge {
+    #[error("route needs {0} bytes (v1 limit {MAX_TX_BYTES})")]
+    Bytes(usize),
+    #[error("route touches {0} accounts (v1 limit {MAX_ACCOUNTS})")]
+    Accounts(usize),
+    #[error("route needs {0} instructions (v1 limit {MAX_INSTRUCTIONS})")]
+    Instructions(usize),
 }
 
 pub fn is_oversized(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<Oversized>().is_some()
+    error.downcast_ref::<RouteTooLarge>().is_some()
 }
 
-/// Full unsigned v0 transaction: compute budget + route instructions.
+/// Compute budget carried in the v1 message config (v1 replaces the
+/// ComputeBudget instructions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    pub compute_unit_limit: u32,
+    /// Total priority fee in lamports (v1 prices the transaction, not each CU).
+    pub priority_fee_lamports: u64,
+    pub loaded_accounts_data_size_limit: u32,
+}
+
+impl Budget {
+    pub fn for_route(state: &AppState, assembled: &Assembled) -> Self {
+        let compute_unit_limit = assembled
+            .cu_estimate
+            .saturating_add(state.cfg.cu_margin)
+            .min(MAX_COMPUTE_UNIT_LIMIT);
+        Self {
+            compute_unit_limit,
+            priority_fee_lamports: priority_fee_lamports(
+                compute_unit_limit,
+                state.cfg.cu_price_micro_lamports,
+            ),
+            loaded_accounts_data_size_limit: state.cfg.loaded_accounts_data_size_limit,
+        }
+    }
+}
+
+/// `cu_limit × micro-lamports per CU`, rounded up to whole lamports.
+pub fn priority_fee_lamports(compute_unit_limit: u32, micro_lamports_per_cu: u64) -> u64 {
+    (u128::from(compute_unit_limit) * u128::from(micro_lamports_per_cu)).div_ceil(1_000_000) as u64
+}
+
+/// Compile `instructions` into an unsigned v1 transaction and check it
+/// against every v1 limit.
+pub fn compile_v1(
+    payer: &Pubkey,
+    instructions: &[Instruction],
+    budget: Budget,
+    blockhash: Hash,
+) -> anyhow::Result<VersionedTransaction> {
+    if instructions.len() > MAX_INSTRUCTIONS {
+        return Err(RouteTooLarge::Instructions(instructions.len()).into());
+    }
+    let config = TransactionConfig::empty()
+        .with_compute_unit_limit(budget.compute_unit_limit)
+        .with_priority_fee(budget.priority_fee_lamports)
+        .with_loaded_accounts_data_size_limit(budget.loaded_accounts_data_size_limit);
+    let message = v1::Message::try_compile_with_config(payer, instructions, blockhash, config)
+        .context("compiling v1 message")?;
+    if message.account_keys.len() > MAX_ACCOUNTS {
+        return Err(RouteTooLarge::Accounts(message.account_keys.len()).into());
+    }
+    message.validate().context("invalid v1 message")?;
+    let tx = VersionedTransaction {
+        signatures: vec![Signature::default(); usize::from(message.header.num_required_signatures)],
+        message: VersionedMessage::V1(message),
+    };
+    let bytes = wincode::serialize(&tx)
+        .context("serializing transaction")?
+        .len();
+    if bytes > MAX_TX_BYTES {
+        return Err(RouteTooLarge::Bytes(bytes).into());
+    }
+    Ok(tx)
+}
+
+/// Whether the route fits one v1 transaction (no RPC: size and account
+/// counts do not depend on the blockhash).
+pub fn check_fits(state: &AppState, user: &Pubkey, assembled: &Assembled) -> anyhow::Result<()> {
+    compile_v1(
+        user,
+        &assembled.instructions,
+        Budget::for_route(state, assembled),
+        Hash::default(),
+    )
+    .map(|_| ())
+}
+
+/// Full unsigned v1 transaction (wincode wire format, base64): the route's
+/// instructions with the compute budget in the message config.
 pub async fn route_tx(
     state: &AppState,
     user: &Pubkey,
-    assembled: Assembled,
+    assembled: &Assembled,
 ) -> anyhow::Result<String> {
-    let mut instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(
-            assembled
-                .cu_estimate
-                .saturating_add(state.cfg.cu_margin)
-                .min(1_400_000),
-        ),
-        ComputeBudgetInstruction::set_compute_unit_price(state.cfg.cu_price_micro_lamports),
-    ];
-    instructions.extend(assembled.instructions);
-
     let blockhash = state
         .chain
         .rpc()
         .get_latest_blockhash()
         .await
         .context("fetching blockhash")?;
-    let message = MessageV0::try_compile(user, &instructions, &[], blockhash)
-        .context("compiling v0 message")?;
-    let num_signatures = message.header.num_required_signatures as usize;
-    let tx = VersionedTransaction {
-        signatures: vec![Signature::default(); num_signatures],
-        message: VersionedMessage::V0(message),
-    };
-    let bytes = bincode::serialize(&tx).context("serializing transaction")?;
-    if bytes.len() > MAX_TX_BYTES {
-        return Err(Oversized { bytes: bytes.len() }.into());
-    }
+    let tx = compile_v1(
+        user,
+        &assembled.instructions,
+        Budget::for_route(state, assembled),
+        blockhash,
+    )?;
+    let bytes = wincode::serialize(&tx).context("serializing transaction")?;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_instruction::AccountMeta;
+
+    fn budget() -> Budget {
+        Budget {
+            compute_unit_limit: 200_000,
+            priority_fee_lamports: 200,
+            loaded_accounts_data_size_limit: DEFAULT_LOADED_ACCOUNTS_DATA_SIZE_LIMIT,
+        }
+    }
+
+    fn ix(accounts: u8, data: usize) -> Instruction {
+        Instruction {
+            program_id: Pubkey::new_from_array([200; 32]),
+            accounts: (0..accounts)
+                .map(|i| AccountMeta::new(Pubkey::new_from_array([i; 32]), false))
+                .collect(),
+            data: vec![0; data],
+        }
+    }
+
+    fn too_large(result: anyhow::Result<VersionedTransaction>) -> Option<RouteTooLarge> {
+        result.err()?.downcast_ref::<RouteTooLarge>().cloned()
+    }
+
+    #[test]
+    fn priority_fee_rounds_up_to_lamports() {
+        assert_eq!(priority_fee_lamports(200_000, 1_000), 200);
+        assert_eq!(priority_fee_lamports(1, 1), 1);
+        assert_eq!(priority_fee_lamports(200_000, 0), 0);
+    }
+
+    #[test]
+    fn v1_limits_are_enforced() {
+        let payer = Pubkey::new_from_array([250; 32]);
+        let tx = compile_v1(&payer, &[ix(40, 100)], budget(), Hash::default()).expect("fits");
+        assert!(matches!(tx.message, VersionedMessage::V1(_)));
+        // 63 unique accounts + payer + program = 65 addresses
+        let too_wide = compile_v1(&payer, &[ix(63, 10)], budget(), Hash::default());
+        assert_eq!(too_large(too_wide), Some(RouteTooLarge::Accounts(65)));
+        let too_big = compile_v1(
+            &payer,
+            &[ix(4, 3_000), ix(4, 1_000)],
+            budget(),
+            Hash::default(),
+        );
+        assert!(matches!(too_large(too_big), Some(RouteTooLarge::Bytes(_))));
+        let too_many: Vec<Instruction> = (0..65).map(|_| ix(1, 0)).collect();
+        assert_eq!(
+            too_large(compile_v1(&payer, &too_many, budget(), Hash::default())),
+            Some(RouteTooLarge::Instructions(65))
+        );
+    }
+
+    #[test]
+    fn v1_round_trips_through_wincode() {
+        let payer = Pubkey::new_from_array([250; 32]);
+        let tx = compile_v1(&payer, &[ix(3, 8)], budget(), Hash::default()).expect("fits");
+        let bytes = wincode::serialize(&tx).expect("serializes");
+        let back: VersionedTransaction = wincode::deserialize(&bytes).expect("deserializes");
+        assert_eq!(back, tx);
+    }
 }
