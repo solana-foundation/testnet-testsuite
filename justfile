@@ -72,6 +72,35 @@ router-seed-dev *ARGS:
             --manifest "$(pk KEYPAIR_MANIFEST)" "$@" \
     ' _ {{ARGS}}
 
+# --- market-making scenario (bootstrap/scenario/README.md) ------------------------
+
+# Local Surfpool forking testnet (Metaplex for token metadata), funding the faucet and admin.
+scenario-surfpool:
+    doppler run --project testnet-testsuite --config dev -- bash -c ' \
+        surfpool start --network testnet --no-deploy --disable-instruction-profiling \
+            --airdrop "$PUBKEY_FAUCET" --airdrop "$PUBKEY_PROGRAM_AUTHORITY"'
+
+# Run a scenario.sh command under a Doppler config: CMD = deploy|up|bootstrap|observe|status.
+scenario-with CONFIG TARGET CMD:
+    doppler run --project testnet-testsuite --config "{{CONFIG}}" -- \
+        bootstrap/scenario/scenario.sh "{{CMD}}" "{{TARGET}}"
+
+scenario-deploy-dev: (scenario-with "dev" "local" "deploy")
+scenario-up-dev: (scenario-with "dev" "local" "up")
+scenario-status-dev: (scenario-with "dev" "local" "status")
+scenario-deploy-testnet: (scenario-with "prd" "testnet" "deploy")
+scenario-testnet: (scenario-with "prd" "testnet" "up")
+scenario-status-testnet: (scenario-with "prd" "testnet" "status")
+
+# Deploy the forks, bootstrap and run every service, then start observability.
+scenario-dev: scenario-deploy-dev scenario-up-dev scenario-observe
+
+scenario-observe:
+    bootstrap/scenario/scenario.sh observe
+
+scenario-down:
+    bootstrap/scenario/scenario.sh down
+
 # --- token bootstrap (doppler-managed secrets) ----------------------------------
 
 bootstrap-tokens *ARGS:

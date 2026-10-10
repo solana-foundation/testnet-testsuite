@@ -12,6 +12,9 @@ oracle instead of a custom one — `programs/` is reserved).
   (oracle + prometheus + grafana via ops/compose.yaml; local profile expects
   surfpool running on the host)
 - `just bootstrap-tokens[-dev]` — token bootstrap via doppler-managed secrets
+- `just scenario-dev` / `scenario-testnet` / `scenario-down` — market-making scenario
+  (oracle + router + mm + flow + Prometheus/Grafana; bootstrap/scenario/README.md).
+  Scenario ports: oracle 8180, router 8181, metrics 9180-9183, Prometheus 9190, Grafana 3100
 
 ## Architecture rules
 
