@@ -1,0 +1,3 @@
+# Vendored upstream artifacts: keep byte-identical to their sources.
+crates/sdks/*/idl/
+codegen/pnpm-lock.yaml
