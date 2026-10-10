@@ -93,6 +93,54 @@ configure-raydium-clmm-dev *ARGS:
 configure-raydium-clmm-prd *ARGS:
     just configure-raydium-clmm-with prd "KEYPAIR_PROGRAM_AUTHORITY" https://api.testnet.solana.com {{ARGS}}
 
+# --- orca whirlpool (doppler-managed secrets) ---------------------------------------
+
+# Create and seed every unordered pair of mints supplied with repeated --mint flags.
+orca-whirlpool-create-pools *ARGS:
+    cargo run -p orca-whirlpool-orchestrator-service -- create-pools \
+        --mint $(echo $PUBKEY_TOKEN_JUP_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_RAY_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_USDC_MINT) \
+        {{ARGS}}
+
+orca-whirlpool-create-pools-dev *ARGS:
+    doppler run --project testnet-testsuite --config dev -- \
+        just orca-whirlpool-create-pools --rpc-url http://localhost:8899 {{ARGS}}
+
+orca-whirlpool-create-pools-testnet *ARGS:
+    doppler run --project testnet-testsuite --config prd -- \
+        just orca-whirlpool-create-pools --rpc-url https://api.testnet.solana.com {{ARGS}}
+
+# Exercise every existing unordered pair supplied with --mint using a new faucet-funded user.
+orca-whirlpool-user-flow *ARGS:
+    cargo run -p orca-whirlpool-orchestrator-service -- user-flow \
+        --mint $(echo $PUBKEY_TOKEN_JUP_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_RAY_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_USDC_MINT) \
+        {{ARGS}}
+
+orca-whirlpool-user-flow-dev *ARGS:
+    doppler run --project testnet-testsuite --config dev -- \
+        just orca-whirlpool-user-flow --rpc-url http://localhost:8899 {{ARGS}}
+
+orca-whirlpool-user-flow-testnet *ARGS:
+    doppler run --project testnet-testsuite --config prd -- \
+        just orca-whirlpool-user-flow --rpc-url https://api.testnet.solana.com {{ARGS}}
+
+# Create or validate the WhirlpoolsConfig + fee tier using a named admin signer.
+configure-orca-whirlpool-with CONFIG ADMIN_KEYPAIR_VAR RPC_URL *ARGS:
+    doppler run --project testnet-testsuite --config "{{CONFIG}}" -- \
+        cargo run -p orca-whirlpool-orchestrator-service -- admin \
+            --rpc-url "{{RPC_URL}}" \
+            --admin-keypair-env "{{ADMIN_KEYPAIR_VAR}}" \
+            {{ARGS}}
+
+configure-orca-whirlpool-dev *ARGS:
+    just configure-orca-whirlpool-with dev "KEYPAIR_PROGRAM_AUTHORITY" http://localhost:8899 {{ARGS}}
+
+configure-orca-whirlpool-prd *ARGS:
+    just configure-orca-whirlpool-with prd "KEYPAIR_PROGRAM_AUTHORITY" https://api.testnet.solana.com {{ARGS}}
+
 # --- program deployments (doppler-managed secrets) ----------------------------------
 
 # Deploy a program using a Doppler-injected keypair.

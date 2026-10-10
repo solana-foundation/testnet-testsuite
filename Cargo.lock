@@ -1387,6 +1387,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethnum"
+version = "1.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
+
+[[package]]
 name = "evmap"
 version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2698,6 +2704,99 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio-tungstenite 0.30.0",
+]
+
+[[package]]
+name = "orca-whirlpool-client"
+version = "0.1.0"
+dependencies = [
+ "metrics",
+ "mtm-chain",
+ "mtm-dex-harness",
+ "orca_whirlpools_client",
+ "orca_whirlpools_core",
+ "rust_decimal",
+ "sha2 0.10.9",
+ "solana-account 4.7.0",
+ "solana-commitment-config",
+ "solana-instruction 2.3.3",
+ "solana-instruction 3.5.1",
+ "solana-keypair",
+ "solana-pubkey 2.4.0",
+ "solana-pubkey 4.4.0",
+ "solana-signature 3.6.0",
+ "solana-signer 3.0.1",
+ "spl-token-2022 7.0.0",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "orca-whirlpool-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "mtm-chain",
+ "mtm-dex-harness",
+ "orca-whirlpool-client",
+ "rust_decimal",
+ "solana-commitment-config",
+ "solana-pubkey 4.4.0",
+ "solana-signer 3.0.1",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "orca-whirlpool-orchestrator-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mtm-dex-harness",
+ "mtm-telemetry",
+ "orca-whirlpool-orchestrator",
+ "rust_decimal",
+ "serde_json",
+ "solana-pubkey 4.4.0",
+ "solana-signer 3.0.1",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "orca_whirlpools_client"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0031c8c7c2e4b328252ed7a4c60f94100e9b232ae82b252144da3c8b34c5224c"
+dependencies = [
+ "borsh 0.10.4",
+ "num-derive 0.4.2",
+ "num-traits",
+ "orca_whirlpools_core",
+ "solana-program",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "orca_whirlpools_core"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b884e3d6f39337baeb00c096b9d2d30682aeff8ead301303d039f84dcac24bec"
+dependencies = [
+ "ethnum",
+ "libm",
+ "orca_whirlpools_macros",
+]
+
+[[package]]
+name = "orca_whirlpools_macros"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b093a9e60ca608c1dff40fcd841a2d5680b96f877080b6279044c159ebd50b78"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
