@@ -60,6 +60,8 @@ pub struct RouteLeg {
     /// fees charged by the venue, in input atoms
     pub fee_amount: u64,
     pub price_impact_bps: u32,
+    /// compute units this leg's swap is expected to consume
+    pub cu_estimate: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +75,14 @@ pub struct QuoteResponse {
     pub route: Vec<RouteLeg>,
     /// oldest state slot among quoted venues
     pub state_slot: u64,
+    /// compute units the route is expected to consume: the legs' estimates
+    /// plus aggregator overhead for `jupiter` execution (no margin)
+    pub cu_estimate: u32,
+    /// CU limit written into the returned transaction's v1 config, or
+    /// recommended for /v1/instructions callers (estimate + the router's
+    /// margin, capped at 1.4M); present when `user` was given
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_unit_limit: Option<u32>,
     /// unsigned v1 transaction, wincode wire format, base64 (present when
     /// `user` was given); the compute budget is in the message config
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,15 +104,14 @@ pub struct WireInstruction {
 }
 
 /// Response of /v1/instructions: the quote plus raw instructions for callers
-/// composing their own transaction (compute budget NOT included — the caller
-/// owns the budget when composing).
+/// composing their own transaction. The compute budget is NOT included: put
+/// the quote's `compute_unit_limit` (or `cu_estimate` plus your own margin)
+/// in your transaction's v1 config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstructionsResponse {
     #[serde(flatten)]
     pub quote: QuoteResponse,
     pub instructions: Vec<WireInstruction>,
-    /// CU the route legs are expected to consume (add your own margin)
-    pub cu_estimate: u32,
 }
 
 #[derive(Debug, thiserror::Error)]

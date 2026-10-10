@@ -90,7 +90,8 @@ async fn planned(
     (StatusCode, String),
 > {
     validate(req)?;
-    let request = Request::parse(req).map_err(engine_status)?;
+    let mut request = Request::parse(req).map_err(engine_status)?;
+    request.jupiter_overhead_cu = state.jupiter_overhead_cu;
     let (book, state_slot) = crate::load_book(state, &request)
         .await
         .map_err(engine_status)?;
@@ -189,8 +190,10 @@ async fn quote(
         return Ok(Json(planned(&state, &req).await?.1.response));
     };
     let user = parse_user(user)?;
-    let (planned, _, tx) = fitted(&state, &req, &user).await?;
+    let (planned, assembled, tx) = fitted(&state, &req, &user).await?;
     let mut response = planned.response;
+    response.compute_unit_limit =
+        Some(assemble::Budget::for_route(&state, &assembled).compute_unit_limit);
     response.tx_base64 = Some(tx);
     Ok(Json(response))
 }
@@ -207,6 +210,9 @@ async fn instructions(
     };
     let user = parse_user(user)?;
     let (planned, assembled, _) = fitted(&state, &req, &user).await?;
+    let mut quote = planned.response;
+    quote.compute_unit_limit =
+        Some(assemble::Budget::for_route(&state, &assembled).compute_unit_limit);
     let wire = assembled
         .instructions
         .iter()
@@ -225,9 +231,8 @@ async fn instructions(
         })
         .collect();
     Ok(Json(InstructionsResponse {
-        quote: planned.response,
+        quote,
         instructions: wire,
-        cu_estimate: assembled.cu_estimate,
     }))
 }
 
