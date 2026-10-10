@@ -25,7 +25,7 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::AppState;
-use crate::engine::Segment;
+use crate::engine::{Segment, route_cu_estimate};
 
 pub const ATA_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -60,7 +60,6 @@ fn direct_instructions(
 ) -> anyhow::Result<Assembled> {
     let mut seen_atas = HashSet::new();
     let mut instructions = Vec::new();
-    let mut cu_estimate: u32 = 0;
     for segment in segments {
         for leg in &segment.legs {
             for ix in leg
@@ -77,12 +76,11 @@ fn direct_instructions(
                 }
                 instructions.push(ix);
             }
-            cu_estimate = cu_estimate.saturating_add(leg.amounts.cu_estimate);
         }
     }
     Ok(Assembled {
         instructions,
-        cu_estimate,
+        cu_estimate: route_cu_estimate(segments, Execution::Direct, 0),
     })
 }
 
@@ -125,7 +123,6 @@ fn jupiter_instructions(
     }
 
     let mut steps = Vec::new();
-    let mut cu_estimate = state.jupiter_overhead_cu;
     for (index, segment) in segments.iter().enumerate() {
         let amounts: Vec<u64> = segment
             .legs
@@ -143,7 +140,6 @@ fn jupiter_instructions(
                 input_index: u8::try_from(index)?,
                 output_index: u8::try_from(index + 1)?,
             });
-            cu_estimate = cu_estimate.saturating_add(leg.amounts.cu_estimate);
         }
     }
     let in_amount = first.legs.iter().map(|leg| leg.amounts.in_amount).sum();
@@ -173,7 +169,7 @@ fn jupiter_instructions(
     );
     Ok(Assembled {
         instructions,
-        cu_estimate,
+        cu_estimate: route_cu_estimate(segments, Execution::Jupiter, state.jupiter_overhead_cu),
     })
 }
 

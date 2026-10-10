@@ -416,7 +416,10 @@ curl -s localhost:8081/v1/quote -H 'content-type: application/json' -d '{
 
 With `user`, the response carries an unsigned v1 transaction (wincode wire
 format, base64; compute budget in the message config); `/v1/instructions`
-returns the raw instructions instead. `execution: "direct"` uses each venue's
+returns the raw instructions instead. Every quote reports `cu_estimate`
+(per leg and for the route); with `user`, `compute_unit_limit` is the limit
+written into the transaction (estimate + `cu_margin`) — `/v1/instructions`
+callers should put it in their own transaction's v1 config. `execution: "direct"` uses each venue's
 own top-level swap instruction; `execution: "jupiter"` emits one `route_v2` of
 the Jupiter fork configured by `PUBKEY_JUPITER_FORK` (see the placeholders in
 the design doc). Routes are fitted to the v1 limits (4,096 bytes, 64

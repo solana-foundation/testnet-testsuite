@@ -131,6 +131,8 @@ pub struct Request {
     /// Pools the planner must not use (assembly excludes the widest leg
     /// when a route does not fit one transaction).
     pub excluded: HashSet<Pubkey>,
+    /// CU charged for the aggregator itself on `jupiter` routes.
+    pub jupiter_overhead_cu: u32,
 }
 
 /// Split width tried first; three venues trade every pair at most.
@@ -154,6 +156,7 @@ impl Request {
             slippage_bps: req.slippage_bps,
             max_split_legs: DEFAULT_MAX_SPLIT_LEGS,
             excluded: HashSet::new(),
+            jupiter_overhead_cu: 0,
         })
     }
 
@@ -360,6 +363,25 @@ fn route_out<S: QuoteSource>(segments: &[Segment<S>]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Compute units the route is expected to consume: every leg's estimate,
+/// plus the aggregator's own overhead for `jupiter` execution.
+pub fn route_cu_estimate<S: QuoteSource>(
+    segments: &[Segment<S>],
+    execution: Execution,
+    jupiter_overhead_cu: u32,
+) -> u32 {
+    let legs = segments
+        .iter()
+        .flat_map(|segment| &segment.legs)
+        .fold(0_u32, |total, leg| {
+            total.saturating_add(leg.amounts.cu_estimate)
+        });
+    match execution {
+        Execution::Direct => legs,
+        Execution::Jupiter => legs.saturating_add(jupiter_overhead_cu),
+    }
+}
+
 /// Floor enforced on the route's final output.
 pub fn route_min_out<S: QuoteSource>(
     segments: &[Segment<S>],
@@ -400,6 +422,7 @@ fn build_response<S: QuoteSource>(
                 out_amount: leg.amounts.out_amount,
                 fee_amount: leg.amounts.fee_amount,
                 price_impact_bps: 0,
+                cu_estimate: leg.amounts.cu_estimate,
             })
         })
         .collect();
@@ -411,6 +434,8 @@ fn build_response<S: QuoteSource>(
         price_impact_bps: 0,
         route,
         state_slot,
+        cu_estimate: route_cu_estimate(segments, request.execution, request.jupiter_overhead_cu),
+        compute_unit_limit: None,
         tx_base64: None,
     }
 }
@@ -645,6 +670,7 @@ mod tests {
             slippage_bps: 50,
             max_split_legs: DEFAULT_MAX_SPLIT_LEGS,
             excluded: HashSet::new(),
+            jupiter_overhead_cu: 0,
         }
     }
 
@@ -705,6 +731,25 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn cu_estimate_sums_legs_and_jupiter_overhead() {
+        let book = Book::new(vec![
+            pool(1, 4, 6, 1_000_000_000, 1_000_000_000),
+            pool(2, 6, 5, 1_000_000_000, 1_000_000_000),
+        ]);
+        let direct =
+            plan(&request(10_000_000, Execution::Direct), &book, &[key(6)], 1).expect("plans");
+        assert_eq!(direct.response.cu_estimate, 2);
+        assert!(direct.response.route.iter().all(|leg| leg.cu_estimate == 1));
+        let jupiter = Request {
+            jupiter_overhead_cu: 60_000,
+            ..request(10_000_000, Execution::Jupiter)
+        };
+        let routed = plan(&jupiter, &book, &[key(6)], 1).expect("plans");
+        assert_eq!(routed.response.cu_estimate, 60_002);
+        assert_eq!(routed.response.compute_unit_limit, None);
     }
 
     #[test]
