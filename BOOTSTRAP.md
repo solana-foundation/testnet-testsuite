@@ -9,6 +9,7 @@ Clone the following repos in a sibling directory to this project:
 
 - https://github.com/solana-foundation/raydium-clmm
 - https://github.com/solana-foundation/whirlpools (branch `testnet`; see [docs/dex-forks.md](./docs/dex-forks.md))
+- https://github.com/solana-foundation/manifest (branch `testnet`; needs an Agave ≥ 4.x CLI to build and deploy)
 
 ### Env Vars
 
@@ -110,4 +111,27 @@ for testnet, run
 just deploy-program-testnet "KEYPAIR_ORCA_WHIRLPOOL" "../whirlpools/target/deploy/whirlpool.so"
 just configure-orca-whirlpool-prd
 just orca-whirlpool-create-pools-testnet
+```
+
+#### Manifest
+
+Build the `testnet` branch of the `manifest` fork with the program ID of
+`KEYPAIR_MANIFEST` (see [docs/dex-forks.md](./docs/dex-forks.md)):
+
+```sh
+cargo build-sbf --arch v3 --tools-version v1.57 --manifest-path ../manifest/programs/manifest/Cargo.toml
+```
+
+For surfnet deployment, run:
+
+```sh
+just deploy-program-dev "KEYPAIR_MANIFEST" "../manifest/target/deploy/manifest.so"
+just manifest-create-markets-dev
+```
+
+for testnet, run
+
+```sh
+just deploy-program-testnet "KEYPAIR_MANIFEST" "../manifest/target/deploy/manifest.so"
+just manifest-create-markets-testnet
 ```

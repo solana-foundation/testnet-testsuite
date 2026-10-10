@@ -13,12 +13,16 @@ the point is generating realistic traffic against it.
 | `crates/mtm-math`                      | Canonical fixed-point `Price` (i128 mantissa × 10^expo) + rust_decimal bridge                      |
 | `crates/mtm-chain`                     | Off-chain Solana toolkit: RPC clients, keypairs, (soon) tx pipeline                                |
 | `crates/oracle-client`                 | Typed client for the oracle service; owns the API wire types                                       |
+| `crates/manifest-dex-client`           | Async Manifest market creation, seats, deposits, orders, and swaps; clean-room market decoder      |
+| `crates/manifest-dex-orchestrator`     | Reusable funding and maker/taker lifecycle sequencing for Manifest                                 |
+| `crates/sdks/manifest`                 | Codama-generated Manifest instruction SDK (from the published IDL)                                 |
 | `crates/mtm-dex-harness`               | SPL builders, test-token funding, and the ephemeral-user CLI lifecycle shared by DEX orchestrators |
 | `crates/orca-whirlpool-client`         | Async Orca Whirlpool pool, tick-array, position, collection, close, and swap actions               |
 | `crates/orca-whirlpool-orchestrator`   | Reusable funding and full Whirlpool lifecycle sequencing                                           |
 | `crates/raydium-clmm-client`           | Async Raydium CLMM pool, position, collection, close, and swap actions                             |
 | `crates/raydium-clmm-orchestrator`     | Reusable funding and full CLMM lifecycle sequencing                                                |
 | `services/oracle`                      | Polls Hermes → serves `/v1/prices` + `/v1/ws` → pushes on-chain (WIP)                              |
+| `services/manifest-dex-orchestrator`   | CLI with `create-markets` and `user-flow` commands for the Manifest fork                           |
 | `services/orca-whirlpool-orchestrator` | CLI with `admin`, `create-pools`, and `user-flow` commands for the Whirlpool fork                  |
 | `services/raydium-clmm-orchestrator`   | CLI with `admin` setup and complete `flow` lifecycle commands                                      |
 | `programs/`                            | On-chain programs (empty for now — Anchor workspace lands here later)                              |
@@ -351,6 +355,44 @@ supplemental) and rely on the program's sparse-swap support for
 uninitialized ones. Orca core 1.0.4 never terminates when a quote walks past
 the loaded arrays, so the client bounds every quote at the sequence edge and
 reports an unfillable size as a quote error instead.
+
+## Manifest
+
+`manifest-dex-client` covers a Manifest (CLOB) market end to end:
+`find_markets`, `create_market`, `claim_seat`, `deposit`, `withdraw_all`,
+`place_orders`, `cancel_all_orders`, `swap_exact_in`, `swap_exact_out`, plus a
+pure `MarketSnapshot` (book decode + quote + `SwapV2` instruction building) for
+callers composing their own transactions. Book math mirrors the program's
+matching loop and `impact_base_atoms`, including its rounding law, so exact-in
+quotes equal executed amounts.
+
+Markets are keypair accounts rather than PDAs. `create-markets` therefore
+looks pairs up with `getProgramAccounts` (discriminant + base/quote mint
+filters) and reuses the oldest market unless `--allow-duplicate` is passed.
+Each pair's lower-addressed mint is the base. `user-flow` runs a maker/taker
+lifecycle per market with a fresh faucet-funded user:
+
+```text
+fund → claim seat → deposit base + quote → rest a bid and an ask around --mid-price
+→ exact-in sell into the bid → exact-out buy from the ask → cancel → withdraw all
+→ return tokens and SOL
+```
+
+The same seat makes and takes, so the exact-out leg's wallet input is zero
+(the seat pays itself); the swaps still exercise matching and settlement.
+Manifest documents direct exact-out swaps as unsupported unless the caller
+validates the result, so the client compares wallet deltas after the swap and
+fails if the requested output was not delivered. Claimed seats expand the
+market account; that rent (about 0.006 SOL per user) is not recoverable.
+
+```sh
+NO_DNA=1 just deploy-program-dev "KEYPAIR_MANIFEST" "../manifest/target/deploy/manifest.so"
+NO_DNA=1 just manifest-create-markets-dev
+NO_DNA=1 just manifest-user-flow-dev
+```
+
+See [docs/dex-forks.md](docs/dex-forks.md) for the fork, its SBPF v3 build,
+and why no GPL code is linked here.
 
 ## Conventions
 
