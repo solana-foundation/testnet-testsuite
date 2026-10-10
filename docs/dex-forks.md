@@ -31,10 +31,10 @@ The fork therefore branches from **`e528dd23bb41571f92cfdb49a2f15d4fa0b01bec`**
 (2025-02-26, the last commit released under Apache-2.0), and the Rust crates
 are pinned to the matching Apache-2.0 releases:
 
-| Crate | Version | Published | License |
-|---|---|---|---|
+| Crate                    | Version  | Published  | License    |
+| ------------------------ | -------- | ---------- | ---------- |
 | `orca_whirlpools_client` | `=2.0.2` | 2025-02-21 | Apache-2.0 |
-| `orca_whirlpools_core` | `=1.0.4` | 2025-02-21 | Apache-2.0 |
+| `orca_whirlpools_core`   | `=1.0.4` | 2025-02-21 | Apache-2.0 |
 
 Do not merge or cherry-pick later upstream commits into the fork, and do not
 bump either crate, without a fresh licensing decision.
