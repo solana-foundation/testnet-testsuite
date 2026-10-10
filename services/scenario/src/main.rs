@@ -6,7 +6,12 @@
 //!    price if it does not exist (existing ones are left alone).
 //! 3. Wallets: every maker and taker (derived from the scenario seed) is
 //!    topped up to its configured SOL and token inventory.
+//!
+//! `snapshot` and `report` account for every participant (see `pnl`).
 
+mod pnl;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -51,6 +56,25 @@ enum Command {
     },
     /// Print every scenario pool and wallet with its balances.
     Status,
+    /// Record every participant's holdings (wallet, seats, LP positions) and
+    /// the oracle prices, for `report`.
+    Snapshot {
+        #[arg(long)]
+        out: PathBuf,
+        /// Where the mm service keeps open LP positions.
+        #[arg(long, default_value = ".scenario/state")]
+        state_dir: PathBuf,
+    },
+    /// PnL, transactions, and trades per participant between two snapshots.
+    Report {
+        #[arg(long)]
+        start: PathBuf,
+        #[arg(long)]
+        end: PathBuf,
+        /// Prometheus scraping the scenario services (for trade counts).
+        #[arg(long)]
+        prometheus: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +117,23 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
+        Command::Snapshot { out, state_dir } => {
+            let snapshot = pnl::snapshot(&chain, &scenario, &state_dir).await?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&snapshot)?)?;
+            json!({ "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len() })
+        }
+        Command::Report {
+            start,
+            end,
+            prometheus,
+        } => {
+            let read = |path: &PathBuf| -> Result<pnl::Snapshot> {
+                Ok(serde_json::from_slice(
+                    &std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+                )?)
+            };
+            pnl::report(&chain, &read(&start)?, &read(&end)?, prometheus.as_deref()).await?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -270,6 +311,25 @@ async fn bootstrap(
             .await?;
             wallets.push(json!({ "role": format!("maker/{}", maker.name), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
         }
+        for bot in scenario.config.arb.iter().flat_map(|arb| &arb.bots) {
+            let wallet = scenario.arb_wallet(&bot.name).pubkey();
+            let tokens = bot
+                .inventory
+                .iter()
+                .map(|(name, amount)| Ok((scenario.token(name)?, *amount)))
+                .collect::<Result<Vec<_>>>()?;
+            let outcome = top_up(
+                chain,
+                faucet.as_ref(),
+                mint_authority.as_ref(),
+                &wallet,
+                bot.sol,
+                &tokens,
+                Funding::Endowment,
+            )
+            .await?;
+            wallets.push(json!({ "role": format!("arb/{}", bot.name), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
+        }
         if let Some(flow) = &scenario.config.flow {
             let tokens = flow
                 .inventory
@@ -323,6 +383,19 @@ async fn status(chain: &ChainClient, scenario: &Scenario) -> Result<Value> {
             )
         })
         .collect();
+    roles.extend(
+        scenario
+            .config
+            .arb
+            .iter()
+            .flat_map(|arb| &arb.bots)
+            .map(|bot| {
+                (
+                    format!("arb/{}", bot.name),
+                    scenario.arb_wallet(&bot.name).pubkey(),
+                )
+            }),
+    );
     if let Some(flow) = &scenario.config.flow {
         roles.extend((0..flow.takers).map(|index| {
             (

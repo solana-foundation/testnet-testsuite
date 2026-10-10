@@ -32,6 +32,8 @@ pub struct ScenarioConfig {
     pub makers: Vec<MakerConfig>,
     #[serde(default)]
     pub flow: Option<FlowConfig>,
+    #[serde(default)]
+    pub arb: Option<ArbConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -180,6 +182,52 @@ pub struct FlowConfig {
     pub refill_below_ratio: Decimal,
     #[serde(default)]
     pub rng_seed: u64,
+}
+
+/// Cross-venue arbitrage: searches cycles across every scenario pool when
+/// pool accounts change (websocket) or on a fallback poll, oracle-free.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArbConfig {
+    pub bots: Vec<ArbBotConfig>,
+    /// Fallback scan cadence when no pool update arrives.
+    #[serde(default = "default_arb_poll_ms")]
+    pub poll_ms: u64,
+    /// Coalesce bursts of pool updates into one scan.
+    #[serde(default = "default_arb_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArbBotConfig {
+    pub name: String,
+    /// Tokens a cycle may start and end in (the bot holds inventory in them).
+    pub start_tokens: Vec<String>,
+    /// Longest cycle searched (2 = cross-venue same pair, 3 = triangular).
+    #[serde(default = "default_max_legs")]
+    pub max_legs: usize,
+    /// Smallest profit worth a transaction, in USD (oracle-valued).
+    pub min_profit_usd: Decimal,
+    /// Largest cycle input, in USD.
+    pub max_trade_usd: Decimal,
+    /// Per-leg slippage allowance; the final leg still enforces the profit.
+    #[serde(default = "default_leg_slippage_bps")]
+    pub leg_slippage_bps: u16,
+    pub inventory: BTreeMap<String, Decimal>,
+    #[serde(default = "default_sol")]
+    pub sol: Decimal,
+}
+
+fn default_arb_poll_ms() -> u64 {
+    5_000
+}
+fn default_arb_debounce_ms() -> u64 {
+    250
+}
+fn default_max_legs() -> usize {
+    3
+}
+fn default_leg_slippage_bps() -> u16 {
+    5
 }
 
 fn default_seed_env() -> String {

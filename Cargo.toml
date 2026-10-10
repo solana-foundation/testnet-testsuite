@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "services/arb",
     "crates/mtm-chain",
     "crates/mtm-common",
     "crates/mtm-dex-harness",
@@ -93,6 +94,7 @@ solana-signer = "3"
 solana-transaction = "4"
 solana-account = "4.3"
 solana-rpc-client-api = "4.2.1"
+solana-pubsub-client = "4.2.1"
 solana-account-decoder-client-types = "4"
 anchor-lang = "0.32.1"
 spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }

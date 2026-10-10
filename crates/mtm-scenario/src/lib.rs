@@ -156,6 +156,16 @@ impl Scenario {
                 );
             }
         }
+        if let Some(arb) = &self.config.arb {
+            for bot in &arb.bots {
+                for name in bot.start_tokens.iter().chain(bot.inventory.keys()) {
+                    self.token(name)?;
+                }
+                if !(2..=3).contains(&bot.max_legs) {
+                    bail!("arb bot {}: max_legs must be 2 or 3", bot.name);
+                }
+            }
+        }
         if let Some(flow) = &self.config.flow {
             flow.validate()?;
             for (a, b) in &flow.pairs {
@@ -186,6 +196,10 @@ impl Scenario {
 
     pub fn maker_wallet(&self, maker: &str) -> Keypair {
         self.wallet(&format!("maker/{maker}"))
+    }
+
+    pub fn arb_wallet(&self, bot: &str) -> Keypair {
+        self.wallet(&format!("arb/{bot}"))
     }
 
     pub fn taker_wallet(&self, index: u32) -> Keypair {
