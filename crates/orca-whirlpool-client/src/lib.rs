@@ -668,8 +668,8 @@ impl OrcaWhirlpoolClient {
     /// tick. Quoting and instruction building on the snapshot are pure, so
     /// callers (the router) can price many sizes and build for any owner.
     pub async fn load_swap_snapshot(&self, pool: Pubkey) -> Result<SwapSnapshot> {
-        let bundle = self.load_pool(pool).await?;
-        let (tick_arrays, facades) = self.load_swap_tick_arrays(&bundle).await?;
+        let mut bundle = self.load_pool(pool).await?;
+        let (tick_arrays, facades) = self.load_swap_tick_arrays(&mut bundle).await?;
         Ok(SwapSnapshot {
             program_id: self.program_id,
             oracle: self.oracle_address(pool),
@@ -1158,43 +1158,69 @@ impl OrcaWhirlpoolClient {
     /// Five tick arrays centred on the current tick (current, +1, +2, -1, -2),
     /// matching Orca's own SDK; uninitialized arrays quote as empty and are
     /// accepted on-chain by sparse swap.
+    /// Re-read the whirlpool together with the five tick arrays around its
+    /// current tick in one `getMultipleAccounts` (one slot), so liquidity and
+    /// ticks are consistent. Reading them in separate calls under live
+    /// trading can pair one slot's liquidity with another slot's ticks, which
+    /// makes the quote walk underflow. Retries while the current tick keeps
+    /// moving into another array between the two reads.
     async fn load_swap_tick_arrays(
         &self,
-        bundle: &PoolBundle,
+        bundle: &mut PoolBundle,
     ) -> Result<([Pubkey; 5], [TickArrayFacade; 5])> {
         let spacing = bundle.whirlpool.tick_spacing;
-        let start =
-            core::get_tick_array_start_tick_index(bundle.whirlpool.tick_current_index, spacing);
         let span = tick_array_span(spacing);
-        let starts = [
-            start,
-            start + span,
-            start + span * 2,
-            start - span,
-            start - span * 2,
-        ];
-        let keys = starts.map(|start| self.tick_array_address(bundle.key, start));
-        let accounts = self.fetch_optional(&keys).await?;
-        let mut facades = starts.map(empty_tick_array);
-        for (index, account) in accounts.iter().enumerate() {
-            let Some(account) = account else { continue };
-            let array: orca::TickArray = self.decode_program_account(
-                keys[index],
-                account,
-                "TickArray",
-                orca::TickArray::from_bytes,
+        for _ in 0..3 {
+            let start =
+                core::get_tick_array_start_tick_index(bundle.whirlpool.tick_current_index, spacing);
+            let starts = [
+                start,
+                start + span,
+                start + span * 2,
+                start - span,
+                start - span * 2,
+            ];
+            let keys = starts.map(|start| self.tick_array_address(bundle.key, start));
+            let mut request = vec![bundle.key];
+            request.extend(keys);
+            let accounts = self.fetch_optional(&request).await?;
+            let whirlpool: orca::Whirlpool = self.decode_program_account(
+                bundle.key,
+                require_account(&request, &accounts, 0, "whirlpool")?,
+                "Whirlpool",
+                orca::Whirlpool::from_bytes,
             )?;
-            if current_pubkey(array.whirlpool) != bundle.key
-                || array.start_tick_index != starts[index]
-            {
-                return Err(OrcaWhirlpoolError::MalformedAccount {
-                    address: keys[index],
-                    reason: "tick array pool or start index mismatch".to_owned(),
-                });
+            let moved =
+                core::get_tick_array_start_tick_index(whirlpool.tick_current_index, spacing)
+                    != start;
+            bundle.whirlpool = whirlpool;
+            if moved {
+                continue;
             }
-            facades[index] = array.into();
+            let mut facades = starts.map(empty_tick_array);
+            for (index, account) in accounts[1..].iter().enumerate() {
+                let Some(account) = account else { continue };
+                let array: orca::TickArray = self.decode_program_account(
+                    keys[index],
+                    account,
+                    "TickArray",
+                    orca::TickArray::from_bytes,
+                )?;
+                if current_pubkey(array.whirlpool) != bundle.key
+                    || array.start_tick_index != starts[index]
+                {
+                    return Err(OrcaWhirlpoolError::MalformedAccount {
+                        address: keys[index],
+                        reason: "tick array pool or start index mismatch".to_owned(),
+                    });
+                }
+                facades[index] = array.into();
+            }
+            return Ok((keys, facades));
         }
-        Ok((keys, facades))
+        Err(OrcaWhirlpoolError::Quote(
+            "pool price kept crossing tick arrays while loading".to_owned(),
+        ))
     }
 
     async fn missing_tick_array_instructions(
