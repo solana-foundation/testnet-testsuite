@@ -135,3 +135,31 @@ base = { kind = "basket", rebase = "100.00", legs = [
     { feed = "BTC/USD", weight = "0.3" },
     { feed = "ETH/USD", weight = "0.3" },
 ] }
+
+# --- router service (docs/router-architecture.md) ------------------------------
+
+[router]
+listen_addr = "127.0.0.1:8081"
+metrics_addr = "127.0.0.1:9101"
+# Intermediate mints for 2-hop routes, e.g. the bootstrap USDC mint.
+bridge_mints = []
+
+# Program IDs of the deployed DEX forks. Set per environment, e.g.
+# MTM_ROUTER__PROGRAMS__RAYDIUM_CLMM / __ORCA_WHIRLPOOL / __MANIFEST
+# (`just router-dev` maps them from Doppler's PUBKEY_* variables).
+[router.programs]
+
+# Pools are discovered from each program by account discriminator and vetted
+# with a two-way probe quote; curated pools can also be pinned:
+# [[router.pools]]
+# venue = "orca-whirlpool"
+# address = "<pool>"
+[router.discovery]
+enabled = true
+interval_ms = 60000
+probe_amount = 1000
+
+# Jupiter aggregator fork for `execution = "jupiter"` requests
+# (MTM_ROUTER__JUPITER__PROGRAM_ID). Unset: such requests are rejected.
+[router.jupiter]
+overhead_cu = 60000

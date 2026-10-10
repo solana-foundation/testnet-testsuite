@@ -2609,6 +2609,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mtm-venues"
+version = "0.1.0"
+dependencies = [
+ "manifest-dex-client",
+ "mtm-chain",
+ "orca-whirlpool-client",
+ "raydium-clmm-client",
+ "serde",
+ "sha2 0.10.9",
+ "solana-account-decoder-client-types",
+ "solana-commitment-config",
+ "solana-instruction 3.5.1",
+ "solana-pubkey 4.4.0",
+ "solana-rpc-client-api",
+ "solana-signer 3.0.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3550,6 +3569,52 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "router"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bincode",
+ "dotenvy",
+ "futures",
+ "manifest-dex-client",
+ "metrics",
+ "mtm-chain",
+ "mtm-common",
+ "mtm-dex-harness",
+ "mtm-telemetry",
+ "mtm-venues",
+ "orca-whirlpool-client",
+ "raydium-clmm-client",
+ "router-client",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "solana-commitment-config",
+ "solana-compute-budget-interface",
+ "solana-instruction 3.5.1",
+ "solana-message 4.6.0",
+ "solana-pubkey 4.4.0",
+ "solana-signature 3.6.0",
+ "solana-signer 3.0.1",
+ "solana-transaction",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "router-client"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.13.1",
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

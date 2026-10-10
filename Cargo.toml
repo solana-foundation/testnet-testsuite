@@ -5,6 +5,7 @@ members = [
     "crates/mtm-common",
     "crates/mtm-dex-harness",
     "crates/mtm-math",
+    "crates/mtm-venues",
     "crates/mtm-telemetry",
     "crates/manifest-dex-client",
     "crates/manifest-dex-orchestrator",
@@ -13,11 +14,13 @@ members = [
     "crates/orca-whirlpool-orchestrator",
     "crates/raydium-clmm-client",
     "crates/raydium-clmm-orchestrator",
+    "crates/router-client",
     "crates/sdks/manifest",
     "services/manifest-dex-orchestrator",
     "services/oracle",
     "services/orca-whirlpool-orchestrator",
     "services/raydium-clmm-orchestrator",
+    "services/router",
 ]
 
 [workspace.package]
@@ -31,6 +34,7 @@ mtm-chain = { path = "crates/mtm-chain" }
 mtm-common = { path = "crates/mtm-common" }
 mtm-dex-harness = { path = "crates/mtm-dex-harness" }
 mtm-math = { path = "crates/mtm-math" }
+mtm-venues = { path = "crates/mtm-venues" }
 manifest-dex-client = { path = "crates/manifest-dex-client" }
 manifest-dex-orchestrator = { path = "crates/manifest-dex-orchestrator" }
 manifest-sdk = { path = "crates/sdks/manifest" }
@@ -40,6 +44,7 @@ orca-whirlpool-client = { path = "crates/orca-whirlpool-client" }
 orca-whirlpool-orchestrator = { path = "crates/orca-whirlpool-orchestrator" }
 raydium-clmm-client = { path = "crates/raydium-clmm-client" }
 raydium-clmm-orchestrator = { path = "crates/raydium-clmm-orchestrator" }
+router-client = { path = "crates/router-client" }
 
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net"] }
 futures = "0.3"
@@ -48,6 +53,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "que
 # both ring (tungstenite) and aws-lc-rs (reqwest) end up compiled in — a
 # process-default CryptoProvider must be installed at startup or rustls panics
 rustls = "0.23"
+base64 = "0.22"
+bincode = "1"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rand = "0.10"
 rand_chacha = "0.10"
