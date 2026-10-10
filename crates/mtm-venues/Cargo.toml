@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 manifest-dex-client = { workspace = true }
+metrics = { workspace = true }
 mtm-chain = { workspace = true }
 orca-whirlpool-client = { workspace = true }
 raydium-clmm-client = { workspace = true }
