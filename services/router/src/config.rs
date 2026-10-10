@@ -22,12 +22,17 @@ pub struct RouterConfig {
     /// Curated pools: routed without vetting (we created them).
     #[serde(default)]
     pub pools: Vec<PoolEntry>,
-    /// priority fee attached to built transactions, micro-lamports per CU
+    /// priority price, micro-lamports per CU; converted to the total-lamport
+    /// priority fee of the v1 message config using the transaction's CU limit
     #[serde(default = "default_cu_price")]
     pub cu_price_micro_lamports: u64,
     /// CU margin added on top of summed per-leg estimates
     #[serde(default = "default_cu_margin")]
     pub cu_margin: u32,
+    /// Account-data load limit written into each v1 message config (v1
+    /// treats an unset limit as zero).
+    #[serde(default = "default_loaded_accounts_data_size_limit")]
+    pub loaded_accounts_data_size_limit: u32,
     #[serde(default)]
     pub discovery: DiscoveryConfig,
     /// intermediate mints multi-hop routes may pass through
@@ -89,6 +94,9 @@ fn default_cu_price() -> u64 {
 }
 fn default_cu_margin() -> u32 {
     50_000
+}
+fn default_loaded_accounts_data_size_limit() -> u32 {
+    crate::assemble::DEFAULT_LOADED_ACCOUNTS_DATA_SIZE_LIMIT
 }
 fn default_jupiter_overhead() -> u32 {
     60_000

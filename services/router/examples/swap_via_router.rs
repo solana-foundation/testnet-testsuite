@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
             .as_deref()
             .context("router returned no transaction")?,
     )?;
-    let unsigned: VersionedTransaction = bincode::deserialize(&bytes)?;
+    let unsigned: VersionedTransaction = wincode::deserialize(&bytes)?;
     let signed = VersionedTransaction::try_new(unsigned.message, &[&user])?;
     let before = balances(&chain, &user.pubkey(), &[input, output]).await?;
     let simulation = chain.rpc().simulate_transaction(&signed).await?;

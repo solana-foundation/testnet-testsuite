@@ -73,7 +73,8 @@ pub struct QuoteResponse {
     pub route: Vec<RouteLeg>,
     /// oldest state slot among quoted venues
     pub state_slot: u64,
-    /// unsigned base64 versioned transaction (present when `user` was given)
+    /// unsigned v1 transaction, wincode wire format, base64 (present when
+    /// `user` was given); the compute budget is in the message config
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_base64: Option<String>,
 }
@@ -102,9 +103,6 @@ pub struct InstructionsResponse {
     pub instructions: Vec<WireInstruction>,
     /// CU the route legs are expected to consume (add your own margin)
     pub cu_estimate: u32,
-    /// address lookup tables the caller should load (none are managed yet)
-    #[serde(default)]
-    pub alt_addresses: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

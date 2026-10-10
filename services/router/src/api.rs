@@ -101,8 +101,8 @@ async fn planned(
     Ok((request, planned, book, state_slot))
 }
 
-/// Plan and assemble for `user`, narrowing same-pair splits until the
-/// transaction fits the packet limit.
+/// Plan and assemble for `user`, narrowing the route until it fits one v1
+/// transaction (bytes, addresses, and instructions), then build it.
 async fn fitted(
     state: &AppState,
     req: &QuoteRequest,
@@ -125,8 +125,13 @@ async fn fitted(
             &planned.segments,
         )
         .map_err(assembly_error)?;
-        match assemble::route_tx(state, user, assembled.clone()).await {
-            Ok(tx) => return Ok((planned, assembled, tx)),
+        match assemble::check_fits(state, user, &assembled) {
+            Ok(()) => {
+                let tx = assemble::route_tx(state, user, &assembled)
+                    .await
+                    .map_err(assembly_error)?;
+                return Ok((planned, assembled, tx));
+            }
             Err(error) if assemble::is_oversized(&error) => {
                 let widest = planned
                     .segments
@@ -138,7 +143,7 @@ async fn fitted(
                     // First narrow same-pair splits...
                     request.max_split_legs = widest.min(request.max_split_legs) - 1;
                 } else {
-                    // ...then drop the leg with the largest account footprint.
+                    // ...then drop the leg that touches the most accounts.
                     let Some(pool) = widest_leg(user, &planned) else {
                         return Err(assembly_error(error));
                     };
@@ -223,7 +228,6 @@ async fn instructions(
         quote: planned.response,
         instructions: wire,
         cu_estimate: assembled.cu_estimate,
-        alt_addresses: vec![],
     }))
 }
 

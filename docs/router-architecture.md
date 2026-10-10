@@ -12,7 +12,7 @@ routing → transaction assembly under Solana's hard limits.
                        ┌────────────────────── services/router ──────────────────────┐
  accounts feed         │                                                              │
  (ws / geyser)  ──────▶│  market-state ──▶ token graph ──▶ route search ──▶ assembler │──▶ tx / ixs
-                       │   (shared lib)     + venue         (constrained)    (ALTs,   │
+                       │   (shared lib)     + venue         (constrained)    (tx v1,  │
  pool registry  ──────▶│                    adapters                         budgets) │
  (config/xtask)        │        ▲                                              │      │
                        └────────┼──────────────────────────────────────────────┼──────┘
@@ -52,11 +52,15 @@ What changed relative to the design below:
   `probe_amount` atoms is the functional check. Failures stay `quarantined`
   and re-vet every sweep. The stash's freeze-authority rule is dropped: our
   own bootstrap mints carry a freeze authority.
-- **Budgets are planner inputs (§1, §5).** Until ALTs exist, assembly
-  narrows same-pair splits (3 → 2 → 1 legs) and then excludes the widest leg
-  until the transaction fits 1,232 bytes. A 3-venue split serializes to
-  ~1,360 bytes and a Raydium+Orca 2-hop to ~1,270, so ALTs remain the M3
-  priority.
+- **Transaction v1 instead of ALTs (§5).** Routes are built as v1
+  transactions (SIMD-0385; `enable_tx_v1` active on testnet since slot
+  437,276,256): up to 4,096 bytes, 64 addresses, 64 instructions, compute
+  budget in the message config. V1 has no lookup tables, so the 64-address
+  cap is the real account budget and no ALT infrastructure is planned. A
+  3-venue split lands at ~1,330 bytes, well inside the limit.
+- **Budgets are planner inputs (§1, §5).** If a route breaks any v1 limit,
+  assembly narrows same-pair splits (3 → 2 → 1 legs) and then excludes the
+  leg touching the most accounts, until it fits.
 - **Execution modes.** `execution = "direct"` emits each leg's own top-level
   venue instruction (conservative chaining, §8.3). `execution = "jupiter"`
   emits one `route_v2` of a Jupiter aggregator fork, described next.
@@ -95,10 +99,10 @@ POST /v1/quote
     route: [ { venue, pool, in_mint, out_mint, in_amount, out_amount,
                fee_amount, cu_estimate, writable_accounts } ],
     state_slot, oracle_divergence_bps?,          # sanity signal, see §6
-    tx?: base64 versioned tx, alt_addresses?: [] }
+    tx?: base64 unsigned v1 tx (wincode wire format) }
 
 POST /v1/swap          # quote_id (or inline quote params) + user pubkey → tx
-POST /v1/instructions  # same, but raw instructions + ALT list — for callers
+POST /v1/instructions  # same, but raw instructions — for callers
                        # composing their own tx (arb bot, CPI-style flows)
 GET  /v1/venues, /v1/pools   # registry introspection
 ```
@@ -183,12 +187,10 @@ the graph, the subscription manager, and metrics.
 so restarts don't re-vet the world from a cold gPA sweep; the registry file
 overlays allow/deny/curation on top.
 
-**ALT interaction**: discovered pools aren't in the xtask-managed ALTs. They
-remain routable at raw-address cost (32B/account — fine single-hop, painful
-multi-hop); an **ALT-maintainer task** extends the venue ALT when a market
-reaches `verified` (needs custody of the ALT authority key — see §8). The
-assembler always verifies resolved addresses, so a stale/wrong table entry is
-detectable, not exploitable.
+**Transaction format**: every route ships as a v1 transaction, so a
+discovered pool costs exactly what a curated one does (32 bytes per new
+address against the 4,096-byte limit, one slot against the 64-address cap).
+There are no lookup tables to keep in sync with discovery.
 
 **Discovery as a test surface**: same ground-truth philosophy as the lag/noise
 arb pairs — `xtask spawn-junk-markets` creates adversarial fixtures (freezable
@@ -267,13 +269,13 @@ for sanity; all: freshness gates).
 Budget table the assembler enforces (verify exact current values at
 implementation start — marked ⚠ where consensus limits have moved before):
 
-| Limit                     | Value                                                                    | Impact                                                                         |
-| ------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| Packet size               | **1232 bytes** total (sigs + message + ALT refs)                         | ALT ref = 1 byte/account vs 32 raw; multi-hop without ALTs is hopeless         |
-| Account locks/tx          | **64** ⚠ (raise to 128 landed behind a feature gate — verify on testnet) | dedup accounts across legs; writable set is the scarce resource                |
-| CU/tx                     | **1.4M**                                                                 | CLMM tick walks are the hog; per-leg CU estimates from measurement (§7)        |
-| CU/writable-account/block | ~12M ⚠                                                                   | hot-pool throughput cap under traffic-gen load — relevant to _us_ specifically |
-| ALT                       | 256 addresses/table; extensions usable next slot                         | warmup matters for freshly-bootstrapped pools                                  |
+| Limit                     | Value                            | Impact                                                                         |
+| ------------------------- | -------------------------------- | ------------------------------------------------------------------------------ |
+| Transaction size (v1)     | **4,096 bytes** (sigs + message) | 32 bytes per address; splits and 2-hop routes fit comfortably                  |
+| Addresses/tx (v1)         | **64** (no lookup tables in v1)  | the binding constraint: dedup accounts across legs                             |
+| Instructions/tx (v1)      | **64**                           | ATA preflight + one swap per leg is far below it                               |
+| CU/tx                     | **1.4M**                         | CLMM tick walks are the hog; per-leg CU estimates from measurement (§7)        |
+| CU/writable-account/block | ~12M ⚠                           | hot-pool throughput cap under traffic-gen load — relevant to _us_ specifically |
 
 Assembly pipeline:
 
@@ -282,12 +284,10 @@ Assembly pipeline:
 2. **ATA preflight**: check user's ATAs for intermediate/output mints; prepend
    `create_associated_token_account_idempotent` (bytes + CU they cost are part
    of the budget); wSOL wrap/unwrap legs where SOL is an endpoint.
-3. Resolve against **our ALTs**: `xtask bootstrap-dex` creates/extends one ALT
-   per venue (pool accounts, vaults, configs) at pool-creation time; router
-   config lists them. User-specific accounts (ATAs) ride raw.
-4. Compute budget ixs (CU limit from summed leg estimates + margin; priority
-   fee via mtm-chain policy), then legs in order.
-5. Fit check — **which should never fail**, because the search already
+3. Compile a v1 message with the compute budget in its config (CU limit
+   from summed leg estimates + margin; priority fee as total lamports;
+   explicit loaded-accounts-data limit, since v1 treats unset as zero).
+4. Fit check — **which should never fail**, because the search already
    received the budgets. Assembly-time overflow is a bug, not a fallback path.
 
 **The chaining caveat** (drives a future decision): with off-chain composed
@@ -356,11 +356,8 @@ shape doesn't change.
 4. **State layer as shared lib** (`mtm-market-state`): recommended strongly;
    the alternative (router-internal) forces the arb bot to duplicate
    subscriptions or eat an API hop.
-5. Verify the ⚠ limits (account locks 64 vs 128, per-account block CU) on
-   testnet at M0.
-6. **ALT authority custody**: the ALT-maintainer needs the authority keypair
-   (doppler). Router service holds it vs an xtask cron — service is more
-   responsive, cron is a smaller trust surface. Lean: cron first.
+5. Verify the ⚠ per-account block CU limit on testnet under load.
+6. ~~ALT authority custody~~ — moot: transaction v1 replaced the ALT plan.
 7. **Discovery persistence**: JSON snapshot (simple, greppable) vs sqlite
    (query-able history). Lean: JSON snapshot until the market count argues
    otherwise.
@@ -381,14 +378,14 @@ shape doesn't change.
   deny or quarantine, functional probes + liquidity floors quarantine;
   quarantined markets re-vet every sweep so transient failures heal),
   `auto_promote` config, junk-market test fixtures. In lieu of ALTs, assembly
-  enforces a hard 1232-byte serialize guard; ALT-maintainer + xtask ALT
-  bootstrap moved to M3 (blocked on xtask revival + authority custody, §8.6).
+  enforced a hard 1232-byte serialize guard (superseded by transaction v1).
   Geyser backend and quote cache deferred: no geyser endpoint on our testnet
   infra yet, and quoting is pure in-memory math over pushed state — there is
   no RPC call to cache until that changes.
 - **M2.5 — three deployed venues** _(done, 2026-10-10)_: Raydium CLMM, Orca
   Whirlpool, and Manifest via venue snapshots; discriminator discovery with
-  probe vetting; footprint-aware fitting; Jupiter-fork `route_v2` assembly
+  probe vetting; transaction v1 with fitting to its limits; Jupiter-fork
+  `route_v2` assembly
   behind the placeholders above; Surfpool end-to-end runs for split, bridge,
   and exact-out routes (`services/router/examples`).
 - **M3 — hardening**: execution feedback loop, CLMM adapter (tick-window

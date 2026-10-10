@@ -414,12 +414,13 @@ curl -s localhost:8081/v1/quote -H 'content-type: application/json' -d '{
 }'
 ```
 
-With `user`, the response carries an unsigned v0 transaction; `/v1/instructions`
+With `user`, the response carries an unsigned v1 transaction (wincode wire
+format, base64; compute budget in the message config); `/v1/instructions`
 returns the raw instructions instead. `execution: "direct"` uses each venue's
 own top-level swap instruction; `execution: "jupiter"` emits one `route_v2` of
 the Jupiter fork configured by `PUBKEY_JUPITER_FORK` (see the placeholders in
-the design doc). Without address lookup tables, the router narrows splits and
-drops wide legs until the transaction fits 1,232 bytes.
+the design doc). Routes are fitted to the v1 limits (4,096 bytes, 64
+addresses, 64 instructions): splits narrow and wide legs drop until it fits.
 
 On a fresh Surfpool, `NO_DNA=1 just router-seed-dev` opens faucet-funded
 positions and resting orders on every pool so routes have liquidity, and
