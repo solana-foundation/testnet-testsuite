@@ -7,22 +7,22 @@ the point is generating realistic traffic against it.
 
 ## Layout
 
-| Path | What |
-|---|---|
-| `crates/mtm-common` | Shared leaf types (`Symbol`) + layered config loading |
-| `crates/mtm-math` | Canonical fixed-point `Price` (i128 mantissa × 10^expo) + rust_decimal bridge |
-| `crates/mtm-chain` | Off-chain Solana toolkit: RPC clients, keypairs, (soon) tx pipeline |
-| `crates/oracle-client` | Typed client for the oracle service; owns the API wire types |
-| `crates/mtm-dex-harness` | SPL builders, test-token funding, and the ephemeral-user CLI lifecycle shared by DEX orchestrators |
-| `crates/orca-whirlpool-client` | Async Orca Whirlpool pool, tick-array, position, collection, close, and swap actions |
-| `crates/orca-whirlpool-orchestrator` | Reusable funding and full Whirlpool lifecycle sequencing |
-| `crates/raydium-clmm-client` | Async Raydium CLMM pool, position, collection, close, and swap actions |
-| `crates/raydium-clmm-orchestrator` | Reusable funding and full CLMM lifecycle sequencing |
-| `services/oracle` | Polls Hermes → serves `/v1/prices` + `/v1/ws` → pushes on-chain (WIP) |
-| `services/orca-whirlpool-orchestrator` | CLI with `admin`, `create-pools`, and `user-flow` commands for the Whirlpool fork |
-| `services/raydium-clmm-orchestrator` | CLI with `admin` setup and complete `flow` lifecycle commands |
-| `programs/` | On-chain programs (empty for now — Anchor workspace lands here later) |
-| `config/` | Layered config: `default.toml` ← `{profile}.toml` ← `MTM_*` env vars |
+| Path                                   | What                                                                                               |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `crates/mtm-common`                    | Shared leaf types (`Symbol`) + layered config loading                                              |
+| `crates/mtm-math`                      | Canonical fixed-point `Price` (i128 mantissa × 10^expo) + rust_decimal bridge                      |
+| `crates/mtm-chain`                     | Off-chain Solana toolkit: RPC clients, keypairs, (soon) tx pipeline                                |
+| `crates/oracle-client`                 | Typed client for the oracle service; owns the API wire types                                       |
+| `crates/mtm-dex-harness`               | SPL builders, test-token funding, and the ephemeral-user CLI lifecycle shared by DEX orchestrators |
+| `crates/orca-whirlpool-client`         | Async Orca Whirlpool pool, tick-array, position, collection, close, and swap actions               |
+| `crates/orca-whirlpool-orchestrator`   | Reusable funding and full Whirlpool lifecycle sequencing                                           |
+| `crates/raydium-clmm-client`           | Async Raydium CLMM pool, position, collection, close, and swap actions                             |
+| `crates/raydium-clmm-orchestrator`     | Reusable funding and full CLMM lifecycle sequencing                                                |
+| `services/oracle`                      | Polls Hermes → serves `/v1/prices` + `/v1/ws` → pushes on-chain (WIP)                              |
+| `services/orca-whirlpool-orchestrator` | CLI with `admin`, `create-pools`, and `user-flow` commands for the Whirlpool fork                  |
+| `services/raydium-clmm-orchestrator`   | CLI with `admin` setup and complete `flow` lifecycle commands                                      |
+| `programs/`                            | On-chain programs (empty for now — Anchor workspace lands here later)                              |
+| `config/`                              | Layered config: `default.toml` ← `{profile}.toml` ← `MTM_*` env vars                               |
 
 ## Quickstart
 
