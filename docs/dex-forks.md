@@ -91,20 +91,27 @@ trivial if that is ever approved.
 
 ### Build
 
-The snapshot predates current platform tools: its lockfile pins
-`solana-program =1.17.22`, whose `ahash 0.8.5` needs a rustc that still has
-the `stdsimd` feature (removed in Rust 1.78). Build with platform-tools
-**v1.41** (rustc 1.75), which any recent `cargo build-sbf` can fetch:
+Build with **platform-tools v1.37**, the version Solana 1.17.25 (upstream CI)
+shipped with. Any recent `cargo build-sbf` can fetch it:
 
 ```sh
-cargo build-sbf --tools-version v1.41 \
+cargo build-sbf --tools-version v1.37 \
   --manifest-path programs/whirlpool/Cargo.toml
 # → target/deploy/whirlpool.so
 ```
 
-Upstream CI used Solana 1.17.25, Anchor 0.29.0, and rustc 1.84.0 for host
-tooling; `anchor build -p whirlpool` with Anchor 0.29.0 also works but is not
-required.
+Newer tools do not work for this snapshot, for two reasons:
+
+- Platform-tools ≥ v1.43 fail to compile the pinned `ahash 0.8.5` (pulled in
+  by `solana-program =1.17.22`), which uses the `stdsimd` feature removed in
+  Rust 1.78.
+- Platform-tools v1.41 compiles, but `InitializePool` / `InitializePoolV2`
+  `try_accounts` exceed the 4 KiB SBF stack frame (by 792 / 1,080 bytes).
+  The build only warns; the deployed program then fails pool creation with
+  `Access violation in stack frame 5`.
+
+Verified on a local Surfpool (2026-10-10): the v1.37 artifact deploys and
+passes `admin`, `create-pools`, and the complete `user-flow` for three pairs.
 
 ### Deploy and configure
 
