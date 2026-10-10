@@ -131,3 +131,71 @@ NO_DNA=1 just orca-whirlpool-user-flow-dev
 
 Use `deploy-program-testnet`, `configure-orca-whirlpool-prd`, and the
 `-testnet` recipes for testnet.
+
+## Manifest
+
+### Licensing
+
+Manifest ([Bonasa-Tech/manifest](https://github.com/Bonasa-Tech/manifest)) is
+GPL-3.0. The fork is public, which satisfies the GPL for the deployed
+binary. This repository links **no** Manifest code: `manifest-dex-client`
+builds instructions with the codama SDK generated from Manifest's published
+IDL (`crates/sdks/manifest`) and reads market accounts with its own decoder of
+the documented layout. Keep it that way; upstream's `manifest-client` also pins
+`solana-instruction =3.4.0`, which cannot coexist with this workspace's
+Solana crates.
+
+### Create the fork
+
+Pin the commit the client was verified against:
+
+```sh
+gh repo fork Bonasa-Tech/manifest --org solana-foundation --clone=false
+git clone git@github.com:solana-foundation/manifest.git
+cd manifest
+git switch -c testnet 5718d3eed80fa7472a826f346c0668644ff32138
+```
+
+### Code changes
+
+Manifest has no admin, config, or fee accounts; markets are permissionless
+keypair accounts. The only required change is the program ID:
+
+`programs/manifest/src/lib.rs`:
+
+```diff
+-declare_id!("MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms");
++declare_id!("<public key of KEYPAIR_MANIFEST>");
+```
+
+Every program-side PDA (vaults, global accounts) derives from `crate::ID`,
+so nothing else changes. Do not deploy the `wrapper` or `ui-wrapper`
+programs; the suite calls the core program directly. Their own `declare_id!`
+lines would need the same treatment if that ever changes.
+
+### Build and deploy
+
+Upstream builds SBPF v3 with platform-tools v1.57, which ship with Agave
+4.3.0's `cargo-build-sbf`:
+
+```sh
+agave-install init 4.3.0          # or use the release tarball's bin/ directly
+cargo build-sbf --arch v3 --tools-version v1.57 \
+  --manifest-path programs/manifest/Cargo.toml
+# → target/deploy/manifest.so (ELF e_flags = 3)
+```
+
+SBPF v3 deployment is active on testnet since slot 406,604,256
+(`5cC3foj77CWun58pC51ebHFUWavHWKarWyR5UUik7dnC`) and on mainnet since slot
+428,976,000. Deploy with an Agave ≥ 4.x CLI: Solana CLI 2.1's local ELF
+check rejects v3 artifacts (`ELF error: Offset or value is out of bounds`).
+
+```sh
+NO_DNA=1 just deploy-program-dev "KEYPAIR_MANIFEST" "../manifest/target/deploy/manifest.so"
+NO_DNA=1 just manifest-create-markets-dev
+NO_DNA=1 just manifest-user-flow-dev
+```
+
+Verified on a local Surfpool (2026-10-10): `create-markets` (create, then
+reuse via `getProgramAccounts`) and the complete `user-flow` for three pairs;
+exact-in output matched the client's quote to the atom.
