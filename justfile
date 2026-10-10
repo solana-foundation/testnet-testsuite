@@ -36,6 +36,42 @@ ci: fmt-check lint test
 oracle profile="local":
     MTM_PROFILE={{profile}} cargo run -p oracle
 
+router profile="local":
+    MTM_PROFILE={{profile}} cargo run -p router
+
+# Run the router under a Doppler config. Program IDs are derived from the
+# program keypair secrets in a wrapper shell; the router process only sees
+# public keys. PUBKEY_JUPITER_FORK enables `execution = "jupiter"`.
+router-with CONFIG PROFILE:
+    doppler run --project testnet-testsuite --config "{{CONFIG}}" -- bash -c ' \
+        set -euo pipefail; \
+        pk() { if [ -n "${!1:-}" ]; then solana-keygen pubkey <(printf %s "${!1}"); fi; }; \
+        export MTM_PROFILE="$1"; \
+        export MTM_ROUTER__PROGRAMS__RAYDIUM_CLMM="$(pk KEYPAIR_RAYDIUM_CLMM)"; \
+        export MTM_ROUTER__PROGRAMS__ORCA_WHIRLPOOL="$(pk KEYPAIR_ORCA_WHIRLPOOL)"; \
+        export MTM_ROUTER__PROGRAMS__MANIFEST="$(pk KEYPAIR_MANIFEST)"; \
+        export MTM_ROUTER__JUPITER__PROGRAM_ID="${PUBKEY_JUPITER_FORK:-}"; \
+        export MTM_ROUTER__BRIDGE_MINTS="[\"${PUBKEY_TOKEN_USDC_MINT:?missing in config}\"]"; \
+        unset KEYPAIR_RAYDIUM_CLMM KEYPAIR_ORCA_WHIRLPOOL KEYPAIR_MANIFEST; \
+        exec cargo run -p router \
+    ' _ "{{PROFILE}}"
+
+router-dev: (router-with "dev" "local")
+router-testnet: (router-with "prd" "testnet")
+
+# Local only: open wide positions and rest orders on every discovered pool so
+# the router has liquidity to route through (faucet-funded, left open).
+router-seed-dev *ARGS:
+    doppler run --project testnet-testsuite --config dev -- bash -c ' \
+        set -euo pipefail; \
+        pk() { solana-keygen pubkey <(printf %s "${!1:?missing Doppler secret: $1}"); }; \
+        cargo run -p router --example seed_liquidity -- \
+            --rpc-url http://localhost:8899 \
+            --raydium-clmm "$(pk KEYPAIR_RAYDIUM_CLMM)" \
+            --orca-whirlpool "$(pk KEYPAIR_ORCA_WHIRLPOOL)" \
+            --manifest "$(pk KEYPAIR_MANIFEST)" "$@" \
+    ' _ {{ARGS}}
+
 # --- token bootstrap (doppler-managed secrets) ----------------------------------
 
 bootstrap-tokens *ARGS:
