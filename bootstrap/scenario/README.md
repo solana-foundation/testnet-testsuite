@@ -170,6 +170,12 @@ SCENARIO_SCALE=x10 bootstrap/scenario/scenario.sh measure x10 600
 python3 -I bootstrap/scenario/summarize.py .scenario/runs x1 x10 x100 assets
 ```
 
+Always start Surfpool with `--disable-instruction-profiling` (both
+`scenario-surfpool*` recipes do; `--ci` also implies it). With profiling on,
+Surfpool pins one core and its memory grows with history: at x10 it lands
+4.3 TPS instead of 13 (RPC p95 7.4 s instead of 1 ms), and the x100
+bootstrap crawls at ~2 TPS.
+
 `measure` freezes flow, arb, and mm (`SIGSTOP`) while each snapshot reads,
 so every wallet, seat, and position is read in one chain state; without it,
 heavy flow moves value between participants mid-read and PnL stops summing
