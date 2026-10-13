@@ -282,6 +282,61 @@ transactions failed). The limits, in order:
   (`--limit-blockstore-size 5000000` retains ~40 min at x2000, enough for a
   report window) or a tmpfs quota stops the validator.
 
+## Teardown
+
+`scenario.sh teardown` (`just scenario-teardown-dev` / `-testnet`) recovers
+the scenario's SOL into the faucet:
+
+1. stops oracle, router, makers, flow, and arb (Prometheus/Grafana stay);
+2. unwinds every maker: CLMM positions are emptied, their fees collected,
+   and closed (position, NFT mint, and NFT account rent come back);
+   Manifest makers cancel their orders and withdraw their seat balances;
+3. sweeps every participant wallet (makers, arb bots, takers): scenario
+   tokens are burned, every token account is closed with its rent sent to
+   the faucet, and the remaining SOL follows, leaving each wallet at 0.
+   Token accounts holding anything else (e.g. a position NFT whose close
+   failed) are left open and listed instead of burned;
+4. with `SCENARIO_CLOSE_PROGRAMS=1`, closes the three DEX programs
+   (programdata rent to the faucet; the pools stop working);
+5. sweeps the operator wallets (program / mint / freeze / metadata
+   authorities) into the faucet: by default on `local`, opt-in on testnet
+   (`SCENARIO_SWEEP_OPERATORS=1`), where those keys are shared;
+6. writes `.scenario/teardown.json` (what moved) and
+   `.scenario/leftovers.json` (`scenario leftovers`: the rent still locked,
+   by owner program and account type).
+
+Every step is idempotent, so a teardown can be re-run after a partial
+failure; `scenario leftovers` can also be run on its own at any time.
+
+What stays locked has no close instruction in the forked programs (or is a
+mint): pools, tick arrays, observation and bitmap accounts, venue configs,
+Manifest markets, pool/market vaults, the mints and their Metaplex
+metadata, and the 36-byte stubs of closed programs. Measured on the x2000
+chain (33 086 participants, 3 tokens, 7 pools) on 2026-10-13:
+
+| recovered into the faucet                   | SOL       |
+| ------------------------------------------- | --------- |
+| participant wallets (33 086, all left at 0) | 16 715.19 |
+| token-account rent (99 222 accounts closed) | 202.34    |
+| operator wallets                            | 200 000   |
+| programdata (`SCENARIO_CLOSE_PROGRAMS=1`)   | 20.29     |
+
+| still locked                                               | accounts | SOL   |
+| ---------------------------------------------------------- | -------- | ----- |
+| Orca tick arrays                                           | 14       | 0.986 |
+| Raydium tick arrays                                        | 10       | 0.722 |
+| Raydium observation + tick-array bitmap accounts           | 4        | 0.091 |
+| pools (Orca Whirlpool, Raydium PoolState)                  | 5        | 0.040 |
+| Manifest markets                                           | 2        | 0.038 |
+| pool / market vaults                                       | 14       | 0.029 |
+| mints + Metaplex metadata                                  | 6        | 0.051 |
+| venue configs (Orca config + fee tier, Raydium AMM config) | 3        | 0.005 |
+| closed-program stubs                                       | 3        | 0.003 |
+| **total** (20.30 more if the programs are kept)            |          | 1.964 |
+
+Tick arrays dominate (~0.07 SOL each); they grow with the ranges LPs
+open, so the asset scale (39 pools) locks proportionally more.
+
 ## Doppler variables
 
 | Variable                                                                                                                                                     | Used by                                                                                                            |

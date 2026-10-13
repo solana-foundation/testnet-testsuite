@@ -125,6 +125,8 @@ scenario-deploy-dev: (scenario-with "dev" "local" "deploy")
 scenario-up-dev: (scenario-with "dev" "local" "up")
 scenario-status-dev: (scenario-with "dev" "local" "status")
 scenario-deploy-testnet: (scenario-with "prd" "testnet" "deploy")
+scenario-teardown-dev: (scenario-with "dev" "local" "teardown")
+scenario-teardown-testnet: (scenario-with "prd" "testnet" "teardown")
 scenario-testnet: (scenario-with "prd" "testnet" "up")
 scenario-status-testnet: (scenario-with "prd" "testnet" "status")
 
