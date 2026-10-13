@@ -100,7 +100,7 @@ scenario-test-validator:
         ledger="$([[ -w /dev/shm ]] && echo /dev/shm/mtm-test-ledger || echo .scenario/test-ledger)"; \
         solana-test-validator --ledger "$ledger" --reset --quiet --mint "$PUBKEY_FAUCET" \
             --account-dir .scenario/metaplex-accounts \
-            --account-index program-id spl-token-owner spl-token-mint --limit-blockstore-size 20000000 \
+            --account-index program-id spl-token-owner spl-token-mint --limit-blockstore-size 5000000 \
             --deactivate-feature B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g'
 
 # Fund the program authority on a fresh test validator (Surfpool airdrops it instead).

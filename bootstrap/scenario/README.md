@@ -250,6 +250,38 @@ memory stays flat (Surfpool keeps history in RSS). x200 did not saturate
 it; the next bottlenecks on this machine are the router (~1 core at x200)
 and flow's per-swap RPC round trips.
 
+#### Test-validator ceiling (x200 → x2000)
+
+Same machine, 2026-10-13, fresh chain per row. From x1000 up the router
+runs with `MTM_ROUTER__SNAPSHOT_TTL_MS=400` (without it quotes average 5 s
+at x1000 and the router caps the run at 750 TPS):
+
+| scale       | offered swaps/s | validator TPS mean (max) | successful swaps/s | tx / block (mean, max) | RPC p95 | validator CPU · RSS |
+| ----------- | --------------- | ------------------------ | ------------------ | ---------------------- | ------- | ------------------- |
+| x200        | 275             | 269 (288)                | 259                | —                      | 1.6 ms  | 276% · 1.7 GB       |
+| x500        | 690             | 661 (1051)               | 633                | —                      | 1.9 ms  | 339% · 1.8 GB       |
+| x1000 + TTL | 1375            | 1284 (1545)              | 1220               | 531, 665               | 2.5 ms  | 380% · 2.0 GB       |
+| x2000 + TTL | 2750            | 1357 (2204)              | 1332               | 554, 860               | 785 ms  | 403% · 2.3 GB       |
+
+The scenario tops out at ~1.3k successful swaps/s on this machine: doubling
+the offered load from x1000 to x2000 adds 9%. The validator is not what
+saturates (4 of 16 cores, ~29M of the 100M block CU limit, 1% of landed
+transactions failed). The limits, in order:
+
+- **Pool contention.** All flow goes through 7 pools (~190 swaps per pool
+  per second at x2000), so a quote is stale within a slot: a quarter of
+  x2000's swaps are rejected at preflight on slippage, and LP re-centres
+  fail on chain, so books thin over a long run (a chain kept under x1000
+  load for an hour lands 40% of its transactions failed).
+- **Client transport.** Each taker holds an HTTP/1.1 connection while it
+  polls for confirmation: flow opens ~24k sockets to the RPC port at x2000,
+  which exhausts the ephemeral port range (`EADDRNOTAVAIL`) and pushes RPC
+  p95 to ~0.8 s. Batched `getSignatureStatuses` (or TPU/QUIC sends) would
+  be needed to find the validator's own ceiling.
+- **Ledger.** At ~1k TPS the blockstore grows ~0.5 GB/min; keep it capped
+  (`--limit-blockstore-size 5000000` retains ~40 min at x2000, enough for a
+  report window) or a tmpfs quota stops the validator.
+
 ## Doppler variables
 
 | Variable                                                                                                                                                     | Used by                                                                                                            |
