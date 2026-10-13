@@ -153,6 +153,7 @@ any happened in the window); for a clean window run flow with
 | `x10`            | 170          | 140    | 6        | 24     | 3 / 7          | ×3            |
 | `x100`           | 1700         | 1650   | 14       | 36     | 3 / 7          | ×10           |
 | `assets`         | 1756         | 1650   | 14       | 92     | 11 / 39        | ×10           |
+| `x200`           | 3356         | 3300   | 20       | 36     | 3 / 7          | ×20           |
 
 Takers keep the base 5 trades/min each, so offered load scales with them.
 The asset scale adds BONK, WIF, PYTH, JTO, ORCA, RENDER, W, TNSR (Binance
@@ -195,6 +196,59 @@ counts transactions from the window's blocks. Use the offline
 Surfpool for scale runs: the forking one fetches every missing account
 (uninitialized tick arrays, never-funded ATAs) from testnet, which turns
 snapshot loads into multi-second stalls.
+
+### solana-test-validator
+
+A local Agave validator runs the same scenario with a real banking stage,
+so it is the closer stand-in for testnet. It also scales much further:
+Surfpool saturates near 105 TPS, while the test validator still lands
+~95% of the offered load at x200 (261 TPS) with sub-millisecond RPC:
+
+```sh
+just scenario-test-validator                   # Agave >= 4.3 on PATH; fresh ledger
+just scenario-test-validator-fund              # program authority (Surfpool airdrops it)
+SCENARIO_SCALE=x100 just scenario-dev          # deploy + up, as with Surfpool
+SCENARIO_SCALE=x100 bootstrap/scenario/scenario.sh measure tv-x100 600
+```
+
+Differences from Surfpool that matter when reading the numbers:
+
+- **Votes.** The validator lands one vote transaction per slot. The report
+  skips vote transactions (`network.voteTransactionsExcluded`) and
+  `sample.py` subtracts one per slot from `getTransactionCount`, so TPS is
+  non-vote on both.
+- **Failures land.** Surfpool executes each transaction when it is sent, so
+  anything that would fail is rejected at preflight. On Agave, preflight
+  runs against the last bank: racing arb bots, slipped swaps, and LP
+  re-centres that a competitor front-runs within the slot land _failed_
+  and pay fees, as on testnet (~13% of landed transactions at x100).
+- **Commitments differ.** Finalized lags confirmed by ~32 slots (~13 s),
+  so every read in a snapshot must use one commitment (the client's,
+  confirmed); Surfpool treats all commitments alike and hides mixing.
+- **Genesis.** SIMD-0500 (no new SBPF v0–v2 deploys) is active at
+  test-validator genesis but not on testnet, and the Raydium and Orca forks
+  are v0 builds, so the recipe deactivates it. Metaplex comes from the same
+  snapshot via `--account-dir` (`metaplex-snapshot.py --account-dir`, which
+  zeroes the ProgramData deployment slot: a testnet slot is in a fresh
+  chain's future and keeps the program from loading).
+
+Measured 2026-10-13 on a 16-core / 125 GB machine, 10-minute windows,
+Surfpool 1.5.0 (`--ci`, offline) vs solana-test-validator 4.3.0 (tmpfs
+ledger). TPS is non-vote, landed (ok + failed on chain):
+
+| scale  | offered swaps/s | Surfpool TPS | test-validator TPS (peak 10 s) | failed on chain (S / TV) | RPC p95 (S / TV) | validator CPU / RSS (S / TV)  |
+| ------ | --------------- | ------------ | ------------------------------ | ------------------------ | ---------------- | ----------------------------- |
+| x1     | 0.3             | 0.6          | 0.6 (2.0)                      | 1 / 5                    | 1 ms / 0.6 ms    | 2% · 1.0 GB / 129% · 1.2 GB   |
+| x10    | 12              | 13.0         | 13.8 (16.0)                    | 0 / 592                  | 1 ms / 0.7 ms    | 21% · 0.8 GB / 145% · 1.3 GB  |
+| x100   | 137             | 105.3        | 138.5 (162.5)                  | 73 / 9 759               | 696 ms / 1.7 ms  | 210% · 4.8 GB / 247% · 1.7 GB |
+| assets | 137             | 48.4         | 133.0 (140.2)                  | 31 / 10 615              | 1.5 s / 1.6 ms   | 174% · 6.7 GB / 250% · 1.9 GB |
+| x200   | 275             | —            | 268.8 (321.1)                  | — / 4 776                | — / 1.6 ms       | — / 276% · 1.7 GB             |
+
+The test validator idles at ~1.3 cores (block production, votes) where
+Surfpool idles near zero, but its cost barely grows with load and its
+memory stays flat (Surfpool keeps history in RSS). x200 did not saturate
+it; the next bottlenecks on this machine are the router (~1 core at x200)
+and flow's per-swap RPC round trips.
 
 ## Doppler variables
 

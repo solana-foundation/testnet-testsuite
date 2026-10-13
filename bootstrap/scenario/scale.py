@@ -9,12 +9,14 @@
 | scale-x10     | 140    | 6        | 2                | 3      |
 | scale-x100    | 1650   | 14       | 3                | 3      |
 | scale-assets  | 1650   | 14       | 3 (1 on new)     | 11     |
+| scale-x200    | 3300   | 20       | 3                | 3      |
 
 * per Manifest book: that many ladders; per AMM pool: that many LP ranges
   and that many oracle pool-arbs, each with different parameters. Makers
   grow slowly on purpose; participants grow by an order of magnitude.
-  Maker capital grows instead (×3 at x10, ×10 at x100) so the books and
-  pools can absorb the larger flow.
+  Maker capital grows instead (×3 at x10, ×10 at x100, ×20 at x200) so the
+  books and pools can absorb the larger flow. x200 is past Surfpool's
+  ceiling; it is meant for solana-test-validator.
 
 Takers keep the base per-taker arrival rate (5/min), so offered load grows
 with the participant count. Maker and bot inventories are set in USD at the
@@ -208,6 +210,7 @@ def main():
         "scale-x10": (140, 6, 2, 3, BASE_TOKENS, base_crosses),
         "scale-x100": (1650, 14, 3, 10, BASE_TOKENS, base_crosses),
         "scale-assets": (1650, 14, 3, 10, tokens, crosses),
+        "scale-x200": (3300, 20, 3, 20, BASE_TOKENS, base_crosses),
     }
     for name, args in overlays.items():
         if not only or name in only:
