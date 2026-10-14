@@ -32,9 +32,58 @@ enum Lp {
     Raydium(raydium_clmm_client::RaydiumClmmClient),
 }
 
+/// Why an open did not happen.
+enum OpenError {
+    /// The venue computed (for its tick-snapped range) more of `mint` than
+    /// the wallet holds.
+    Short {
+        required: u64,
+        available: u64,
+    },
+    Other(anyhow::Error),
+}
+
 impl Lp {
     /// Open a position in pool-order prices with `amount` of `mint`.
     async fn open(
+        &self,
+        pool: Pubkey,
+        lower: Decimal,
+        upper: Decimal,
+        mint: Pubkey,
+        amount: Decimal,
+    ) -> std::result::Result<Pubkey, OpenError> {
+        match self.open_inner(pool, lower, upper, mint, amount).await {
+            Ok(position) => Ok(position),
+            Err(error) => {
+                let short = match error.downcast_ref::<orca_whirlpool_client::OrcaWhirlpoolError>()
+                {
+                    Some(orca_whirlpool_client::OrcaWhirlpoolError::InsufficientBalance {
+                        required,
+                        available,
+                        ..
+                    }) => Some((*required, *available)),
+                    _ => match error.downcast_ref::<raydium_clmm_client::RaydiumClmmError>() {
+                        Some(raydium_clmm_client::RaydiumClmmError::InsufficientBalance {
+                            required,
+                            available,
+                            ..
+                        }) => Some((*required, *available)),
+                        _ => None,
+                    },
+                };
+                Err(match short {
+                    Some((required, available)) => OpenError::Short {
+                        required,
+                        available,
+                    },
+                    None => OpenError::Other(error),
+                })
+            }
+        }
+    }
+
+    async fn open_inner(
         &self,
         pool: Pubkey,
         lower: Decimal,
@@ -294,40 +343,72 @@ impl Clmm {
         let quote_atoms = ctx.wallet_balance(&ctx.quote).await?;
         ctx.record_inventory(&prices, base_atoms, quote_atoms);
 
-        // Half the target value in base; keep 10% of each side in reserve.
-        let base_usd = prices.usd(&ctx.base)?;
-        let wanted = position_usd / Decimal::TWO / base_usd;
-        let base_free = to_ui(&ctx.base, base_atoms) * Decimal::new(9, 1);
-        let quote_free = to_ui(&ctx.quote, quote_atoms) * Decimal::new(9, 1) / center;
-        let amount = wanted
-            .min(base_free)
-            .min(quote_free)
-            .round_dp_with_strategy(u32::from(ctx.base.decimals), RoundingStrategy::ToZero);
-        if amount.is_zero() || to_atoms(&ctx.base, amount).unwrap_or(0) == 0 {
-            anyhow::bail!("not enough inventory to open a position");
-        }
         let half = Decimal::from(width_bps) / Decimal::from(20_000);
         let (lower, upper) = (
             center * (Decimal::ONE - half),
             center * (Decimal::ONE + half),
         );
+        // Size from what the range actually takes: a CLMM range centred on
+        // the price needs more quote than base by value (≈1.04x at ±3%,
+        // ≈1.13x at ±12.5%), and the client reserves its slippage on top.
+        // Keep 10% of each side in reserve.
+        let (slippage_bps, _, _) = ctx.execution(100, 1_400_000);
+        let quote_per_base =
+            deposit_ratio(center, lower, upper).context("range has no deposit ratio")?;
+        let mut amount = open_size(OpenSizing {
+            position_usd,
+            base_usd: prices.usd(&ctx.base)?,
+            quote_usd: prices.usd(&ctx.quote)?,
+            quote_per_base,
+            slippage: Decimal::from(slippage_bps) / Decimal::from(10_000),
+            base_free: to_ui(&ctx.base, base_atoms) * Decimal::new(9, 1),
+            quote_free: to_ui(&ctx.quote, quote_atoms) * Decimal::new(9, 1),
+        })
+        .round_dp_with_strategy(u32::from(ctx.base.decimals), RoundingStrategy::ToZero);
+        if amount.is_zero() || to_atoms(&ctx.base, amount).unwrap_or(0) == 0 {
+            anyhow::bail!("not enough inventory to open a position");
+        }
         // Venue clients take pool-order prices: mint B per mint A, A < B.
         let (lower, upper) = if ctx.base.mint < ctx.quote.mint {
             (lower, upper)
         } else {
             (Decimal::ONE / upper, Decimal::ONE / lower)
         };
-        let mint = self
-            .lp
-            .open(
-                ctx.pool,
-                lower.round_dp(10),
-                upper.round_dp(10),
-                ctx.base.mint,
-                amount,
-            )
-            .await
-            .context("opening position")?;
+        let (lower, upper) = (lower.round_dp(10), upper.round_dp(10));
+        let mut retried = false;
+        let mint = loop {
+            match self
+                .lp
+                .open(ctx.pool, lower, upper, ctx.base.mint, amount)
+                .await
+            {
+                Ok(mint) => break mint,
+                // The venue snaps the range to its tick spacing, which can
+                // shift the split further: shrink to what it asked for, once.
+                Err(OpenError::Short {
+                    required,
+                    available,
+                }) if !retried && required > 0 => {
+                    retried = true;
+                    let scale =
+                        Decimal::from(available) / Decimal::from(required) * Decimal::new(98, 2);
+                    amount = (amount * scale).round_dp_with_strategy(
+                        u32::from(ctx.base.decimals),
+                        RoundingStrategy::ToZero,
+                    );
+                    info!(maker = %ctx.maker.name, required, available, %amount, "position resized to the venue's requirement");
+                }
+                Err(OpenError::Short {
+                    required,
+                    available,
+                }) => {
+                    anyhow::bail!(
+                        "opening position: needs {required} atoms, wallet holds {available}"
+                    )
+                }
+                Err(OpenError::Other(error)) => return Err(error.context("opening position")),
+            }
+        };
         info!(maker = %ctx.maker.name, %mint, %center, %amount, "position opened");
         self.position = Some(Position {
             mint: mint.to_string(),
@@ -336,5 +417,94 @@ impl Clmm {
         self.save()?;
         ctx.action("open");
         Ok(())
+    }
+}
+
+/// Quote needed per unit of base (UI amounts) to fund a range `[lower,
+/// upper]` (quote per base) at price `price` inside it:
+/// `(√p − √pa) / (1/√p − 1/√pb)`.
+fn deposit_ratio(price: Decimal, lower: Decimal, upper: Decimal) -> Option<Decimal> {
+    use rust_decimal::MathematicalOps;
+    if !(lower < price && price < upper) || lower <= Decimal::ZERO {
+        return None;
+    }
+    let (sp, sa, sb) = (price.sqrt()?, lower.sqrt()?, upper.sqrt()?);
+    let base = Decimal::ONE / sp - Decimal::ONE / sb;
+    (base > Decimal::ZERO).then(|| (sp - sa) / base)
+}
+
+struct OpenSizing {
+    position_usd: Decimal,
+    base_usd: Decimal,
+    quote_usd: Decimal,
+    /// quote per base the range takes ([`deposit_ratio`])
+    quote_per_base: Decimal,
+    /// share the client reserves on top of each side
+    slippage: Decimal,
+    base_free: Decimal,
+    quote_free: Decimal,
+}
+
+/// Base amount to open with: the position's USD target split as the range
+/// takes it, capped by what each side can fund including slippage.
+fn open_size(s: OpenSizing) -> Decimal {
+    let wanted = s.position_usd / (s.base_usd + s.quote_per_base * s.quote_usd);
+    let margin = Decimal::ONE + s.slippage;
+    wanted
+        .min(s.base_free / margin)
+        .min(s.quote_free / (s.quote_per_base * margin))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).expect("decimal")
+    }
+
+    #[test]
+    fn symmetric_ranges_take_more_quote_than_base() {
+        // ±3% around 1: ≈1.03x quote per base; ±12.5%: ≈1.13x.
+        let narrow = deposit_ratio(d("1"), d("0.97"), d("1.03")).expect("in range");
+        assert!(narrow > d("1.02") && narrow < d("1.04"), "{narrow}");
+        let wide = deposit_ratio(d("1"), d("0.875"), d("1.125")).expect("in range");
+        assert!(wide > d("1.12") && wide < d("1.14"), "{wide}");
+        // scales with the price
+        let at_two = deposit_ratio(d("2"), d("1.94"), d("2.06")).expect("in range");
+        assert!((at_two / narrow - d("2")).abs() < d("0.000001"), "{at_two}");
+        assert!(deposit_ratio(d("1"), d("1.1"), d("1.2")).is_none());
+    }
+
+    #[test]
+    fn sizing_funds_the_quote_side_with_slippage() {
+        // A wide range in JUP/RAY terms (price 0.1734 RAY per JUP).
+        let price = d("0.1734");
+        let half = d("0.075");
+        let ratio = deposit_ratio(
+            price,
+            price * (Decimal::ONE - half),
+            price * (Decimal::ONE + half),
+        )
+        .expect("in range");
+        let quote_free = d("4500") * d("0.9");
+        let amount = open_size(OpenSizing {
+            position_usd: d("1000000"),
+            base_usd: d("0.32"),
+            quote_usd: d("1.84"),
+            quote_per_base: ratio,
+            slippage: d("0.01"),
+            base_free: d("1000000"),
+            quote_free,
+        })
+        // as `tick` does: truncated to the base token's decimals
+        .round_dp_with_strategy(6, RoundingStrategy::ToZero);
+        // What the client will ask for never exceeds what the wallet holds.
+        let required = amount * ratio * d("1.01");
+        assert!(required <= quote_free, "{required} > {quote_free}");
+        assert!(
+            required > quote_free * d("0.999"),
+            "quote-bound: uses the side fully"
+        );
     }
 }

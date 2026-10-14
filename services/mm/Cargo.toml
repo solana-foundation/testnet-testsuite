@@ -21,7 +21,7 @@ mtm-venues = { workspace = true }
 oracle-client = { workspace = true }
 orca-whirlpool-client = { workspace = true }
 raydium-clmm-client = { workspace = true }
-rust_decimal = { workspace = true }
+rust_decimal = { workspace = true, features = ["maths"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
