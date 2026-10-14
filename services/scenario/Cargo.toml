@@ -18,6 +18,7 @@ mtm-scenario = { workspace = true }
 oracle-client = { workspace = true }
 orca-whirlpool-client = { workspace = true }
 orca-whirlpool-orchestrator = { workspace = true }
+rand = { workspace = true }
 raydium-clmm-client = { workspace = true }
 raydium-clmm-orchestrator = { workspace = true }
 reqwest = { workspace = true }
@@ -30,6 +31,7 @@ solana-pubkey = { workspace = true }
 solana-rpc-client = { workspace = true }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

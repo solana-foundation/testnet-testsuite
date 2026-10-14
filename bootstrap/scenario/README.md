@@ -126,10 +126,14 @@ plus uncollected fees). The report gives, per participant:
   and trade counts from service metrics.
 
 It also sums PnL per participant kind (`byKind`) and reports network-wide
-landed/failed transactions and TPS for the window (`network`).
+landed/failed transactions and TPS for the window (`network`, with
+`slotsSkipped`). RPC errors fail the snapshot or report rather than reading
+as "no positions" or "empty block"; the Prometheus parts are best-effort and
+anything missing is listed in `warnings`.
 
-Taker refills mint tokens and would show up as PnL; for a clean window run
-flow with `MTM_SCENARIO__FLOW__REFILL_BELOW_RATIO=0`.
+Taker refills mint tokens and would show up as PnL (the report warns when
+any happened in the window); for a clean window run flow with
+`MTM_SCENARIO__FLOW__REFILL_BELOW_RATIO=0`.
 
 ## Doppler variables
 
