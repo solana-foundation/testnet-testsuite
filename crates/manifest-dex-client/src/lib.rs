@@ -105,16 +105,19 @@ pub struct MarketSnapshot {
 
 impl MarketSnapshot {
     pub async fn load(chain: &ChainClient, program_id: Pubkey, market: Pubkey) -> Result<Self> {
-        let slot = chain
-            .rpc()
-            .get_slot()
-            .await
-            .map_err(|error| ManifestError::Rpc(error.to_string()))?;
-        let accounts = chain
-            .rpc()
-            .get_multiple_accounts(&[market])
-            .await
-            .map_err(|error| ManifestError::Rpc(error.to_string()))?;
+        Self::load_at(chain, program_id, market, None).await
+    }
+
+    /// Load the market as of a context slot of at least `min_context_slot`
+    /// (reads after a confirmed transaction must not come from a node that
+    /// has not seen it). `slot` is the slot the market account was read at.
+    pub async fn load_at(
+        chain: &ChainClient,
+        program_id: Pubkey,
+        market: Pubkey,
+        min_context_slot: Option<u64>,
+    ) -> Result<Self> {
+        let (slot, accounts) = fetch_accounts(chain, &[market], min_context_slot).await?;
         let account = require_account(&[market], &accounts, 0, "market")?;
         if account.owner != program_id {
             return Err(ManifestError::MalformedAccount {
@@ -135,11 +138,7 @@ impl MarketSnapshot {
             });
         }
         let mint_keys = [book.base_mint, book.quote_mint];
-        let mints = chain
-            .rpc()
-            .get_multiple_accounts(&mint_keys)
-            .await
-            .map_err(|error| ManifestError::Rpc(error.to_string()))?;
+        let (_, mints) = fetch_accounts(chain, &mint_keys, Some(slot)).await?;
         let base = require_account(&mint_keys, &mints, 0, "base mint")?;
         let quote = require_account(&mint_keys, &mints, 1, "quote mint")?;
         for (key, account) in mint_keys.iter().zip([base, quote]) {
@@ -201,7 +200,18 @@ impl MarketSnapshot {
             self.book.quote_exact_out(base_in, amount_raw, now_slot)
         }
         .map_err(|error| ManifestError::Quote(error.to_string()))?;
-        if exact_in && input != amount_raw {
+        // Buying base with quote fills whole base atoms only, so the program
+        // leaves up to one atom's cost with the trader. That shortfall is
+        // rounding, not missing liquidity, when the book holds at least the
+        // requested quote amount.
+        let rounding_only = !base_in
+            && input < amount_raw
+            && self
+                .book
+                .quote_depth(true, now_slot)
+                .map_err(|error| ManifestError::Quote(error.to_string()))?
+                >= amount_raw;
+        if exact_in && input != amount_raw && !rounding_only {
             return Err(ManifestError::Quote(format!(
                 "book absorbs only {input} of the requested {amount_raw} input atoms"
             )));
@@ -374,6 +384,21 @@ impl ManifestClient {
         MarketSnapshot::load(&self.chain, self.program_id, market).await
     }
 
+    /// The market as of (at least) the slot `transaction` confirmed in.
+    async fn load_market_after(
+        &self,
+        market: Pubkey,
+        transaction: &TransactionOutcome,
+    ) -> Result<MarketSnapshot> {
+        MarketSnapshot::load_at(
+            &self.chain,
+            self.program_id,
+            market,
+            Some(transaction.confirmation_slot),
+        )
+        .await
+    }
+
     /// Create a market in a fresh keypair account. Manifest markets are not
     /// PDAs, so this is intentionally non-idempotent; use [`find_markets`] to
     /// locate existing ones.
@@ -466,7 +491,7 @@ impl ManifestClient {
             let transaction = self
                 .submit(vec![retarget(ix, self.program_id)], &[])
                 .await?;
-            let seat = self.require_seat(market).await?;
+            let seat = self.require_seat(market, &transaction).await?;
             Ok(SeatOutcome {
                 transaction: Some(transaction),
                 seat,
@@ -486,9 +511,10 @@ impl ManifestClient {
                     market,
                     trader: self.payer(),
                 })?;
-            let leg = self.seat_leg(&snapshot, input.mint).await?;
+            let leg = self.seat_leg(&snapshot, input.mint)?;
             let amount_raw = ui_to_raw(input.amount, leg.decimals)?;
-            let balance = self.token_balance(leg.trader_token, &leg).await?;
+            let accounts = self.fetch_optional(&[leg.trader_token]).await?;
+            let balance = self.token_balance(leg.trader_token, accounts[0].as_ref(), &leg)?;
             if balance < amount_raw {
                 return Err(ManifestError::InsufficientBalance {
                     mint: input.mint,
@@ -511,9 +537,10 @@ impl ManifestClient {
             let transaction = self
                 .submit(vec![retarget(ix, self.program_id)], &[])
                 .await?;
+            let seat = self.require_seat(market, &transaction).await?;
             Ok(BalanceOutcome {
                 transaction: Some(transaction),
-                seat: self.require_seat(market).await?,
+                seat,
             })
         })
         .await
@@ -538,7 +565,7 @@ impl ManifestClient {
                 if amount == 0 {
                     continue;
                 }
-                let leg = self.seat_leg(&snapshot, mint).await?;
+                let leg = self.seat_leg(&snapshot, mint)?;
                 instructions.push(spl::create_associated_token_account_idempotent(
                     &self.payer(),
                     &self.payer(),
@@ -566,9 +593,10 @@ impl ManifestClient {
                 });
             }
             let transaction = self.submit(instructions, &[]).await?;
+            let seat = self.require_seat(market, &transaction).await?;
             Ok(BalanceOutcome {
                 transaction: Some(transaction),
-                seat: self.require_seat(market).await?,
+                seat,
             })
         })
         .await
@@ -601,56 +629,58 @@ impl ManifestClient {
         orders: &[OrderSpec],
         cancel_existing: bool,
     ) -> Result<OrdersOutcome> {
-        {
-            if orders.is_empty() {
-                return Err(ManifestError::InvalidInput(
-                    "at least one order is required".to_owned(),
-                ));
-            }
-            let snapshot = self.load_market(market).await?;
-            let seat = snapshot
-                .book
-                .seat(&self.payer())
-                .ok_or(ManifestError::MissingSeat {
-                    market,
-                    trader: self.payer(),
-                })?;
-            let book = &snapshot.book;
-            let params = orders
-                .iter()
-                .map(|order| {
-                    ensure_positive(order.price, "order price")?;
-                    let (mantissa, exponent) =
-                        price_to_mantissa(order.price, book.base_decimals, book.quote_decimals)?;
-                    Ok(PlaceOrderParams {
-                        base_atoms: ui_to_raw(order.base_amount, book.base_decimals)?,
-                        price_mantissa: mantissa,
-                        price_exponent: exponent,
-                        is_bid: order.side == Side::Bid,
-                        last_valid_slot: 0,
-                        order_type: OrderType::Limit,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let cancels = if cancel_existing {
-                book.orders_of(seat.index)
-                    .map(|order| CancelOrderParams {
-                        order_sequence_number: order.sequence_number,
-                        order_index_hint: Some(order.index),
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
-            let ix = self.batch_update(market, seat.index, cancels, params);
-            let transaction = self.submit(vec![ix], &[]).await?;
-            let after = self.load_market(market).await?;
-            let resting = after.book.orders_of(seat.index).copied().collect();
-            Ok(OrdersOutcome {
-                transaction: Some(transaction),
-                resting,
-            })
+        if orders.is_empty() {
+            return Err(ManifestError::InvalidInput(
+                "at least one order is required".to_owned(),
+            ));
         }
+        let snapshot = self.load_market(market).await?;
+        let seat = snapshot
+            .book
+            .seat(&self.payer())
+            .ok_or(ManifestError::MissingSeat {
+                market,
+                trader: self.payer(),
+            })?;
+        let book = &snapshot.book;
+        let params = orders
+            .iter()
+            .map(|order| {
+                ensure_positive(order.price, "order price")?;
+                let (mantissa, exponent) = price_to_mantissa(
+                    order.price,
+                    book.base_decimals,
+                    book.quote_decimals,
+                    order.side == Side::Bid,
+                )?;
+                Ok(PlaceOrderParams {
+                    base_atoms: ui_to_raw(order.base_amount, book.base_decimals)?,
+                    price_mantissa: mantissa,
+                    price_exponent: exponent,
+                    is_bid: order.side == Side::Bid,
+                    last_valid_slot: 0,
+                    order_type: OrderType::Limit,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cancels = if cancel_existing {
+            book.orders_of(seat.index)
+                .map(|order| CancelOrderParams {
+                    order_sequence_number: order.sequence_number,
+                    order_index_hint: Some(order.index),
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let ix = self.batch_update(market, seat.index, cancels, params);
+        let transaction = self.submit(vec![ix], &[]).await?;
+        let after = self.load_market_after(market, &transaction).await?;
+        let resting = after.book.orders_of(seat.index).copied().collect();
+        Ok(OrdersOutcome {
+            transaction: Some(transaction),
+            resting,
+        })
     }
 
     /// Cancel every resting order owned by the payer's seat.
@@ -680,7 +710,7 @@ impl ManifestClient {
             }
             let ix = self.batch_update(market, seat.index, cancels, vec![]);
             let transaction = self.submit(vec![ix], &[]).await?;
-            let after = self.load_market(market).await?;
+            let after = self.load_market_after(market, &transaction).await?;
             Ok(OrdersOutcome {
                 transaction: Some(transaction),
                 resting: after.book.orders_of(seat.index).copied().collect(),
@@ -750,9 +780,10 @@ impl ManifestClient {
             } else {
                 (trader_quote, trader_base)
             };
-            let input_leg = self.seat_leg(&snapshot, input_mint).await?;
-            let output_leg = self.seat_leg(&snapshot, output_mint).await?;
-            let input_before = self.token_balance(input_account, &input_leg).await?;
+            let input_leg = self.seat_leg(&snapshot, input_mint)?;
+            let output_leg = self.seat_leg(&snapshot, output_mint)?;
+            let legs = [(input_account, &input_leg), (output_account, &output_leg)];
+            let [input_before, output_before] = self.token_balances(legs, None).await?;
             if input_before < quote.max_input_raw {
                 return Err(ManifestError::InsufficientBalance {
                     mint: input_mint,
@@ -760,11 +791,11 @@ impl ManifestClient {
                     available: input_before,
                 });
             }
-            let output_before = self.token_balance(output_account, &output_leg).await?;
             let instructions = snapshot.swap_instructions(self.payer(), &quote)?;
             let transaction = self.submit(instructions, &[]).await?;
-            let input_after = self.token_balance(input_account, &input_leg).await?;
-            let output_after = self.token_balance(output_account, &output_leg).await?;
+            let [input_after, output_after] = self
+                .token_balances(legs, Some(transaction.confirmation_slot))
+                .await?;
             let executed = ExecutedSwap {
                 input_raw: input_before.saturating_sub(input_after),
                 output_raw: output_after.saturating_sub(output_before),
@@ -821,8 +852,8 @@ impl ManifestClient {
         without_placeholders(ix, self.program_id)
     }
 
-    async fn require_seat(&self, market: Pubkey) -> Result<Seat> {
-        self.load_market(market)
+    async fn require_seat(&self, market: Pubkey, after: &TransactionOutcome) -> Result<Seat> {
+        self.load_market_after(market, after)
             .await?
             .book
             .seat(&self.payer())
@@ -832,7 +863,7 @@ impl ManifestClient {
             })
     }
 
-    async fn seat_leg(&self, snapshot: &MarketSnapshot, mint: Pubkey) -> Result<SeatLeg> {
+    fn seat_leg(&self, snapshot: &MarketSnapshot, mint: Pubkey) -> Result<SeatLeg> {
         let book = &snapshot.book;
         let (vault, token_program, decimals) = if mint == book.base_mint {
             (
@@ -860,9 +891,23 @@ impl ManifestClient {
         })
     }
 
-    async fn token_balance(&self, key: Pubkey, leg: &SeatLeg) -> Result<u64> {
-        let accounts = self.fetch_optional(&[key]).await?;
-        let Some(account) = accounts.into_iter().next().flatten() else {
+    /// Balances of the payer's two swap token accounts in one read, at a
+    /// context slot of at least `min_context_slot`.
+    async fn token_balances(
+        &self,
+        legs: [(Pubkey, &SeatLeg); 2],
+        min_context_slot: Option<u64>,
+    ) -> Result<[u64; 2]> {
+        let keys = legs.map(|(key, _)| key);
+        let (_, accounts) = fetch_accounts(&self.chain, &keys, min_context_slot).await?;
+        Ok([
+            self.token_balance(keys[0], accounts[0].as_ref(), legs[0].1)?,
+            self.token_balance(keys[1], accounts[1].as_ref(), legs[1].1)?,
+        ])
+    }
+
+    fn token_balance(&self, key: Pubkey, account: Option<&Account>, leg: &SeatLeg) -> Result<u64> {
+        let Some(account) = account else {
             return Ok(0);
         };
         if account.owner != leg.token_program {
@@ -938,9 +983,16 @@ impl ManifestClient {
             Err(SubmissionError::Simulation { error, logs }) => {
                 Err(ManifestError::SimulationFailure { error, logs })
             }
-            Err(SubmissionError::SimulationRpc(error)) => Err(ManifestError::SimulationFailure {
+            // A failed simulation RPC says nothing about the transaction.
+            Err(SubmissionError::SimulationRpc(error)) => Err(ManifestError::Rpc(error)),
+            Err(SubmissionError::Execution {
+                signature,
+                slot,
                 error,
-                logs: vec![],
+            }) => Err(ManifestError::ExecutionFailure {
+                signature,
+                slot,
+                error,
             }),
             Err(SubmissionError::AmbiguousConfirmation { signature, reason }) => {
                 Err(ManifestError::AmbiguousConfirmation { signature, reason })
@@ -1100,6 +1152,13 @@ pub enum ManifestError {
     SimulationFailure { error: String, logs: Vec<String> },
     #[error("submission failed: {0}")]
     SubmissionFailure(String),
+    /// The transaction landed and failed: its fee was paid.
+    #[error("transaction {signature} failed in slot {slot}: {error}")]
+    ExecutionFailure {
+        signature: Signature,
+        slot: u64,
+        error: String,
+    },
     #[error("confirmation of {signature} is ambiguous: {reason}")]
     AmbiguousConfirmation {
         signature: Signature,
@@ -1117,6 +1176,55 @@ struct SeatLeg {
 
 fn address(key: Pubkey) -> solana_address::Address {
     solana_address::Address::new_from_array(key.to_bytes())
+}
+
+/// `getMultipleAccounts` at the client's commitment and, when given, a
+/// minimum context slot; returns the slot the accounts were read at.
+async fn fetch_accounts(
+    chain: &ChainClient,
+    keys: &[Pubkey],
+    min_context_slot: Option<u64>,
+) -> Result<(u64, Vec<Option<Account>>)> {
+    let config = RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::Base64),
+        commitment: Some(chain.rpc().commitment()),
+        min_context_slot,
+        ..RpcAccountInfoConfig::default()
+    };
+    let response = chain
+        .rpc()
+        .get_multiple_ui_accounts_with_config(keys, config)
+        .await
+        .map_err(|error| ManifestError::Rpc(error.to_string()))?;
+    let accounts = response
+        .value
+        .into_iter()
+        .zip(keys)
+        .map(|(account, key)| {
+            account
+                .map(|account| {
+                    let malformed = |reason: &str| ManifestError::MalformedAccount {
+                        address: *key,
+                        reason: reason.to_owned(),
+                    };
+                    Ok(Account {
+                        lamports: account.lamports,
+                        data: account
+                            .data
+                            .decode()
+                            .ok_or_else(|| malformed("account data is not base64"))?,
+                        owner: account
+                            .owner
+                            .parse()
+                            .map_err(|_| malformed("account owner is not a public key"))?,
+                        executable: account.executable,
+                        rent_epoch: account.rent_epoch,
+                    })
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((response.context.slot, accounts))
 }
 
 fn retarget(mut ix: Instruction, program_id: Pubkey) -> Instruction {
@@ -1183,16 +1291,25 @@ fn ui_to_raw(amount: Decimal, decimals: u8) -> Result<u64> {
 }
 
 /// UI price (quote per base) → Manifest `(mantissa, exponent)` in atoms.
-fn price_to_mantissa(price: Decimal, base_decimals: u8, quote_decimals: u8) -> Result<(u32, i8)> {
+/// UI price (quote per base) as the program's price mantissa and exponent.
+/// Bids round down and asks up, so neither rests at a better price for the
+/// taker than requested.
+fn price_to_mantissa(
+    price: Decimal,
+    base_decimals: u8,
+    quote_decimals: u8,
+    is_bid: bool,
+) -> Result<(u32, i8)> {
     let mantissa = u128::try_from(price.mantissa())
         .map_err(|_| ManifestError::InvalidInput("price must be positive".to_owned()))?;
-    let numerator = mantissa
-        .checked_mul(10_u128.pow(u32::from(quote_decimals)))
+    let numerator = 10_u128
+        .checked_pow(u32::from(quote_decimals))
+        .and_then(|scale| mantissa.checked_mul(scale))
         .ok_or_else(|| ManifestError::InvalidInput("price overflow".to_owned()))?;
     let denominator = 10_u128
         .checked_pow(price.scale() + u32::from(base_decimals))
         .ok_or_else(|| ManifestError::InvalidInput("price overflow".to_owned()))?;
-    book::price_mantissa_exponent(numerator, denominator)
+    book::price_mantissa_exponent(numerator, denominator, !is_bid)
         .map_err(|error| ManifestError::InvalidInput(error.to_string()))
 }
 
@@ -1214,11 +1331,11 @@ mod tests {
     fn ui_price_converts_through_decimals() {
         // 1.5 quote per base, base 9 decimals, quote 6 → 0.0015 quote atoms per base atom
         assert_eq!(
-            price_to_mantissa(Decimal::new(15, 1), 9, 6).expect("fits"),
+            price_to_mantissa(Decimal::new(15, 1), 9, 6, true).expect("fits"),
             (1_500_000_000, -12)
         );
         assert_eq!(
-            price_to_mantissa(Decimal::ONE, 6, 6).expect("fits"),
+            price_to_mantissa(Decimal::ONE, 6, 6, true).expect("fits"),
             (1_000_000_000, -9)
         );
     }
@@ -1255,5 +1372,87 @@ mod tests {
     fn slippage_rounds_against_the_trader() {
         assert_eq!(apply_slippage(10_000, 50, false).expect("fits"), 9_950);
         assert_eq!(apply_slippage(10_001, 50, true).expect("fits"), 10_052);
+    }
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+    use crate::book::BookOrder;
+
+    const D18: u128 = 1_000_000_000_000_000_000;
+
+    fn snapshot(bids: Vec<BookOrder>, asks: Vec<BookOrder>) -> MarketSnapshot {
+        MarketSnapshot {
+            program_id: Pubkey::default(),
+            market: Pubkey::default(),
+            book: Book {
+                base_mint: Pubkey::new_from_array([1; 32]),
+                quote_mint: Pubkey::new_from_array([2; 32]),
+                base_vault: Pubkey::default(),
+                quote_vault: Pubkey::default(),
+                base_decimals: 6,
+                quote_decimals: 6,
+                bids,
+                asks,
+                seats: vec![],
+                has_free_block: false,
+            },
+            base_token_program: Pubkey::default(),
+            quote_token_program: Pubkey::default(),
+            slot: 1,
+        }
+    }
+
+    fn order_at(price_raw: u128, base_atoms: u64) -> BookOrder {
+        BookOrder {
+            index: 0,
+            price_raw,
+            base_atoms,
+            sequence_number: 0,
+            trader_index: 0,
+            last_valid_slot: 0,
+            is_global: false,
+        }
+    }
+
+    fn asks() -> MarketSnapshot {
+        snapshot(
+            vec![],
+            vec![order_at(3 * D18 / 2, 100), order_at(2 * D18, 100)],
+        )
+    }
+
+    #[test]
+    fn quote_in_accepts_rounding_dust() {
+        let (base, quote) = (
+            Pubkey::new_from_array([1; 32]),
+            Pubkey::new_from_array([2; 32]),
+        );
+        let swap = asks().quote(quote, base, 251, true, 50).expect("dust only");
+        assert_eq!(
+            (swap.expected_input_raw, swap.expected_output_raw),
+            (250, 150)
+        );
+    }
+
+    #[test]
+    fn quote_in_beyond_the_book_is_rejected() {
+        let (base, quote) = (
+            Pubkey::new_from_array([1; 32]),
+            Pubkey::new_from_array([2; 32]),
+        );
+        assert!(asks().quote(quote, base, 400, true, 50).is_err());
+    }
+
+    #[test]
+    fn base_in_shortfall_is_rejected() {
+        let (base, quote) = (
+            Pubkey::new_from_array([1; 32]),
+            Pubkey::new_from_array([2; 32]),
+        );
+        let bids = snapshot(vec![order_at(2 * D18, 100)], vec![]);
+        assert!(bids.quote(base, quote, 150, true, 50).is_err());
+        assert!(bids.quote(base, quote, 100, true, 50).is_ok());
     }
 }

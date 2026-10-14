@@ -7,9 +7,12 @@
 //! (`RestingOrder` or `ClaimedSeat`). Both book sides order their trees so the
 //! best price is the maximum, so best-first is a reverse in-order walk.
 //!
-//! The matching math mirrors the program's `place_order` loop and
-//! `impact_base_atoms` (quantities in atoms, prices as quote atoms per base
-//! atom × 10^18):
+//! The matching math is written independently to reproduce the program's
+//! observable results (no program code is linked or copied; the GPL source
+//! is not a dependency). It follows the IDL's account and instruction
+//! semantics and is checked against the amounts the deployed program
+//! settles. Quantities are in atoms, prices in quote atoms per base atom ×
+//! 10^18:
 //! - rounding law: `round_up = taker_is_bid != fully_matched_resting_order`
 //!   (full fills favor the taker, partial fills favor the maker);
 //! - expired orders are skipped;
@@ -18,7 +21,7 @@
 //! - Manifest charges no protocol fee.
 
 use borsh::BorshDeserialize;
-use manifest_sdk::types::{ClaimedSeat, MarketFixed, OrderType, RestingOrder};
+use manifest_sdk::types::{ClaimedSeat, MarketFixed, OrderType};
 use solana_pubkey::Pubkey;
 
 pub const MARKET_FIXED_DISCRIMINANT: u64 = 4_859_840_929_024_028_656;
@@ -184,7 +187,26 @@ impl Book {
         Ok((base_traded, quote_traded))
     }
 
-    /// Mirror of the program's `impact_base_atoms`: base atoms a taker can
+    /// Quote atoms that matching every available order on the side a taker
+    /// hits would trade (bid: cost of all asks; ask: proceeds of all bids),
+    /// stopping where matching stops (at a global order).
+    pub fn quote_depth(&self, taker_is_bid: bool, now_slot: u32) -> Result<u64, BookError> {
+        let side = if taker_is_bid { &self.asks } else { &self.bids };
+        let mut depth = 0_u64;
+        for resting in side {
+            if resting.is_expired(now_slot) {
+                continue;
+            }
+            if resting.is_global {
+                break;
+            }
+            let quote = quote_for_base(resting.price_raw, resting.base_atoms, taker_is_bid)?;
+            depth = depth.saturating_add(quote);
+        }
+        Ok(depth)
+    }
+
+    /// The program's base-atom impact for a quote budget: base atoms a taker can
     /// match for `quote_limit` quote atoms (bid: spend; ask: receive).
     pub fn impact_base_atoms(
         &self,
@@ -259,21 +281,53 @@ fn best_index(index: u32) -> Option<u32> {
 }
 
 fn order(index: u32, payload: &[u8], expect_bid: bool) -> Result<BookOrder, BookError> {
-    let resting = RestingOrder::try_from_slice(payload)
-        .map_err(|error| BookError::Malformed(error.to_string()))?;
-    if resting.is_bid != expect_bid {
+    // RestingOrder's fixed layout, read by hand rather than through the
+    // SDK's borsh type: its `order_type` enum would reject a variant byte the
+    // fork adds and fail the whole market, where only `Global` matters here.
+    // price u128 | num_base_atoms u64 | sequence_number u64 | trader_index u32
+    // | last_valid_slot u32 | is_bid bool | order_type u8 | padding [u8; 22]
+    let field = |range: std::ops::Range<usize>| {
+        payload
+            .get(range)
+            .ok_or_else(|| BookError::Malformed(format!("order {index} is truncated")))
+    };
+    let u64_at = |at: usize| -> Result<u64, BookError> {
+        Ok(u64::from_le_bytes(field(at..at + 8)?.try_into().map_err(
+            |_| BookError::Malformed(format!("order {index} is truncated")),
+        )?))
+    };
+    let u32_at = |at: usize| -> Result<u32, BookError> {
+        Ok(u32::from_le_bytes(field(at..at + 4)?.try_into().map_err(
+            |_| BookError::Malformed(format!("order {index} is truncated")),
+        )?))
+    };
+    let price_raw = u128::from_le_bytes(
+        field(0..16)?
+            .try_into()
+            .map_err(|_| BookError::Malformed(format!("order {index} is truncated")))?,
+    );
+    let is_bid = match field(40..41)?[0] {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(BookError::Malformed(format!(
+                "order {index} has an invalid side byte {other}"
+            )));
+        }
+    };
+    if is_bid != expect_bid {
         return Err(BookError::Malformed(format!(
             "order {index} is on the wrong book side"
         )));
     }
     Ok(BookOrder {
         index,
-        price_raw: resting.price,
-        base_atoms: resting.num_base_atoms,
-        sequence_number: resting.sequence_number,
-        trader_index: resting.trader_index,
-        last_valid_slot: resting.last_valid_slot,
-        is_global: resting.order_type == OrderType::Global,
+        price_raw,
+        base_atoms: u64_at(16)?,
+        sequence_number: u64_at(24)?,
+        trader_index: u32_at(32)?,
+        last_valid_slot: u32_at(36)?,
+        is_global: field(41..42)?[0] == OrderType::Global as u8,
     })
 }
 
@@ -346,20 +400,35 @@ fn base_for_quote(price_raw: u128, quote_atoms: u64, round_up: bool) -> Option<u
 /// `(mantissa, exponent)` for the price `numerator / denominator` quote atoms
 /// per base atom, choosing the smallest exponent whose mantissa fits `u32`
 /// (maximum precision). The result rounds down.
-pub fn price_mantissa_exponent(numerator: u128, denominator: u128) -> Result<(u32, i8), BookError> {
+/// `numerator / denominator` as the program's `mantissa × 10^exponent`
+/// price, with the most precision a `u32` mantissa holds. `round_up` rounds
+/// the last unit up (asks: never quote below the requested price), otherwise
+/// down (bids: never above it).
+pub fn price_mantissa_exponent(
+    numerator: u128,
+    denominator: u128,
+    round_up: bool,
+) -> Result<(u32, i8), BookError> {
     if numerator == 0 || denominator == 0 {
         return Err(BookError::Malformed("price must be positive".to_owned()));
     }
+    let divide = |dividend: u128, divisor: u128| {
+        if round_up {
+            dividend.div_ceil(divisor)
+        } else {
+            dividend / divisor
+        }
+    };
     for exponent in -18_i8..=8 {
         let scale = 10_u128.pow(u32::from(exponent.unsigned_abs()));
         let mantissa = if exponent < 0 {
             numerator
                 .checked_mul(scale)
-                .map(|value| value / denominator)
+                .map(|value| divide(value, denominator))
         } else {
             denominator
                 .checked_mul(scale)
-                .map(|value| numerator / value)
+                .map(|value| divide(numerator, value))
         };
         let Some(mantissa) = mantissa else { continue };
         if mantissa <= u128::from(u32::MAX) {
@@ -377,6 +446,38 @@ pub fn price_mantissa_exponent(numerator: u128, denominator: u128) -> Result<(u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manifest_sdk::types::RestingOrder;
+
+    #[test]
+    fn order_decoding_tolerates_unknown_order_types() {
+        let mut payload = borsh::to_vec(&RestingOrder {
+            price: 7 * D18,
+            num_base_atoms: 11,
+            sequence_number: 13,
+            trader_index: 17,
+            last_valid_slot: 19,
+            is_bid: true,
+            order_type: OrderType::Limit,
+            padding: [0; 22],
+        })
+        .expect("serialize");
+        let decoded = order(64, &payload, true).expect("limit");
+        assert_eq!(
+            (
+                decoded.price_raw,
+                decoded.base_atoms,
+                decoded.sequence_number
+            ),
+            (7 * D18, 11, 13)
+        );
+        assert_eq!((decoded.trader_index, decoded.last_valid_slot), (17, 19));
+        assert!(!decoded.is_global);
+        payload[41] = OrderType::Global as u8;
+        assert!(order(64, &payload, true).expect("global").is_global);
+        payload[41] = 200; // a variant this IDL does not know
+        assert!(!order(64, &payload, true).expect("unknown type").is_global);
+        assert!(order(64, &payload, false).is_err());
+    }
     use solana_address::Address;
 
     fn order_at(price: u128, base: u64) -> BookOrder {
@@ -429,6 +530,18 @@ mod tests {
     }
 
     #[test]
+    fn quote_in_leaves_rounding_dust_and_reports_depth() {
+        // 251 quote buys 100 @ 1.5 (150) + 50 @ 2.0 (100); the 51st atom at
+        // 2.0 would cost 2, so 1 quote atom is left over.
+        let b = book(
+            vec![],
+            vec![order_at(3 * D18 / 2, 100), order_at(2 * D18, 100)],
+        );
+        assert_eq!(b.quote_exact_in(false, 251, 1), Ok((250, 150)));
+        assert_eq!(b.quote_depth(true, 1), Ok(350));
+    }
+
+    #[test]
     fn exact_out_charges_what_the_program_charges() {
         let b = book(
             vec![order_at(2 * D18, 100)],
@@ -458,18 +571,33 @@ mod tests {
     fn mantissa_exponent_keeps_precision() {
         // 1.0 quote per base with equal decimals.
         assert_eq!(
-            price_mantissa_exponent(1, 1).expect("fits"),
+            price_mantissa_exponent(1, 1, false).expect("fits"),
             (1_000_000_000, -9)
         );
         // 0.000123 → mantissa 1_230_000_000 × 10^-13
         assert_eq!(
-            price_mantissa_exponent(123, 1_000_000).expect("fits"),
+            price_mantissa_exponent(123, 1_000_000, false).expect("fits"),
             (1_230_000_000, -13)
         );
         assert_eq!(
-            price_mantissa_exponent(5, 2).expect("fits"),
+            price_mantissa_exponent(5, 2, false).expect("fits"),
             (2_500_000_000, -9)
         );
+    }
+
+    #[test]
+    fn mantissa_rounds_toward_the_maker() {
+        // 1/3 at u32 precision: 3_333_333_333 × 10^-10, last unit up for asks.
+        assert_eq!(
+            price_mantissa_exponent(1, 3, false),
+            Ok((3_333_333_333, -10))
+        );
+        assert_eq!(
+            price_mantissa_exponent(1, 3, true),
+            Ok((3_333_333_334, -10))
+        );
+        // Exact prices are unaffected.
+        assert_eq!(price_mantissa_exponent(5, 2, true), Ok((2_500_000_000, -9)));
     }
 
     fn write_node(dynamic: &mut [u8], index: u32, left: u32, right: u32, payload: &[u8]) {
