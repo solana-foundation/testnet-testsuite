@@ -622,12 +622,65 @@ impl OrcaWhirlpoolClient {
             bundle.transfer_fee_b,
         )
         .map_err(quote_error)?;
+        // Fees earned since the position's last update live in the pool's
+        // fee growth, not in `fee_owed` yet.
+        let spacing = bundle.whirlpool.tick_spacing;
+        let starts = [position.tick_lower, position.tick_upper]
+            .map(|tick| core::get_tick_array_start_tick_index(tick, spacing));
+        let keys = starts.map(|start| self.tick_array_address(position.pool, start));
+        let arrays = self.fetch_optional(&keys).await?;
+        let mut outside = [(0_u128, 0_u128); 2];
+        for (index, tick) in [position.tick_lower, position.tick_upper]
+            .into_iter()
+            .enumerate()
+        {
+            let array: orca::TickArray = self.decode_program_account(
+                keys[index],
+                require_account(&keys, &arrays, index, "position tick array")?,
+                "TickArray",
+                orca::TickArray::from_bytes,
+            )?;
+            let offset = usize::try_from((tick - starts[index]) / i32::from(spacing)).unwrap_or(0);
+            let state = &array.ticks[offset.min(array.ticks.len() - 1)];
+            outside[index] = (state.fee_growth_outside_a, state.fee_growth_outside_b);
+        }
+        let pool = &bundle.whirlpool;
+        let accrued = |global, lower, upper, checkpoint| {
+            mtm_math::clmm::fees_accrued(
+                position.liquidity,
+                global,
+                lower,
+                upper,
+                pool.tick_current_index,
+                position.tick_lower,
+                position.tick_upper,
+                checkpoint,
+            )
+        };
+        let fees_a = accrued(
+            pool.fee_growth_global_a,
+            outside[0].0,
+            outside[1].0,
+            position.fee_checkpoint.0,
+        );
+        let fees_b = accrued(
+            pool.fee_growth_global_b,
+            outside[0].1,
+            outside[1].1,
+            position.fee_checkpoint.1,
+        );
         Ok(PositionValue {
             pool: position.pool,
             mint_a: bundle.mint_a.key,
             mint_b: bundle.mint_b.key,
-            amount_a: quote.token_est_a.saturating_add(position.fee_owed_a),
-            amount_b: quote.token_est_b.saturating_add(position.fee_owed_b),
+            amount_a: quote
+                .token_est_a
+                .saturating_add(position.fee_owed_a)
+                .saturating_add(fees_a),
+            amount_b: quote
+                .token_est_b
+                .saturating_add(position.fee_owed_b)
+                .saturating_add(fees_b),
             liquidity: position.liquidity,
         })
     }
@@ -1008,6 +1061,7 @@ impl OrcaWhirlpoolClient {
             liquidity: state.liquidity,
             fee_owed_a: state.fee_owed_a,
             fee_owed_b: state.fee_owed_b,
+            fee_checkpoint: (state.fee_growth_checkpoint_a, state.fee_growth_checkpoint_b),
             rewards_owed: state.reward_infos.map(|reward| reward.amount_owed),
         })
     }
@@ -1913,6 +1967,7 @@ struct PositionView {
     liquidity: u128,
     fee_owed_a: u64,
     fee_owed_b: u64,
+    fee_checkpoint: (u128, u128),
     rewards_owed: [u64; 3],
 }
 
