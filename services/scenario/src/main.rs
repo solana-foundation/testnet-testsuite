@@ -10,6 +10,7 @@
 //! `snapshot` and `report` account for every participant (see `pnl`).
 
 mod pnl;
+mod rpc;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -95,7 +96,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
-    let rpc_url = cfg.rpc.http_url.clone();
+    let rpc = rpc::JsonRpc::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let report = match cli.command {
         Command::Bootstrap {
@@ -116,8 +117,10 @@ async fn main() -> Result<()> {
         }
         Command::Status => status(&chain, &scenario).await?,
         Command::Snapshot { out } => {
-            let snapshot = pnl::snapshot(&chain, &scenario).await?;
-            std::fs::write(&out, serde_json::to_vec_pretty(&snapshot)?)?;
+            let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
+            // Compact: at tens of thousands of participants a pretty
+            // snapshot is several MB of whitespace.
+            std::fs::write(&out, serde_json::to_vec(&snapshot)?)?;
             json!({ "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len() })
         }
         Command::Report {
@@ -130,13 +133,7 @@ async fn main() -> Result<()> {
                     &std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
                 )?)
             };
-            pnl::report(
-                &rpc_url,
-                &read(&start)?,
-                &read(&end)?,
-                prometheus.as_deref(),
-            )
-            .await?
+            pnl::report(&rpc, &read(&start)?, &read(&end)?, prometheus.as_deref()).await?
         }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -376,38 +373,11 @@ async fn status(chain: &ChainClient, scenario: &Scenario) -> Result<Value> {
         };
         pools.push(json!({ "venue": pool.venue.as_str(), "base": pool.base, "quote": pool.quote, "address": address.map(|a| a.to_string()), "live": live }));
     }
-    let mut roles: Vec<(String, solana_pubkey::Pubkey)> = scenario
-        .config
-        .makers
-        .iter()
-        .map(|maker| {
-            (
-                format!("maker/{}", maker.name),
-                scenario.maker_wallet(&maker.name).pubkey(),
-            )
-        })
+    let roles: Vec<(String, solana_pubkey::Pubkey)> = scenario
+        .participants()
+        .into_iter()
+        .map(|p| (p.role, p.wallet))
         .collect();
-    roles.extend(
-        scenario
-            .config
-            .arb
-            .iter()
-            .flat_map(|arb| &arb.bots)
-            .map(|bot| {
-                (
-                    format!("arb/{}", bot.name),
-                    scenario.arb_wallet(&bot.name).pubkey(),
-                )
-            }),
-    );
-    if let Some(flow) = &scenario.config.flow {
-        roles.extend((0..flow.takers).map(|index| {
-            (
-                format!("taker/{index}"),
-                scenario.taker_wallet(index).pubkey(),
-            )
-        }));
-    }
     // Batched reads: one round trip per 100 accounts instead of one per
     // (wallet, token).
     let tokens: Vec<&Token> = scenario.tokens.values().collect();
