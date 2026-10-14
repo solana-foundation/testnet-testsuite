@@ -25,14 +25,29 @@
 # topped up to their targets.
 set -euo pipefail
 
+usage() { echo "usage: $0 {deploy|up|bootstrap|observe|status|down} [local|testnet]" \
+  "| snapshot FILE [target] | report START END [target] | measure NAME SECONDS [target]" >&2; exit 2; }
+is_target() { [[ "$1" == local || "$1" == testnet ]]; }
+
+# Positional arguments, checked strictly: a forgotten operand must not shift
+# the target into its place (e.g. `measure x10 testnet` running locally).
 cmd="${1:-up}"
+[[ $# -gt 0 ]] && shift
 args=()
 case "$cmd" in
-  snapshot) args=("${2:?snapshot FILE}"); shift ;;
-  report) args=("${2:?report START END}" "${3:?report START END}"); shift 2 ;;
-  measure) args=("${2:?measure NAME SECONDS}" "${3:?measure NAME SECONDS}"); shift 2 ;;
+  snapshot) operands=1 ;;
+  report | measure) operands=2 ;;
+  *) operands=0 ;;
 esac
-target="${2:-local}"
+for _ in $(seq 1 "$operands"); do
+  [[ $# -gt 0 ]] && ! is_target "$1" || usage
+  args+=("$1"); shift
+done
+if [[ "$cmd" == measure ]] && ! [[ "${args[1]}" =~ ^[0-9]+$ ]]; then
+  echo "measure: SECONDS must be a whole number, got '${args[1]}'" >&2; exit 2
+fi
+target="${1:-local}"
+[[ $# -le 1 ]] || usage
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 state="$root/.scenario"
 mkdir -p "$state/logs" "$state/pids" "$state/state"
@@ -53,8 +68,11 @@ esac
 export MTM_RPC__HTTP_URL="$rpc"
 if [[ -n "${SCENARIO_WS_URL:-}" ]]; then
   export MTM_RPC__WS_URL="$SCENARIO_WS_URL"
+elif [[ "$target" == local && "$rpc" =~ ^http://([^/:]+):([0-9]+)/?$ ]]; then
+  # Surfpool and solana-test-validator: websocket on the RPC port + 1.
+  export MTM_RPC__WS_URL="ws://${BASH_REMATCH[1]}:$(( BASH_REMATCH[2] + 1 ))"
 elif [[ "$target" == local ]]; then
-  export MTM_RPC__WS_URL="ws://127.0.0.1:$(( ${rpc##*:} + 1 ))" # Surfpool: RPC port + 1
+  echo "cannot derive the websocket URL from $rpc: set SCENARIO_WS_URL" >&2; exit 2
 else
   export MTM_RPC__WS_URL="${rpc/https/wss}"
 fi
@@ -239,12 +257,8 @@ case "$cmd" in
     tokens
     start oracle "$bin/oracle"
     wait_http http://127.0.0.1:8180/health oracle
-    # Pools are created at live oracle prices: wait for the first prices.
-    want="$("$bin/scenario" token-count 2>/dev/null || echo 3)"
-    for _ in $(seq 1 120); do
-      [[ "$(curl -sf http://127.0.0.1:8180/v1/prices | grep -o '"symbol"' | wc -l)" -ge "$want" ]] && break
-      sleep 1
-    done
+    # Pools are created at live oracle prices: wait for a fresh price per token.
+    "$bin/scenario" wait-prices >/dev/null
     "$bin/scenario" bootstrap | tee "$state/bootstrap.json"
     (router_env; start router "$bin/router")
     wait_http http://127.0.0.1:8181/health router
@@ -286,19 +300,26 @@ case "$cmd" in
         [[ -f "$state/pids/$n" ]] && kill "-$1" "$(cat "$state/pids/$n")" 2>/dev/null || true
       done
     }
+    # Let in-flight transactions land before reading. A local validator
+    # settles in a slot or two; a testnet RPC node keeps rebroadcasting
+    # until the blockhash expires (60-90 s).
+    settle="${SCENARIO_SETTLE_S:-$([[ "$target" == testnet ]] && echo 90 || echo 3)}"
     frozen_snapshot() {
       signal STOP
-      sleep "${SCENARIO_SETTLE_S:-3}" # let in-flight transactions land
+      sleep "$settle"
       "$bin/scenario" snapshot --out "$1" >&2 || { signal CONT; return 1; }
-      signal CONT
     }
     trap 'signal CONT' EXIT
     frozen_snapshot "$runs/$name-t0.json"
+    signal CONT
     python3 -I "$root/bootstrap/scenario/sample.py" --seconds "$seconds" --rpc "$rpc" \
       --out "$runs/$name-load.json" >/dev/null
     frozen_snapshot "$runs/$name-t1.json"
+    # Still frozen through the report: its block scan and Prometheus reads
+    # compete with flow's connections at high scale (x2000 ran out of ports).
     "$bin/scenario" report --start "$runs/$name-t0.json" --end "$runs/$name-t1.json" \
       --prometheus "${SCENARIO_PROMETHEUS:-http://127.0.0.1:9190}" >"$runs/$name-report.json"
+    signal CONT
     echo "wrote $runs/$name-{t0,t1,load,report}.json"
     ;;
   down)

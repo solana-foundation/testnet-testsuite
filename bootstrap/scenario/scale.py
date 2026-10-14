@@ -17,15 +17,21 @@
   pools can absorb the larger flow.
 
 Takers keep the base per-taker arrival rate (5/min), so offered load grows
-with the participant count. Inventories are set in USD at the live Binance
-price when generated. The asset overlay also writes the token bootstrap
-config (bootstrap/scenario/tokens-assets.json) and expects
+with the participant count. Maker and bot inventories are set in USD at the
+price when generated; taker inventory keeps the base profile's fixed JUP /
+RAY / USDC amounts, plus $5k of each new asset. Prices come from Binance, or
+from SCALE_PRICES (a JSON object, e.g. '{"JUP": "0.32", "RAY": "1.84"}')
+where Binance is unreachable or geo-blocked; any token it leaves out is
+still fetched. The asset overlay also writes the token bootstrap config
+(bootstrap/scenario/tokens-assets.json) and expects
 KEYPAIR_TOKEN_<NAME>_MINT / PUBKEY_TOKEN_<NAME>_MINT for every new token.
+Amounts are Decimal throughout (the TOML holds them as strings).
 """
 import json, os, sys, urllib.request
 from decimal import Decimal
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = Path(__file__).resolve().parents[2]
 PER_TAKER_RATE = 5.0  # trades / min, as in the base profile (20/min over 4 takers)
 
 # name -> (mainnet mint for metadata, Binance symbol); USDC is pegged.
@@ -48,11 +54,20 @@ MAINNET = {
 }
 
 
+OVERRIDES = {name: Decimal(str(px)) for name, px in json.loads(os.environ.get("SCALE_PRICES", "{}")).items()}
+
+
 def price(name):
+    if name in OVERRIDES:
+        return OVERRIDES[name]
     if name == "USDC":
         return Decimal(1)
     url = f"https://api.binance.com/api/v3/ticker/price?symbol={name}USDT"
-    return Decimal(json.load(urllib.request.urlopen(url, timeout=10))["price"])
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return Decimal(json.load(response)["price"])
+    except Exception as error:
+        raise SystemExit(f"no price for {name} from Binance ({error}); set SCALE_PRICES") from error
 
 
 def amount(usd, px):
@@ -116,7 +131,8 @@ def makers_for(pools, density, prices, capital, new_tokens=()):
             else:
                 width, recenter, position = [(600, 200, 20000), (1200, 400, 15000), (2500, 800, 10000)][k]
                 makers.append({"name": f"lp-{tag}-{k}", "venue": venue, "base": base, "quote": quote, "interval_ms": 5000,
-                               "inventory": {base: amount(position * 0.8 * capital, pb), quote: amount(position * 0.8 * capital, pq)},
+                               "inventory": {base: amount(position * Decimal("0.8") * capital, pb),
+                                             quote: amount(position * Decimal("0.8") * capital, pq)},
                                "strategy": {"kind": "clmm-range", "width_bps": width, "recenter_bps": recenter,
                                             "position_usd": str(position * capital)}})
                 threshold = [10, 15, 20][k] + (5 if quote != "USDC" else 0)
@@ -128,16 +144,23 @@ def makers_for(pools, density, prices, capital, new_tokens=()):
     return makers
 
 
+# Per-bot searcher profile, so the population does not act in lockstep:
+# priority fee (lamports per cycle) and reaction latency (ms).
+BOT_PROFILES = [(0, 0), (5000, 150), (20000, 400), (0, 50), (10000, 250)]
+
+
 def bots_for(n, tokens, prices):
     params = [("0.50", "5000", 3), ("0.25", "2500", 3), ("1.00", "10000", 3), ("2.00", "1500", 2), ("0.75", "4000", 3)]
     non_usdc = [t for t in tokens if t != "USDC"]
     bots = []
     for k in range(n):
         min_profit, max_trade, legs = params[k % len(params)]
+        fee, latency = BOT_PROFILES[k % len(BOT_PROFILES)]
         starts = ["USDC"] + [non_usdc[(k + j) % len(non_usdc)] for j in range(k % 3)]
         bots.append({"name": f"searcher-{k}", "start_tokens": starts, "max_legs": legs, "min_profit_usd": min_profit,
                      "max_trade_usd": max_trade, "leg_slippage_bps": 5,
-                     "inventory": {t: amount(20000, prices[t]) for t in starts}, "sol": "3"})
+                     "inventory": {t: amount(20000, prices[t]) for t in starts}, "sol": "3",
+                     "priority_fee_lamports": fee, "latency_ms": latency})
     return bots
 
 
@@ -171,7 +194,7 @@ def overlay(name, takers, bots, density, capital, tokens, crosses, prices, new_t
     text += array_table("scenario.makers", makers)
     text += table("scenario.flow", flow_for(takers, tokens, pools, prices, sol))
     text += array_table("scenario.arb.bots", bots_for(bots, tokens, prices))
-    open(os.path.join(ROOT, "config", f"{name}.toml"), "w").write(text)
+    (ROOT / "config" / f"{name}.toml").write_text(text)
     print(f"{name}: {takers} takers + {bots} bots + {len(makers)} makers = {takers + bots + len(makers)} participants; {len(tokens)} assets, {len(pools)} pools")
 
 
@@ -194,8 +217,7 @@ def main():
     config = [{"mainnetPubkey": MAINNET[t], "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
                "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY", "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
                "mint": f"KEYPAIR_TOKEN_{t}_MINT"} for t in tokens]
-    json.dump(config, open(os.path.join(ROOT, "bootstrap", "scenario", "tokens-assets.json"), "w"), indent=2)
-    open(os.path.join(ROOT, "bootstrap", "scenario", "tokens-assets.json"), "a").write("\n")
+    (ROOT / "bootstrap" / "scenario" / "tokens-assets.json").write_text(json.dumps(config, indent=2) + "\n")
 
 
 if __name__ == "__main__":

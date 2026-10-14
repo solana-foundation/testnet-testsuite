@@ -1191,6 +1191,8 @@ max_trade_usd = "5000"
 leg_slippage_bps = 5
 inventory = { USDC = "20000" }
 sol = "3"
+priority_fee_lamports = 0
+latency_ms = 0
 
 [[scenario.arb.bots]]
 name = "searcher-1"
@@ -1201,6 +1203,8 @@ max_trade_usd = "2500"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", RAY = "8350" }
 sol = "3"
+priority_fee_lamports = 5000
+latency_ms = 150
 
 [[scenario.arb.bots]]
 name = "searcher-2"
@@ -1211,6 +1215,8 @@ max_trade_usd = "10000"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", BONK = "5870000000", WIF = "91700" }
 sol = "3"
+priority_fee_lamports = 20000
+latency_ms = 400
 
 [[scenario.arb.bots]]
 name = "searcher-3"
@@ -1221,6 +1227,8 @@ max_trade_usd = "1500"
 leg_slippage_bps = 5
 inventory = { USDC = "20000" }
 sol = "3"
+priority_fee_lamports = 0
+latency_ms = 50
 
 [[scenario.arb.bots]]
 name = "searcher-4"
@@ -1231,6 +1239,8 @@ max_trade_usd = "4000"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", PYTH = "255000" }
 sol = "3"
+priority_fee_lamports = 10000
+latency_ms = 250
 
 [[scenario.arb.bots]]
 name = "searcher-5"
@@ -1241,6 +1251,8 @@ max_trade_usd = "5000"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", JTO = "37100", ORCA = "8020" }
 sol = "3"
+priority_fee_lamports = 0
+latency_ms = 0
 
 [[scenario.arb.bots]]
 name = "searcher-6"
@@ -1251,6 +1263,8 @@ max_trade_usd = "2500"
 leg_slippage_bps = 5
 inventory = { USDC = "20000" }
 sol = "3"
+priority_fee_lamports = 5000
+latency_ms = 150
 
 [[scenario.arb.bots]]
 name = "searcher-7"
@@ -1261,6 +1275,8 @@ max_trade_usd = "10000"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", RENDER = "10400" }
 sol = "3"
+priority_fee_lamports = 20000
+latency_ms = 400
 
 [[scenario.arb.bots]]
 name = "searcher-8"
@@ -1271,6 +1287,8 @@ max_trade_usd = "1500"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", W = "1080000", TNSR = "542000" }
 sol = "3"
+priority_fee_lamports = 0
+latency_ms = 50
 
 [[scenario.arb.bots]]
 name = "searcher-9"
@@ -1281,6 +1299,8 @@ max_trade_usd = "4000"
 leg_slippage_bps = 5
 inventory = { USDC = "20000" }
 sol = "3"
+priority_fee_lamports = 10000
+latency_ms = 250
 
 [[scenario.arb.bots]]
 name = "searcher-10"
@@ -1291,6 +1311,8 @@ max_trade_usd = "5000"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", JUP = "53800" }
 sol = "3"
+priority_fee_lamports = 0
+latency_ms = 0
 
 [[scenario.arb.bots]]
 name = "searcher-11"
@@ -1301,6 +1323,8 @@ max_trade_usd = "2500"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", RAY = "8350", BONK = "5870000000" }
 sol = "3"
+priority_fee_lamports = 5000
+latency_ms = 150
 
 [[scenario.arb.bots]]
 name = "searcher-12"
@@ -1311,6 +1335,8 @@ max_trade_usd = "10000"
 leg_slippage_bps = 5
 inventory = { USDC = "20000" }
 sol = "3"
+priority_fee_lamports = 20000
+latency_ms = 400
 
 [[scenario.arb.bots]]
 name = "searcher-13"
@@ -1321,4 +1347,6 @@ max_trade_usd = "1500"
 leg_slippage_bps = 5
 inventory = { USDC = "20000", WIF = "91700" }
 sol = "3"
+priority_fee_lamports = 0
+latency_ms = 50
 

@@ -161,12 +161,16 @@ on all three venues against USDC plus an Orca pool against JUP; it needs
 `KEYPAIR_TOKEN_<NAME>_MINT` / `PUBKEY_TOKEN_<NAME>_MINT` and
 `SCENARIO_TOKENS_CONFIG=bootstrap/scenario/tokens-assets.json`.
 
+`scale.py scale-x10` regenerates only the named overlays. Prices come from
+Binance at generation time; where it is unreachable or geo-blocked, pass
+them in: `SCALE_PRICES='{"JUP": "0.32", "RAY": "1.84"}'`.
+
 Measure a scale (10 minutes; writes `.scenario/runs/<name>-{t0,t1,load,report}.json`):
 
 ```sh
 NO_DNA=1 just scenario-surfpool-offline        # fresh chain per scale (no testnet fallback)
 SCENARIO_SCALE=x10 just scenario-dev           # deploy + up
-SCENARIO_SCALE=x10 bootstrap/scenario/scenario.sh measure x10 600
+SCENARIO_SCALE=x10 bootstrap/scenario/scenario.sh measure x10 600   # or: just scenario-measure dev local x10 600 x10
 python3 -I bootstrap/scenario/summarize.py .scenario/runs x1 x10 x100 assets
 ```
 
@@ -179,9 +183,15 @@ bootstrap crawls at ~2 TPS.
 `measure` freezes flow, arb, and mm (`SIGSTOP`) while each snapshot reads,
 so every wallet, seat, and position is read in one chain state; without it,
 heavy flow moves value between participants mid-read and PnL stops summing
-to (minus) the protocol fees. `sample.py` records per-service CPU/RSS (from `.scenario/pids`), machine
-CPU, validator TPS (`getTransactionCount`), slot rate, and RPC latency; the
-report counts transactions from the window's blocks. Use the offline
+to (minus) the protocol fees. Before each snapshot it waits
+`SCENARIO_SETTLE_S` for in-flight transactions to land: 3 s locally, 90 s on
+testnet, where the RPC node rebroadcasts until the blockhash expires. They
+stay frozen through the report, whose block scan would otherwise compete
+with flow for connections. `sample.py` records per-service CPU/RSS (from
+`.scenario/pids`), machine CPU, validator TPS (`getTransactionCount`), slot
+rate, and RPC latency; against a shared cluster that TPS is network-wide
+(`tpsScope`), so use the report's per-participant counts there. The report
+counts transactions from the window's blocks. Use the offline
 Surfpool for scale runs: the forking one fetches every missing account
 (uninitialized tick arrays, never-funded ATAs) from testnet, which turns
 snapshot loads into multi-second stalls.
@@ -190,7 +200,7 @@ snapshot loads into multi-second stalls.
 
 | Variable                                                                                                                                                     | Used by                                                                                                            |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `KEYPAIR_TOKEN_{BONK,WIF,PYTH,JTO,ORCA,RENDER,W,TNSR}_MINT`, `PUBKEY_TOKEN_*_MINT` **(new, asset scale only)** | mint keypairs for the added assets |
+| `KEYPAIR_TOKEN_{BONK,WIF,PYTH,JTO,ORCA,RENDER,W,TNSR}_MINT`, `PUBKEY_TOKEN_*_MINT` **(new, asset scale only)**                                               | mint keypairs for the added assets                                                                                 |
 | `SCENARIO_SEED` **(new)**                                                                                                                                    | secret all maker/arb/taker wallets derive from (`prd` required; `dev` optional — the local profile has a dev seed) |
 | `KEYPAIR_ORCA_WHIRLPOOL`, `KEYPAIR_ORCA_WHIRLPOOLS_CONFIG`, `KEYPAIR_MANIFEST`                                                                               | from the DEX branches                                                                                              |
 | `KEYPAIR_RAYDIUM_CLMM`, `KEYPAIR_FAUCET`, `KEYPAIR_PROGRAM_AUTHORITY`, `KEYPAIR_TOKEN_*`, `PUBKEY_TOKEN_*_MINT`, `PUBKEY_FAUCET`, `PUBKEY_PROGRAM_AUTHORITY` | existing                                                                                                           |

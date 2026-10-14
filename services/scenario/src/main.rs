@@ -59,8 +59,12 @@ enum Command {
     },
     /// Print every scenario pool and wallet with its balances.
     Status,
-    /// Print how many tokens (oracle symbols) the scenario prices.
-    TokenCount,
+    /// Wait until the oracle has a fresh price for every scenario token
+    /// (pools are created at oracle prices).
+    WaitPrices {
+        #[arg(long, default_value_t = 120)]
+        timeout_s: u64,
+    },
     /// Record every participant's holdings (wallet, seats, LP positions) and
     /// the oracle prices, for `report`.
     Snapshot {
@@ -126,7 +130,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
-        Command::TokenCount => json!(scenario.tokens.len()),
+        Command::WaitPrices { timeout_s } => wait_prices(&scenario, timeout_s).await?,
         Command::Snapshot { out } => {
             let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
             // Compact: at tens of thousands of participants a pretty
@@ -383,6 +387,35 @@ async fn bootstrap(
         "pools": pools,
         "wallets": wallets,
     }))
+}
+
+async fn wait_prices(scenario: &Scenario, timeout_s: u64) -> Result<Value> {
+    let oracle = OracleClient::new(&scenario.config.oracle_url);
+    let started = std::time::Instant::now();
+    loop {
+        let missing: Vec<String> =
+            match PriceBook::fetch(&oracle, scenario.config.max_price_age_ms).await {
+                Ok(book) => scenario
+                    .tokens
+                    .values()
+                    .filter(|token| book.usd(token).is_err())
+                    .map(|token| token.name.clone())
+                    .collect(),
+                Err(_) => scenario.tokens.keys().cloned().collect(),
+            };
+        if missing.is_empty() {
+            return Ok(
+                json!({ "tokens": scenario.tokens.len(), "waitedMs": started.elapsed().as_millis() as u64 }),
+            );
+        }
+        if started.elapsed().as_secs() >= timeout_s {
+            anyhow::bail!(
+                "no fresh oracle price after {timeout_s} s for: {}",
+                missing.join(", ")
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 async fn status(chain: &ChainClient, scenario: &Scenario) -> Result<Value> {
