@@ -2714,6 +2714,7 @@ dependencies = [
  "metrics",
  "mtm-chain",
  "mtm-dex-harness",
+ "mtm-math",
  "orca_whirlpools_client",
  "orca_whirlpools_core",
  "rust_decimal",
