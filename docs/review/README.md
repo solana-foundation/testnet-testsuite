@@ -25,6 +25,40 @@ against the code while compiling this index. The rest come from the reviewers'
 reading and were spot-checked, not all re-run. Profiling-dependent claims
 (router CPU and RSS) are inferred from code paths.
 
+## Status after the fix rounds (2026-10-14)
+
+The findings below were then worked branch by branch up the stack
+(`feat/raydium` … `feat/test-validator`). Each report still describes the
+code as reviewed; this table says where the P0s stand now.
+
+| P0  | Status      | Where / what remains                                                                                                                                                              |
+| --- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Partly done | `orca_whirlpools_macros` pinned to `=1.0.4` on `feat/orca`. The license-only `cargo deny` gate is not restored.                                                                   |
+| 2   | Done        | `feat/scenario`: re-centres resume (zero-liquidity decrease skipped, a missing NFT counts as closed), atomic maker state.                                                         |
+| 3   | Done        | `feat/scenario`: balances are re-read after a close.                                                                                                                              |
+| 4   | Partly done | `feat/scenario`: `PriceBook` ages prices by publish time. The oracle-side fixes (restamped `received_at_us`, half-open websocket) are in the oracle on `main`, outside the stack. |
+| 5   | Partly done | `ChainClient::send_versioned`, slot-pinned fills and batched balance reads (`feat/scenario`, `feat/arb`). No shared batched confirmer or global RPC bound yet.                    |
+| 6   | Partly done | The quote-to-send gap is gone (`feat/scenario`). Arrivals are still closed-loop.                                                                                                  |
+| 7   | Done        | `feat/router`: `Arc` snapshots, single-flight loads, 400 ms TTL default.                                                                                                          |
+| 8   | Done        | `feat/arb`: executions run beside the scan loop; per-bot priority fee and latency (profiles generated on `feat/scale`).                                                           |
+| 9   | Done        | `feat/arb`: typed `getBlock` skips, RPC errors fail the report, Prometheus parts best-effort with `warnings`.                                                                     |
+
+Notable items still open, by report:
+
+- **flow-and-arb:** open-loop arrivals (flow #1), a global RPC bound with
+  batched confirmations (flow #3), a separate refill worker (flow #8); the
+  full arb cache/search/execute split and one multiplexed websocket client.
+- **scenario-and-tooling:** slot-consistency checks across snapshot reads
+  (#10); `leftovers` still scans with `getProgramAccounts`, which public
+  testnet RPCs limit; TypeScript, Python and shell checks in CI (no
+  `ruff`/`shellcheck` installed on the dev machine); host and socket metrics.
+- **raydium-clmm:** the `base_flag` change was declined (a trade-off, not a
+  fix); the tick-array clamp was a no-op (the program filters out-of-range
+  arrays).
+- **manifest-chain-harness:** cancel hints need an on-chain experiment (the
+  GPL source stays unread).
+- **router-and-venues:** R15 checked and is not a bug.
+
 ## Where the workspace stands
 
 - **Gates are clean.** `cargo clippy --workspace --all-targets -D warnings`
