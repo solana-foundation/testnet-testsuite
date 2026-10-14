@@ -3213,6 +3213,7 @@ dependencies = [
  "solana-keypair",
  "solana-pubkey 4.4.0",
  "solana-signer 3.0.1",
+ "spl-token-2022 7.0.0",
  "tokio",
  "tracing",
 ]
