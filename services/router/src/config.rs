@@ -38,6 +38,11 @@ pub struct RouterConfig {
     /// intermediate mints multi-hop routes may pass through
     #[serde(default)]
     pub bridge_mints: Vec<String>,
+    /// Reuse a pool snapshot across quotes for this long (0 = load per
+    /// quote). Concurrent quotes inside the window share one load, which
+    /// bounds RPC load under heavy quote traffic at the cost of staleness.
+    #[serde(default)]
+    pub snapshot_ttl_ms: u64,
     #[serde(default)]
     pub jupiter: JupiterConfig,
 }
