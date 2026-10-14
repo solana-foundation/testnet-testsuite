@@ -2,6 +2,7 @@
 //! Re-running only sends what is missing, so bootstrap is replayable.
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use mtm_chain::{ChainClient, SubmissionConfig};
 use mtm_dex_harness::spl;
 use rust_decimal::Decimal;
@@ -50,6 +51,54 @@ pub async fn token_balance(chain: &ChainClient, owner: &Pubkey, token: &Token) -
         .flatten()
         .and_then(|account| spl::decode_token_account(&account.data))
         .map_or(0, |state| state.amount))
+}
+
+/// Token balances for many `(owner, token)` pairs and SOL balances for
+/// many wallets, read with batched `getMultipleAccounts` (100 per call) so a
+/// snapshot of thousands of wallets spans a few RPC round trips.
+pub async fn balances(
+    chain: &ChainClient,
+    tokens: &[(Pubkey, &Token)],
+    wallets: &[Pubkey],
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    let atas: Vec<Pubkey> = tokens
+        .iter()
+        .map(|(owner, token)| {
+            spl::associated_token_address(owner, &token.mint, &token.token_program)
+        })
+        .collect();
+    let read = |keys: Vec<Pubkey>| async move {
+        let chunks = futures::stream::iter(keys.chunks(100).map(|chunk| async move {
+            chain
+                .rpc()
+                .get_multiple_accounts(chunk)
+                .await
+                .context("reading balances")
+        }))
+        .buffered(16)
+        .collect::<Vec<_>>()
+        .await;
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in chunks {
+            out.extend(chunk?);
+        }
+        Ok::<_, anyhow::Error>(out)
+    };
+    let (token_accounts, wallet_accounts) = futures::try_join!(read(atas), read(wallets.to_vec()))?;
+    Ok((
+        token_accounts
+            .into_iter()
+            .map(|account| {
+                account
+                    .and_then(|account| spl::decode_token_account(&account.data))
+                    .map_or(0, |state| state.amount)
+            })
+            .collect(),
+        wallet_accounts
+            .into_iter()
+            .map(|account| account.map_or(0, |account| account.lamports))
+            .collect(),
+    ))
 }
 
 /// How token targets are applied.
@@ -119,15 +168,22 @@ pub async fn top_up(
         ));
         outcome.minted.push((token.name.clone(), target - balance));
     }
-    if !instructions.is_empty() {
-        // The mint authority signs only when something is minted.
-        let signers: &[&dyn Signer] = if outcome.minted.is_empty() {
-            &[]
-        } else {
-            &[mint_authority]
-        };
+    // A legacy transaction fits the SOL transfer plus four (create ATA,
+    // mint) pairs; larger inventories go out in several transactions.
+    const PER_TRANSACTION: usize = 9;
+    let mut remaining = instructions.as_slice();
+    while !remaining.is_empty() {
+        let (chunk, rest) = remaining.split_at(remaining.len().min(PER_TRANSACTION));
+        remaining = rest;
+        // The mint authority signs only when the chunk mints.
+        let mints = chunk.iter().any(|ix| {
+            ix.accounts
+                .iter()
+                .any(|meta| meta.is_signer && meta.pubkey == mint_authority.pubkey())
+        });
+        let signers: &[&dyn Signer] = if mints { &[mint_authority] } else { &[] };
         chain
-            .submit(instructions, faucet, signers, SubmissionConfig::default())
+            .submit(chunk.to_vec(), faucet, signers, SubmissionConfig::default())
             .await
             .with_context(|| format!("topping up {owner}"))?;
     }
