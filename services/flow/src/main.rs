@@ -23,12 +23,12 @@
 //! float.
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use metrics::{counter, gauge, histogram};
-use mtm_chain::ChainClient;
+use mtm_chain::{ChainClient, SubmissionError, VersionedSendConfig};
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::signer_from_environment;
 use mtm_scenario::funding::{Funding, LAMPORTS_PER_SOL, top_up, wallet_balances};
@@ -44,8 +44,6 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use solana_keypair::Keypair;
-use solana_rpc_client_api::client_error::ErrorKind as RpcErrorKind;
-use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
@@ -284,14 +282,6 @@ fn fail<T>(outcome: Outcome, error: anyhow::Error) -> std::result::Result<T, Tra
     Err(TradeError { outcome, error })
 }
 
-/// How long to poll a sent swap's status, and how often.
-const CONFIRM_DEADLINE: Duration = Duration::from_secs(90);
-const STATUS_POLL: Duration = Duration::from_millis(400);
-/// Check blockhash validity every this many status polls.
-const BLOCKHASH_CHECK_EVERY: u32 = 5;
-/// A status RPC failing this many polls in a row ends the wait.
-const MAX_STATUS_ERRORS: u32 = 5;
-
 impl Flow<'_> {
     /// Every taker is an independent Poisson process at `rate / takers`
     /// with its own seeded RNG, so slow trades never delay other arrivals and
@@ -522,90 +512,28 @@ impl Flow<'_> {
     }
 
     /// Sends with preflight (the RPC's simulation catches stale quotes
-    /// before they cost a fee) and polls the status until the client's
-    /// commitment. Returns the signature and the slot it landed in.
+    /// before they cost a fee) and waits for the client's commitment.
+    /// Returns the signature and the slot it landed in.
     async fn send_and_confirm(
         &self,
         transaction: &VersionedTransaction,
     ) -> std::result::Result<(Signature, u64), TradeError> {
-        let rpc = self.chain.rpc();
-        let commitment = rpc.commitment();
-        let signature = transaction.signatures[0];
-        match rpc
-            .send_transaction_with_config(
-                transaction,
-                RpcSendTransactionConfig {
-                    preflight_commitment: Some(commitment.commitment),
-                    ..RpcSendTransactionConfig::default()
-                },
-            )
+        match self
+            .chain
+            .send_versioned(transaction, VersionedSendConfig::default())
             .await
         {
-            Ok(_) => {}
-            Err(error) if error.kind().get_transaction_error().is_some() => {
-                return fail(Outcome::PreflightRejected, error.into());
-            }
-            // The request may have reached the node: wait for a status
-            // rather than calling it failed.
-            Err(error) if is_transport_error(error.kind()) => {
-                debug!(%signature, error = %error, "send response lost; polling status");
-            }
-            Err(error) => return fail(Outcome::SendFailed, error.into()),
-        }
-        let blockhash = *transaction.message.recent_blockhash();
-        let started = Instant::now();
-        let (mut polls, mut errors) = (0_u32, 0_u32);
-        loop {
-            tokio::time::sleep(STATUS_POLL).await;
-            polls += 1;
-            if started.elapsed() >= CONFIRM_DEADLINE {
-                return fail(
-                    Outcome::RpcAmbiguous,
-                    anyhow::anyhow!("{signature}: no confirmation within {CONFIRM_DEADLINE:?}"),
-                );
-            }
-            match rpc.get_signature_statuses(&[signature]).await {
-                Ok(response) => {
-                    errors = 0;
-                    if let Some(status) = response.value.into_iter().next().flatten() {
-                        if let Some(error) = status.err {
-                            return fail(
-                                Outcome::LandedFailed,
-                                anyhow::anyhow!(
-                                    "{signature} failed in slot {}: {error:?}",
-                                    status.slot
-                                ),
-                            );
-                        }
-                        if status.satisfies_commitment(commitment) {
-                            return Ok((signature, status.slot));
-                        }
-                        // Seen but not yet at our commitment: it cannot
-                        // expire any more, so skip the blockhash check.
-                        continue;
-                    }
-                }
-                Err(error) => {
-                    errors += 1;
-                    if errors >= MAX_STATUS_ERRORS {
-                        return fail(Outcome::RpcAmbiguous, error.into());
-                    }
-                }
-            }
-            if polls.is_multiple_of(BLOCKHASH_CHECK_EVERY)
-                && let Ok(false) = rpc.is_blockhash_valid(&blockhash, commitment).await
-            {
-                // One last look: it may have landed just before expiry, in
-                // which case the next poll classifies it.
-                if let Ok(response) = rpc.get_signature_statuses(&[signature]).await
-                    && response.value.first().is_some_and(Option::is_some)
-                {
-                    continue;
-                }
-                return fail(
-                    Outcome::Expired,
-                    anyhow::anyhow!("{signature}: blockhash expired with no status"),
-                );
+            Ok(outcome) => Ok((outcome.signature, outcome.confirmation_slot)),
+            Err(error) => {
+                let outcome = match &error {
+                    SubmissionError::Simulation { .. } => Outcome::PreflightRejected,
+                    SubmissionError::Submission(_) => Outcome::SendFailed,
+                    SubmissionError::Execution { .. } => Outcome::LandedFailed,
+                    SubmissionError::Expired { .. } => Outcome::Expired,
+                    SubmissionError::AmbiguousConfirmation { .. } => Outcome::RpcAmbiguous,
+                    _ => Outcome::Error,
+                };
+                fail(outcome, error.into())
             }
         }
     }
@@ -647,13 +575,6 @@ impl Flow<'_> {
         }
         Ok(())
     }
-}
-
-fn is_transport_error(error: &RpcErrorKind) -> bool {
-    matches!(
-        error,
-        RpcErrorKind::Io(_) | RpcErrorKind::Reqwest(_) | RpcErrorKind::Middleware(_)
-    )
 }
 
 /// USD to whole micro-USD for the notional counter (counters are integers;

@@ -12,9 +12,11 @@ use solana_instruction::Instruction;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::client_error::ErrorKind as RpcErrorKind;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
+use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::time::sleep;
 use tracing::{debug, warn};
@@ -73,6 +75,36 @@ pub enum SubmissionError {
         signature: Signature,
         reason: String,
     },
+    /// The blockhash expired and a final status check found nothing: the
+    /// transaction can no longer land. (Only [`ChainClient::send_versioned`]
+    /// makes that final check; `submit` reports expiry as ambiguous.)
+    #[error("transaction {signature} expired without landing")]
+    Expired { signature: Signature },
+}
+
+/// How [`ChainClient::send_versioned`] submits and waits.
+#[derive(Clone, Copy, Debug)]
+pub struct VersionedSendConfig {
+    /// Skip the RPC's preflight simulation (when the caller simulated).
+    pub skip_preflight: bool,
+    pub confirmation_timeout: Duration,
+    pub poll_interval: Duration,
+    /// Check blockhash validity every this many status polls.
+    pub blockhash_check_every: u32,
+    /// Give up after this many consecutive failed status polls.
+    pub max_status_errors: u32,
+}
+
+impl Default for VersionedSendConfig {
+    fn default() -> Self {
+        Self {
+            skip_preflight: false,
+            confirmation_timeout: Duration::from_secs(90),
+            poll_interval: Duration::from_millis(400),
+            blockhash_check_every: 5,
+            max_status_errors: 5,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -234,6 +266,120 @@ impl ChainClient {
                 });
             }
             sleep(config.poll_interval).await;
+        }
+    }
+
+    /// Send an already signed transaction (legacy or versioned, e.g. one a
+    /// router built) and poll its status until the client's commitment.
+    ///
+    /// Errors are typed for callers that classify outcomes: a preflight
+    /// rejection is [`SubmissionError::Simulation`], a non-transport send
+    /// failure [`SubmissionError::Submission`], an on-chain failure
+    /// [`SubmissionError::Execution`], expiry [`SubmissionError::Expired`],
+    /// and an unknown status [`SubmissionError::AmbiguousConfirmation`]. A
+    /// lost send response is not an error by itself: the status poll
+    /// decides.
+    pub async fn send_versioned(
+        &self,
+        transaction: &VersionedTransaction,
+        config: VersionedSendConfig,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let commitment = self.rpc.commitment();
+        let signature = *transaction
+            .signatures
+            .first()
+            .ok_or_else(|| SubmissionError::Signing("transaction has no signatures".to_owned()))?;
+        match self
+            .rpc
+            .send_transaction_with_config(
+                transaction,
+                RpcSendTransactionConfig {
+                    skip_preflight: config.skip_preflight,
+                    preflight_commitment: Some(commitment.commitment),
+                    ..RpcSendTransactionConfig::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                if let RpcErrorKind::RpcError(RpcError::RpcResponseError {
+                    data: RpcResponseErrorData::SendTransactionPreflightFailure(result),
+                    ..
+                }) = error.kind()
+                {
+                    return Err(SubmissionError::Simulation {
+                        error: result
+                            .err
+                            .as_ref()
+                            .map_or_else(|| error.to_string(), |err| format!("{err:?}")),
+                        logs: result.logs.clone().unwrap_or_default(),
+                    });
+                }
+                if !is_transport_error(error.kind()) {
+                    return Err(SubmissionError::Submission(error.to_string()));
+                }
+                // The request may have reached the node: let the status decide.
+                debug!(%signature, error = %error, "send response lost; polling status");
+            }
+        }
+        let blockhash = *transaction.message.recent_blockhash();
+        let started = Instant::now();
+        let (mut polls, mut errors) = (0_u32, 0_u32);
+        loop {
+            sleep(config.poll_interval).await;
+            polls += 1;
+            if started.elapsed() >= config.confirmation_timeout {
+                return Err(SubmissionError::AmbiguousConfirmation {
+                    signature,
+                    reason: format!("no confirmation within {:?}", config.confirmation_timeout),
+                });
+            }
+            match self.rpc.get_signature_statuses(&[signature]).await {
+                Ok(response) => {
+                    errors = 0;
+                    if let Some(status) = response.value.into_iter().next().flatten() {
+                        if let Some(error) = status.err {
+                            return Err(SubmissionError::Execution {
+                                signature,
+                                slot: status.slot,
+                                error: format!("{error:?}"),
+                            });
+                        }
+                        if status.satisfies_commitment(commitment) {
+                            return Ok(SubmissionOutcome {
+                                signature,
+                                confirmation_slot: status.slot,
+                                simulated_compute_units: 0,
+                            });
+                        }
+                        // Seen but not yet at our commitment: it cannot
+                        // expire any more, so skip the blockhash check.
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    errors += 1;
+                    if errors >= config.max_status_errors.max(1) {
+                        return Err(SubmissionError::AmbiguousConfirmation {
+                            signature,
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+            }
+            if polls.is_multiple_of(config.blockhash_check_every.max(1))
+                && let Ok(false) = self.rpc.is_blockhash_valid(&blockhash, commitment).await
+            {
+                // One last look: it may have landed just before expiry, in
+                // which case the next poll classifies it.
+                if let Ok(response) = self.rpc.get_signature_statuses(&[signature]).await
+                    && response.value.first().is_some_and(Option::is_some)
+                {
+                    continue;
+                }
+                return Err(SubmissionError::Expired { signature });
+            }
         }
     }
 
