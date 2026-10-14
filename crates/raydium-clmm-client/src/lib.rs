@@ -390,7 +390,7 @@ impl RaydiumClmmClient {
                 bundle.tick_spacing,
             );
             self.validate_position_tick_arrays(&accounts, true).await?;
-            let mut remaining = vec![LegacyAccountMeta::new(
+            let remaining = vec![LegacyAccountMeta::new(
                 legacy_pubkey(bundle.tick_array_bitmap),
                 false,
             )];
@@ -418,7 +418,7 @@ impl RaydiumClmmClient {
                     amount_1_max: quote.amount_1_max,
                     base_flag: None,
                 },
-                std::mem::take(&mut remaining),
+                remaining,
             );
             instructions.push(ix);
             let transaction = self.submit(instructions, &[]).await?;
@@ -520,7 +520,6 @@ impl RaydiumClmmClient {
                     "position must have zero liquidity, fees, and rewards before close".to_owned(),
                 ));
             }
-            let _bundle = self.load_pool(position.pool).await?;
             let remaining = vec![LegacyAccountMeta::new(legacy_pubkey(position.pool), false)];
             let ix = self.raydium_instruction(
                 raydium_clmm_interface::accounts::ClosePosition {
@@ -607,13 +606,7 @@ impl RaydiumClmmClient {
             } else {
                 &bundle.mint_0
             };
-            let epoch = self
-                .chain
-                .rpc()
-                .get_epoch_info()
-                .await
-                .map_err(|error| RaydiumClmmError::Rpc(error.to_string()))?
-                .epoch;
+            let epoch = bundle.epoch;
             let requested_raw = ui_to_raw(
                 amount,
                 if exact_in {
@@ -675,13 +668,16 @@ impl RaydiumClmmClient {
                 });
             }
             let (other_amount_threshold, expected_input_raw, expected_output_raw) = if exact_in {
+                // The program checks the threshold against the output account's
+                // balance change, which is net of the output mint's transfer fee.
                 let output_fee = transfer_fee(output, epoch, calculated)?;
+                let net_output = calculated.checked_sub(output_fee).ok_or_else(|| {
+                    RaydiumClmmError::Quote("output transfer fee exceeds quote".to_owned())
+                })?;
                 (
-                    apply_slippage(calculated, self.slippage_bps, false)?,
+                    apply_slippage(net_output, self.slippage_bps, false)?,
                     requested_raw,
-                    calculated.checked_sub(output_fee).ok_or_else(|| {
-                        RaydiumClmmError::Quote("output transfer fee exceeds quote".to_owned())
-                    })?,
+                    net_output,
                 )
             } else {
                 let slipped = apply_slippage(calculated, self.slippage_bps, true)?;
@@ -981,6 +977,14 @@ impl RaydiumClmmClient {
         let token_vault_1 = current_pubkey(pool.token_vault_1);
         let observation = current_pubkey(pool.observation_key);
         let tick_array_bitmap = self.tick_array_bitmap_address(key);
+        // The payer's token accounts depend on each mint's token program, which
+        // is only known once the mints load: fetch both candidates in the same
+        // batch (with the Clock sysvar for the transfer-fee epoch) rather than
+        // in two more round trips.
+        let payer_atas = [mint_0_key, mint_1_key].map(|mint| {
+            [token_program_id(), token_2022_program_id()]
+                .map(|program| associated_token_address(self.payer(), mint, program))
+        });
         let keys = [
             amm_config,
             mint_0_key,
@@ -989,6 +993,11 @@ impl RaydiumClmmClient {
             token_vault_0,
             token_vault_1,
             observation,
+            clock_sysvar_id(),
+            payer_atas[0][0],
+            payer_atas[0][1],
+            payer_atas[1][0],
+            payer_atas[1][1],
         ];
         let accounts = self.fetch_optional(&keys).await?;
         let config_account = require_account(&keys, &accounts, 0, "amm config")?.clone();
@@ -1053,20 +1062,17 @@ impl RaydiumClmmClient {
                 reason: "observation account has the wrong owner".to_owned(),
             });
         }
-        let epoch = self
-            .chain
-            .rpc()
-            .get_epoch_info()
-            .await
-            .map_err(|error| RaydiumClmmError::Rpc(error.to_string()))?
-            .epoch;
-        let user_token_0 = associated_token_address(self.payer(), mint_0.key, mint_0.token_program);
-        let user_token_1 = associated_token_address(self.payer(), mint_1.key, mint_1.token_program);
-        let user_accounts = self.fetch_optional(&[user_token_0, user_token_1]).await?;
+        let epoch = clock_epoch(require_account(&keys, &accounts, 7, "clock sysvar")?)?;
+        let payer_ata = |index: usize, mint: &MintInfo| {
+            let slot = 8 + 2 * index + usize::from(mint.token_program == token_2022_program_id());
+            (keys[slot], accounts[slot].as_ref())
+        };
+        let (user_token_0, user_account_0) = payer_ata(0, &mint_0);
+        let (user_token_1, user_account_1) = payer_ata(1, &mint_1);
         let balance_0 =
-            self.validate_token_account(user_token_0, user_accounts[0].as_ref(), &mint_0, false)?;
+            self.validate_token_account(user_token_0, user_account_0, &mint_0, false)?;
         let balance_1 =
-            self.validate_token_account(user_token_1, user_accounts[1].as_ref(), &mint_1, false)?;
+            self.validate_token_account(user_token_1, user_account_1, &mint_1, false)?;
         Ok(PoolBundle {
             pool,
             config_account,
@@ -1164,20 +1170,24 @@ impl RaydiumClmmClient {
         Ok(state.base.amount)
     }
 
+    /// The wallet must cover what the program will transfer at the quoted
+    /// price (plus transfer fees), not the slippage-inflated maximum: the
+    /// program moves the computed amount and only checks it against the max.
     fn ensure_position_balances(&self, bundle: &PoolBundle, quote: &LiquidityQuote) -> Result<()> {
-        if bundle.balance_0 < quote.amount_0_max {
-            return Err(RaydiumClmmError::InsufficientBalance {
-                mint: bundle.mint_0.key,
-                required: quote.amount_0_max,
-                available: bundle.balance_0,
-            });
-        }
-        if bundle.balance_1 < quote.amount_1_max {
-            return Err(RaydiumClmmError::InsufficientBalance {
-                mint: bundle.mint_1.key,
-                required: quote.amount_1_max,
-                available: bundle.balance_1,
-            });
+        for (mint, amount, balance) in [
+            (&bundle.mint_0, quote.amount_0_raw, bundle.balance_0),
+            (&bundle.mint_1, quote.amount_1_raw, bundle.balance_1),
+        ] {
+            let required = amount
+                .checked_add(inverse_transfer_fee(mint, bundle.epoch, amount)?)
+                .ok_or_else(|| RaydiumClmmError::Quote("required deposit overflow".to_owned()))?;
+            if balance < required {
+                return Err(RaydiumClmmError::InsufficientBalance {
+                    mint: mint.key,
+                    required,
+                    available: balance,
+                });
+            }
         }
         Ok(())
     }
@@ -1612,7 +1622,9 @@ impl RaydiumClmmClient {
         ]
     }
 
-    fn pool_address(&self, config: Pubkey, mint_0: Pubkey, mint_1: Pubkey) -> Pubkey {
+    /// Canonical pool PDA for `config` and the pool-ordered mints
+    /// (`mint_0 < mint_1`).
+    pub fn pool_address(&self, config: Pubkey, mint_0: Pubkey, mint_1: Pubkey) -> Pubkey {
         pool_address_for(self.program_id, config, mint_0, mint_1)
     }
 
@@ -2038,8 +2050,7 @@ fn validate_amm_config_params(params: EnsureAmmConfigParams) -> Result<()> {
 
 fn ui_to_raw(amount: Decimal, decimals: u8) -> Result<u64> {
     ensure_positive(amount, "token amount")?;
-    let multiplier = Decimal::from_u128(10_u128.pow(u32::from(decimals)))
-        .ok_or_else(|| RaydiumClmmError::Quote("decimal multiplier overflow".to_owned()))?;
+    let multiplier = decimal_scale(decimals)?;
     let raw = amount
         .checked_mul(multiplier)
         .ok_or_else(|| RaydiumClmmError::Quote("token amount overflow".to_owned()))?;
@@ -2054,10 +2065,8 @@ fn ui_to_raw(amount: Decimal, decimals: u8) -> Result<u64> {
 
 fn price_to_sqrt_x64(price: Decimal, decimals_0: u8, decimals_1: u8) -> Result<u128> {
     ensure_positive(price, "price")?;
-    let scale_0 = Decimal::from_u128(10_u128.pow(u32::from(decimals_0)))
-        .ok_or_else(|| RaydiumClmmError::Quote("mint 0 decimal scale overflow".to_owned()))?;
-    let scale_1 = Decimal::from_u128(10_u128.pow(u32::from(decimals_1)))
-        .ok_or_else(|| RaydiumClmmError::Quote("mint 1 decimal scale overflow".to_owned()))?;
+    let scale_0 = decimal_scale(decimals_0)?;
+    let scale_1 = decimal_scale(decimals_1)?;
     let raw_price = price
         .checked_mul(scale_1)
         .and_then(|value| value.checked_div(scale_0))
@@ -2070,7 +2079,10 @@ fn price_to_sqrt_x64(price: Decimal, decimals_0: u8, decimals_1: u8) -> Result<u
             .ok_or_else(|| RaydiumClmmError::Quote("Q64 conversion failed".to_owned()))?,
     )
     .and_then(|value| value.floor().to_u128())
-    .ok_or_else(|| RaydiumClmmError::Quote("sqrt price does not fit u128".to_owned()))
+    .filter(|sqrt| (tick_math::MIN_SQRT_PRICE_X64..=tick_math::MAX_SQRT_PRICE_X64).contains(sqrt))
+    .ok_or_else(|| {
+        RaydiumClmmError::InvalidInput(format!("price {price} is outside the pool's price range"))
+    })
 }
 
 fn apply_slippage(amount: u64, bps: u16, increase: bool) -> Result<u64> {
@@ -2145,6 +2157,32 @@ fn token_program_id() -> Pubkey {
     current_pubkey(spl_token::id())
 }
 
+fn clock_sysvar_id() -> Pubkey {
+    current_pubkey(anchor_lang::solana_program::sysvar::clock::ID)
+}
+
+/// Epoch from the Clock sysvar (`slot: u64, epoch_start_timestamp: i64,
+/// epoch: u64, ...`), the epoch Token-2022 uses for transfer fees.
+fn clock_epoch(account: &Account) -> Result<u64> {
+    account
+        .data
+        .get(16..24)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| RaydiumClmmError::MalformedAccount {
+            address: clock_sysvar_id(),
+            reason: "clock sysvar is shorter than its layout".to_owned(),
+        })
+}
+
+/// `10^decimals`; mint decimals are untrusted account data.
+fn decimal_scale(decimals: u8) -> Result<Decimal> {
+    10_u128
+        .checked_pow(u32::from(decimals))
+        .and_then(Decimal::from_u128)
+        .ok_or_else(|| RaydiumClmmError::Quote(format!("10^{decimals} does not fit a decimal")))
+}
+
 fn token_2022_program_id() -> Pubkey {
     current_pubkey(spl_token_2022::id())
 }
@@ -2168,4 +2206,71 @@ fn ata_instruction(payer: Pubkey, mint: &MintInfo) -> Instruction {
             &legacy_pubkey(mint.token_program),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimal_scale_rejects_hostile_decimals() {
+        assert_eq!(
+            decimal_scale(6).expect("valid test input"),
+            Decimal::from(1_000_000)
+        );
+        assert!(decimal_scale(39).is_err());
+        assert!(ui_to_raw(Decimal::ONE, 200).is_err());
+    }
+
+    #[test]
+    fn ui_to_raw_scales_and_rejects_excess_precision() {
+        assert_eq!(
+            ui_to_raw(Decimal::new(15, 1), 6).expect("valid test input"),
+            1_500_000
+        );
+        assert!(ui_to_raw(Decimal::new(1, 7), 6).is_err());
+    }
+
+    #[test]
+    fn price_to_sqrt_x64_is_bounded_by_the_pool_range() {
+        assert_eq!(
+            price_to_sqrt_x64(Decimal::ONE, 6, 6).expect("valid test input"),
+            fixed_point_64::Q64
+        );
+        // sqrt(1e-28) · 2^64 is far below MIN_SQRT_PRICE_X64.
+        assert!(matches!(
+            price_to_sqrt_x64(Decimal::new(1, 28), 0, 0),
+            Err(RaydiumClmmError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn clock_epoch_reads_the_epoch_field() {
+        let mut data = vec![0_u8; 40];
+        data[16..24].copy_from_slice(&7_u64.to_le_bytes());
+        let account = Account {
+            data,
+            ..Account::default()
+        };
+        assert_eq!(clock_epoch(&account).expect("valid test input"), 7);
+        let short = Account {
+            data: vec![0; 20],
+            ..Account::default()
+        };
+        assert!(clock_epoch(&short).is_err());
+    }
+
+    #[test]
+    fn slippage_rounds_against_the_trader() {
+        assert_eq!(
+            apply_slippage(10_000, 50, true).expect("valid test input"),
+            10_050
+        );
+        assert_eq!(
+            apply_slippage(10_000, 50, false).expect("valid test input"),
+            9_950
+        );
+        assert_eq!(apply_slippage(1, 1, true).expect("valid test input"), 2);
+        assert_eq!(apply_slippage(1, 1, false).expect("valid test input"), 0);
+    }
 }
