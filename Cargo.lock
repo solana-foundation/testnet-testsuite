@@ -428,6 +428,7 @@ dependencies = [
  "mtm-telemetry",
  "mtm-venues",
  "oracle-client",
+ "rand 0.10.3",
  "rust_decimal",
  "rustls",
  "serde",

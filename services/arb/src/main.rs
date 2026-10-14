@@ -16,6 +16,12 @@
 //! leg's minimum enforces `input + min_profit`, so a stale cycle reverts
 //! instead of losing money. The search is oracle-free; the oracle only values
 //! profit in USD for the threshold and the metrics.
+//!
+//! Scans never wait on confirmations: each planned cycle runs as its own
+//! future next to the scan loop, and a bot with a cycle in flight sits out
+//! later scans until it resolves. Accounting values every token the cycle
+//! touched, from a read pinned to its slot, with gains, losses and fees on
+//! separate counters.
 
 mod search;
 
@@ -25,7 +31,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use metrics::{counter, histogram};
+use futures::stream::FuturesUnordered;
+use metrics::{counter, gauge, histogram};
 use mtm_chain::ChainClient;
 use mtm_common::config::RpcConfig;
 use mtm_scenario::{Scenario, ScenarioConfig};
@@ -82,53 +89,98 @@ async fn main() -> Result<()> {
     for (_, address) in &pools {
         spawn_subscription(cfg.rpc.ws_url.clone(), *address, tx.clone());
     }
+    drop(tx);
     let searcher = search::Searcher::new(chain, &scenario, pools, &arb)?;
     info!(
-        bots = arb.bots.len(),
+        bots = searcher.bot_count(),
         pools = searcher.pool_count(),
         "arb searcher started"
     );
 
-    let poll = Duration::from_millis(arb.poll_ms);
+    // A full reload on a fixed cadence, whether or not updates arrive (a
+    // steady update stream would otherwise postpone it forever).
+    let mut poll = tokio::time::interval(Duration::from_millis(arb.poll_ms));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let debounce = Duration::from_millis(arb.debounce_ms);
+    let mut in_flight = FuturesUnordered::new();
+    let mut busy: HashSet<usize> = HashSet::new();
     loop {
         let (trigger, changed) = tokio::select! {
-            update = rx.recv() => match update {
-                Some(pool) => {
-                    // Coalesce the burst a single transaction produces.
-                    tokio::time::sleep(debounce).await;
-                    let mut changed = HashSet::from([pool]);
-                    while let Ok(pool) = rx.try_recv() {
-                        changed.insert(pool);
-                    }
-                    tracing::debug!(pools = changed.len(), "pool update");
-                    ("pool-update", Some(changed))
+            update = rx.recv() => {
+                let pool = update.context("every pool subscription task ended")?;
+                // Coalesce the burst a single transaction produces.
+                tokio::time::sleep(debounce).await;
+                let mut changed = HashSet::from([pool]);
+                while let Ok(pool) = rx.try_recv() {
+                    changed.insert(pool);
                 }
-                None => ("poll", None),
-            },
-            () = tokio::time::sleep(poll) => ("poll", None),
+                tracing::debug!(pools = changed.len(), "pool update");
+                ("pool-update", Some(changed))
+            }
+            _ = poll.tick() => ("poll", None),
+            Some(bot) = in_flight.next(), if !in_flight.is_empty() => {
+                busy.remove(&bot);
+                gauge!("arb_in_flight").set(busy.len() as f64);
+                continue;
+            }
         };
         let started = Instant::now();
         counter!("arb_scans_total", "trigger" => trigger).increment(1);
-        if let Err(error) = searcher.scan_and_execute(trigger, changed.as_ref()).await {
-            warn!(error = %format!("{error:#}"), "arb scan failed");
-            counter!("arb_errors_total").increment(1);
-        }
+        let idle = busy.clone();
+        let scan = searcher.scan(trigger, changed.as_ref(), &idle);
+        tokio::pin!(scan);
+        // Keep driving in-flight cycles while the scan runs.
+        let plans = loop {
+            tokio::select! {
+                plans = &mut scan => break plans,
+                Some(bot) = in_flight.next(), if !in_flight.is_empty() => {
+                    busy.remove(&bot);
+                }
+            }
+        };
         histogram!("arb_scan_seconds").record(started.elapsed().as_secs_f64());
+        match plans {
+            Ok(plans) => {
+                for plan in plans {
+                    busy.insert(plan.bot);
+                    in_flight.push(searcher.execute(plan));
+                }
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "arb scan failed");
+                counter!("arb_errors_total").increment(1);
+            }
+        }
+        gauge!("arb_in_flight").set(busy.len() as f64);
     }
 }
 
 fn spawn_subscription(ws_url: String, address: Pubkey, tx: mpsc::UnboundedSender<Pubkey>) {
     tokio::spawn(async move {
+        let mut failures: u32 = 0;
         loop {
             match subscribe(&ws_url, &address, &tx).await {
-                Ok(()) => warn!(%address, "pool subscription ended; reconnecting"),
-                Err(error) => warn!(%address, error = %error, "pool subscription failed"),
+                Ok(()) if tx.is_closed() => return,
+                Ok(()) => {
+                    failures = 0;
+                    warn!(%address, "pool subscription ended; reconnecting");
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    warn!(%address, error = %error, "pool subscription failed");
+                }
             }
             counter!("arb_ws_reconnects_total").increment(1);
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(backoff(failures)).await;
         }
     });
+}
+
+/// 1-2 s after a clean end, doubling per consecutive failure up to 30 s,
+/// with jitter so every pool's subscription does not reconnect at once.
+fn backoff(failures: u32) -> Duration {
+    let base_ms = 1_000_u64.saturating_mul(1 << failures.min(5)).min(30_000);
+    Duration::from_millis(base_ms + rand::random_range(0..base_ms.max(1)))
 }
 
 async fn subscribe(
@@ -150,6 +202,11 @@ async fn subscribe(
             }),
         )
         .await?;
+    // Updates during the gap before this subscription are lost: treat the
+    // pool as changed so the next scan reloads it.
+    if tx.send(*address).is_err() {
+        return Ok(());
+    }
     while stream.next().await.is_some() {
         counter!("arb_pool_updates_total").increment(1);
         if tx.send(*address).is_err() {

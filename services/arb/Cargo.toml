@@ -16,6 +16,7 @@ mtm-scenario = { workspace = true }
 mtm-telemetry = { workspace = true }
 mtm-venues = { workspace = true }
 oracle-client = { workspace = true }
+rand = { workspace = true }
 rust_decimal = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
