@@ -14,7 +14,7 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 janitor-interface = { path = "../../crates/janitor-interface", default-features = false }
-pinocchio = { version = "0.11", default-features = false }
+pinocchio = { version = "0.11", default-features = false, features = ["cpi"] }
 
 [build-dependencies]
 bs58 = "0.5"
