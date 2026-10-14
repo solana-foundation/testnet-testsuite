@@ -23,7 +23,7 @@ use mtm_chain::ChainClient;
 use mtm_venues::PoolSnapshot;
 use registry::{Programs, Registry};
 use solana_pubkey::Pubkey;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Pool snapshots are shared between the cache, the book, and planned legs.
 pub type Snapshot = Arc<PoolSnapshot>;
@@ -123,8 +123,7 @@ pub async fn load_book(
         match loaded {
             Ok(snapshot) => sources.push((snapshot.mints(), snapshot)),
             Err(error) => {
-                warn!(pool = %entry.pool, error = %error, "pool snapshot failed");
-                metrics::counter!("router_snapshot_failures_total").increment(1);
+                debug!(pool = %entry.pool, error = %error, "skipping pool without a snapshot");
                 failures.push(format!("{}: {error}", entry.pool));
             }
         }
@@ -159,11 +158,17 @@ impl SnapshotCache {
     }
 
     async fn load(&self, chain: &ChainClient, entry: &registry::Entry) -> Result<Snapshot, String> {
+        // Logged here, once per load attempt, not once per quote that reuses
+        // a cached failure (that was a warning per pool per quote at load).
         let fetch = || async {
             PoolSnapshot::load(chain, entry.kind, entry.program_id, entry.pool)
                 .await
                 .map(Arc::new)
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    warn!(pool = %entry.pool, error = %error, "pool snapshot failed");
+                    metrics::counter!("router_snapshot_load_failures_total").increment(1);
+                    error.to_string()
+                })
         };
         let cell = {
             let mut entries = self

@@ -6,7 +6,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use router_client::{
-    InstructionsResponse, QuoteRequest, QuoteResponse, WireAccountMeta, WireInstruction,
+    Execution, InstructionsResponse, QuoteRequest, QuoteResponse, WireAccountMeta, WireInstruction,
 };
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -96,14 +96,36 @@ async fn planned(
     ),
     (StatusCode, String),
 > {
+    plan_request(state, req).await
+}
+
+fn execution_label(execution: Execution) -> &'static str {
+    match execution {
+        Execution::Direct => "Direct",
+        Execution::Jupiter => "Jupiter",
+    }
+}
+
+/// Time a whole request (planning, fitting, assembly, and the blockhash
+/// fetch) and count its errors by status.
+async fn observed<T>(
+    endpoint: &'static str,
+    execution: Execution,
+    work: impl std::future::Future<Output = Result<T, (StatusCode, String)>>,
+) -> Result<T, (StatusCode, String)> {
     let started = std::time::Instant::now();
-    let result = plan_request(state, req).await;
-    let execution = format!("{:?}", req.execution);
-    metrics::histogram!("router_quote_seconds", "execution" => execution.clone())
+    let result = work.await;
+    let execution = execution_label(execution);
+    metrics::histogram!("router_quote_seconds", "endpoint" => endpoint, "execution" => execution)
         .record(started.elapsed().as_secs_f64());
     if let Err((status, _)) = &result {
-        metrics::counter!("router_quote_errors_total", "execution" => execution, "status" => status.as_u16().to_string())
-            .increment(1);
+        metrics::counter!(
+            "router_quote_errors_total",
+            "endpoint" => endpoint,
+            "execution" => execution,
+            "status" => status.as_u16().to_string()
+        )
+        .increment(1);
     }
     result
 }
@@ -128,7 +150,7 @@ async fn plan_request(
         .map_err(engine_status)?;
     let planned =
         engine::plan(&request, &book, &state.bridge_mints, state_slot).map_err(engine_status)?;
-    metrics::counter!("router_quotes_total", "execution" => format!("{:?}", request.execution))
+    metrics::counter!("router_quotes_total", "execution" => execution_label(request.execution))
         .increment(1);
     Ok((request, planned, book, state_slot))
 }
@@ -210,14 +232,21 @@ async fn quote(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QuoteRequest>,
 ) -> Result<Json<QuoteResponse>, (StatusCode, String)> {
+    observed("quote", req.execution, quote_inner(&state, &req)).await
+}
+
+async fn quote_inner(
+    state: &AppState,
+    req: &QuoteRequest,
+) -> Result<Json<QuoteResponse>, (StatusCode, String)> {
     let Some(user) = &req.user else {
-        return Ok(Json(planned(&state, &req).await?.1.response));
+        return Ok(Json(planned(state, req).await?.1.response));
     };
     let user = parse_user(user)?;
-    let (planned, assembled, tx) = fitted(&state, &req, &user).await?;
+    let (planned, assembled, tx) = fitted(state, req, &user).await?;
     let mut response = planned.response;
     response.compute_unit_limit =
-        Some(assemble::Budget::for_route(&state, &assembled).compute_unit_limit);
+        Some(assemble::Budget::for_route(state, &assembled).compute_unit_limit);
     response.tx_base64 = Some(tx);
     Ok(Json(response))
 }
@@ -226,6 +255,18 @@ async fn instructions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QuoteRequest>,
 ) -> Result<Json<InstructionsResponse>, (StatusCode, String)> {
+    observed(
+        "instructions",
+        req.execution,
+        instructions_inner(&state, &req),
+    )
+    .await
+}
+
+async fn instructions_inner(
+    state: &AppState,
+    req: &QuoteRequest,
+) -> Result<Json<InstructionsResponse>, (StatusCode, String)> {
     let Some(user) = &req.user else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -233,10 +274,10 @@ async fn instructions(
         ));
     };
     let user = parse_user(user)?;
-    let (planned, assembled, _) = fitted(&state, &req, &user).await?;
+    let (planned, assembled, _) = fitted(state, req, &user).await?;
     let mut quote = planned.response;
     quote.compute_unit_limit =
-        Some(assemble::Budget::for_route(&state, &assembled).compute_unit_limit);
+        Some(assemble::Budget::for_route(state, &assembled).compute_unit_limit);
     let wire = assembled
         .instructions
         .iter()

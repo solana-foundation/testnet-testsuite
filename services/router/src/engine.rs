@@ -330,6 +330,10 @@ fn plan_exact_in<S: QuoteSource>(
         ) else {
             continue;
         };
+        // Compared on output-token delivered. Under direct execution hop 2
+        // spends hop 1's on-chain minimum, so a bridge's `route_out` is what
+        // the trader receives in the output mint (hop 1's surplus stays in the
+        // bridge mint); that is the comparable figure, not a penalty.
         if best
             .as_ref()
             .is_none_or(|current| route_out(&candidate) > route_out(current))
