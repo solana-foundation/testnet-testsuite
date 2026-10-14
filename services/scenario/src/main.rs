@@ -61,9 +61,6 @@ enum Command {
     Snapshot {
         #[arg(long)]
         out: PathBuf,
-        /// Where the mm service keeps open LP positions.
-        #[arg(long, default_value = ".scenario/state")]
-        state_dir: PathBuf,
     },
     /// PnL, transactions, and trades per participant between two snapshots.
     Report {
@@ -98,6 +95,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    let rpc_url = cfg.rpc.http_url.clone();
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let report = match cli.command {
         Command::Bootstrap {
@@ -117,8 +115,8 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
-        Command::Snapshot { out, state_dir } => {
-            let snapshot = pnl::snapshot(&chain, &scenario, &state_dir).await?;
+        Command::Snapshot { out } => {
+            let snapshot = pnl::snapshot(&chain, &scenario).await?;
             std::fs::write(&out, serde_json::to_vec_pretty(&snapshot)?)?;
             json!({ "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len() })
         }
@@ -132,7 +130,13 @@ async fn main() -> Result<()> {
                     &std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
                 )?)
             };
-            pnl::report(&chain, &read(&start)?, &read(&end)?, prometheus.as_deref()).await?
+            pnl::report(
+                &rpc_url,
+                &read(&start)?,
+                &read(&end)?,
+                prometheus.as_deref(),
+            )
+            .await?
         }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);

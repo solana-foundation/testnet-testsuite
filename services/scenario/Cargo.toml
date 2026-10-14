@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
 manifest-dex-client = { workspace = true }
 manifest-dex-orchestrator = { workspace = true }
 mtm-chain = { workspace = true }

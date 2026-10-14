@@ -3,29 +3,32 @@
 //! positions) valued at oracle prices, and a report comparing two snapshots
 //! with on-chain transaction counts and trade counts from Prometheus.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use mtm_chain::ChainClient;
-use mtm_scenario::funding::token_balance;
+use mtm_scenario::funding::balances;
 use mtm_scenario::pricing::PriceBook;
 use mtm_scenario::venue::to_ui;
-use mtm_scenario::{Scenario, Strategy, Venue};
+use mtm_scenario::{Scenario, Strategy, Token, Venue};
 use oracle_client::OracleClient;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
-use solana_rpc_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
-use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_signer::null_signer::NullSigner;
 
 const D18: u128 = 1_000_000_000_000_000_000;
+/// A maker's wallet token atoms (in `scenario.tokens` order) and its venue
+/// holdings, read consistently.
+type MakerRead = (Vec<u64>, Option<(String, BTreeMap<String, Decimal>)>);
+/// Concurrent RPC reads per snapshot / report.
+const CONCURRENCY: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -87,63 +90,107 @@ fn participants(scenario: &Scenario) -> Vec<(String, String, Pubkey)> {
     out
 }
 
-pub async fn snapshot(
-    chain: &ChainClient,
-    scenario: &Scenario,
-    state_dir: &Path,
-) -> Result<Snapshot> {
+pub async fn snapshot(chain: &ChainClient, scenario: &Scenario) -> Result<Snapshot> {
     let oracle = OracleClient::new(&scenario.config.oracle_url);
     let book = PriceBook::fetch(&oracle, scenario.config.max_price_age_ms).await?;
     let mut prices = BTreeMap::new();
     for token in scenario.tokens.values() {
         prices.insert(token.name.clone(), book.usd(token)?);
     }
-    let slot = chain.rpc().get_slot().await?;
-    let mut holdings = Vec::new();
-    for (role, kind, wallet) in participants(scenario) {
-        let mut breakdown: BTreeMap<String, BTreeMap<String, Decimal>> = BTreeMap::new();
-        let mut wallet_tokens = BTreeMap::new();
-        for token in scenario.tokens.values() {
-            wallet_tokens.insert(
-                token.name.clone(),
-                to_ui(token, token_balance(chain, &wallet, token).await?),
+    let people = participants(scenario);
+    let tokens: Vec<&Token> = scenario.tokens.values().collect();
+    // Every wallet balance in a few batched reads, so the snapshot is close
+    // to a single point in time even with thousands of participants.
+    let pairs: Vec<(Pubkey, &Token)> = people
+        .iter()
+        .flat_map(|(_, _, wallet)| tokens.iter().map(move |token| (*wallet, *token)))
+        .collect();
+    let wallets: Vec<Pubkey> = people.iter().map(|(_, _, wallet)| *wallet).collect();
+    let (token_atoms, lamports) = balances(chain, &pairs, &wallets).await?;
+    // Venue holdings (seats, orders, positions) only exist for makers. A
+    // maker moving funds between wallet and venue mid-read (a re-centre)
+    // would be counted twice or not at all, so each maker is read
+    // optimistically: wallet, venue, wallet again, retried until the wallet
+    // did not change around the venue read.
+    let makers: Vec<Option<MakerRead>> =
+        futures::stream::iter(people.iter().map(|(role, _, wallet)| {
+            let tokens = &tokens;
+            async move {
+                let Some(name) = role.strip_prefix("maker/") else {
+                    return Ok(None);
+                };
+                let maker = scenario
+                    .config
+                    .makers
+                    .iter()
+                    .find(|m| m.name == name)
+                    .context("maker vanished")?;
+                let pairs: Vec<(Pubkey, &Token)> =
+                    tokens.iter().map(|token| (*wallet, *token)).collect();
+                let mut before = balances(chain, &pairs, &[]).await?.0;
+                for _ in 0..5 {
+                    let venue = venue_holdings(chain, scenario, maker, *wallet)
+                        .await?
+                        .map(|held| (maker.venue.as_str().to_owned(), held));
+                    let after = balances(chain, &pairs, &[]).await?.0;
+                    if after == before {
+                        return Ok::<_, anyhow::Error>(Some((after, venue)));
+                    }
+                    before = after;
+                }
+                anyhow::bail!("maker {name} kept moving funds during the snapshot")
+            }
+        }))
+        .buffered(CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_>>()?;
+    let participants = people
+        .into_iter()
+        .zip(makers)
+        .enumerate()
+        .map(|(index, ((role, kind, wallet), maker))| {
+            let (atoms, venue) = maker.unwrap_or_else(|| {
+                (
+                    token_atoms[index * tokens.len()..(index + 1) * tokens.len()].to_vec(),
+                    None,
+                )
+            });
+            let mut breakdown: BTreeMap<String, BTreeMap<String, Decimal>> = BTreeMap::new();
+            breakdown.insert(
+                "wallet".into(),
+                tokens
+                    .iter()
+                    .zip(&atoms)
+                    .map(|(token, atoms)| (token.name.clone(), to_ui(token, *atoms)))
+                    .collect(),
             );
-        }
-        breakdown.insert("wallet".into(), wallet_tokens);
-        if let Some(name) = role.strip_prefix("maker/") {
-            let maker = scenario
-                .config
-                .makers
-                .iter()
-                .find(|m| m.name == name)
-                .context("maker vanished")?;
-            if let Some(venue_tokens) =
-                venue_holdings(chain, scenario, maker, wallet, state_dir).await?
-            {
-                breakdown.insert(maker.venue.as_str().to_owned(), venue_tokens);
+            breakdown.extend(venue);
+            let mut totals: BTreeMap<String, Decimal> = BTreeMap::new();
+            for place in breakdown.values() {
+                for (name, amount) in place {
+                    *totals.entry(name.clone()).or_default() += *amount;
+                }
             }
-        }
-        let mut tokens: BTreeMap<String, Decimal> = BTreeMap::new();
-        for place in breakdown.values() {
-            for (name, amount) in place {
-                *tokens.entry(name.clone()).or_default() += *amount;
+            Holdings {
+                role,
+                kind,
+                wallet: wallet.to_string(),
+                tokens: totals,
+                sol: Decimal::from(lamports[index]) / Decimal::from(1_000_000_000_u64),
+                breakdown,
             }
-        }
-        let lamports = chain.rpc().get_balance(&wallet).await?;
-        holdings.push(Holdings {
-            role,
-            kind,
-            wallet: wallet.to_string(),
-            tokens,
-            sol: Decimal::from(lamports) / Decimal::from(1_000_000_000_u64),
-            breakdown,
-        });
-    }
+        })
+        .collect();
+    // Taken after the reads: with participants frozen while a snapshot
+    // runs, this is the state the reads saw.
+    let (slot, time_us) = (chain.rpc().get_slot().await?, mtm_common::time::now_us());
     Ok(Snapshot {
-        time_us: mtm_common::time::now_us(),
+        time_us,
         slot,
         prices,
-        participants: holdings,
+        participants,
     })
 }
 
@@ -154,7 +201,6 @@ async fn venue_holdings(
     scenario: &Scenario,
     maker: &mtm_scenario::MakerConfig,
     wallet: Pubkey,
-    state_dir: &Path,
 ) -> Result<Option<BTreeMap<String, Decimal>>> {
     let base = scenario.token(&maker.base)?;
     let quote = scenario.token(&maker.quote)?;
@@ -207,59 +253,101 @@ async fn venue_holdings(
             );
         }
         (Strategy::ClmmRange { .. }, venue) => {
-            #[derive(Deserialize)]
-            struct Position {
-                mint: String,
-            }
-            let Ok(bytes) = std::fs::read(state_dir.join(format!("{}.json", maker.name))) else {
-                return Ok(None);
-            };
-            let position: Position = serde_json::from_slice(&bytes)?;
-            let mint = Pubkey::from_str(&position.mint)?;
+            // Positions are found from the position NFTs the wallet holds
+            // (not the mm's state file, which is briefly absent while a
+            // position is re-centred).
+            let nfts = position_nfts(chain, &wallet).await?;
             let reader: Arc<dyn Signer + Send + Sync> = Arc::new(NullSigner::new(&wallet));
             let program = scenario.programs.of(venue);
             let confirmed = CommitmentConfig::confirmed();
-            let (mint_a, mint_b, amount_a, amount_b) = match venue {
-                Venue::OrcaWhirlpool => {
-                    let value = orca_whirlpool_client::OrcaWhirlpoolClient::new(
+            for mint in nfts {
+                let value = match venue {
+                    Venue::OrcaWhirlpool => orca_whirlpool_client::OrcaWhirlpoolClient::new(
                         chain.clone(),
                         program,
-                        reader,
+                        Arc::clone(&reader),
                         0,
                         200_000,
                         0,
                         confirmed,
                     )?
                     .position_value(mint)
-                    .await?;
-                    (value.mint_a, value.mint_b, value.amount_a, value.amount_b)
-                }
-                Venue::RaydiumClmm => {
-                    let value = raydium_clmm_client::RaydiumClmmClient::new(
+                    .await
+                    .map(|v| (v.mint_a, v.mint_b, v.amount_a, v.amount_b))
+                    .map_err(anyhow::Error::from),
+                    Venue::RaydiumClmm => raydium_clmm_client::RaydiumClmmClient::new(
                         chain.clone(),
                         program,
-                        reader,
+                        Arc::clone(&reader),
                         0,
                         200_000,
                         0,
                         confirmed,
                     )?
                     .position_value(mint)
-                    .await?;
-                    (value.mint_a, value.mint_b, value.amount_a, value.amount_b)
+                    .await
+                    .map(|v| (v.mint_a, v.mint_b, v.amount_a, v.amount_b))
+                    .map_err(anyhow::Error::from),
+                    Venue::Manifest => return Ok(None),
+                };
+                // Not a position of this venue (or already closed).
+                let (mint_a, mint_b, amount_a, amount_b) = match value {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::debug!(maker = %maker.name, %mint, error = %format!("{error:#}"), "NFT is not a valued position");
+                        continue;
+                    }
+                };
+                for (mint, amount) in [(mint_a, amount_a), (mint_b, amount_b)] {
+                    let token = scenario
+                        .token_by_mint(&mint)
+                        .context("position mint is not a scenario token")?;
+                    *out.entry(token.name.clone()).or_default() += to_ui(token, amount);
                 }
-                Venue::Manifest => return Ok(None),
-            };
-            for (mint, amount) in [(mint_a, amount_a), (mint_b, amount_b)] {
-                let token = scenario
-                    .token_by_mint(&mint)
-                    .context("position mint is not a scenario token")?;
-                out.insert(token.name.clone(), to_ui(token, amount));
+            }
+            if out.is_empty() {
+                return Ok(None);
             }
         }
         _ => return Ok(None),
     }
     Ok(Some(out))
+}
+
+/// Mints of the NFTs (amount 1, 0 decimals) `owner` holds under either
+/// token program: candidate CLMM position mints. Read at the client's
+/// commitment like every other snapshot read (the RPC default, finalized,
+/// lags confirmed by ~32 slots on a real validator: recently opened
+/// positions would be missing and recently closed ones still listed).
+async fn position_nfts(chain: &ChainClient, owner: &Pubkey) -> Result<Vec<Pubkey>> {
+    let commitment = chain.rpc().commitment().commitment.to_string();
+    let mut mints = Vec::new();
+    for program in [
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    ] {
+        let response: Value = reqwest::Client::new()
+            .post(chain.rpc().url())
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
+                "params": [owner.to_string(), { "programId": program }, { "encoding": "jsonParsed", "commitment": commitment }],
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let empty = vec![];
+        for account in response["result"]["value"].as_array().unwrap_or(&empty) {
+            let info = &account["account"]["data"]["parsed"]["info"];
+            if info["tokenAmount"]["decimals"] == 0
+                && info["tokenAmount"]["amount"] == "1"
+                && let Some(mint) = info["mint"].as_str().and_then(|m| Pubkey::from_str(m).ok())
+            {
+                mints.push(mint);
+            }
+        }
+    }
+    Ok(mints)
 }
 
 fn value(tokens: &BTreeMap<String, Decimal>, prices: &BTreeMap<String, Decimal>) -> Decimal {
@@ -269,46 +357,78 @@ fn value(tokens: &BTreeMap<String, Decimal>, prices: &BTreeMap<String, Decimal>)
         .sum()
 }
 
-/// Successful and failed transactions signed by or mentioning `wallet` in
-/// `(after_slot, until_slot]`.
-async fn transactions(
-    chain: &ChainClient,
-    wallet: &Pubkey,
+/// Every transaction in `(after_slot, until_slot]`, read block by block:
+/// (signer wallets, succeeded, slot). Block scans are linear in the
+/// window, unlike per-wallet signature lookups, which a local validator
+/// answers by scanning its whole history.
+/// Consensus votes: a real validator (solana-test-validator) lands one per
+/// slot; Surfpool has none. Excluded so the two compare.
+const VOTE_PROGRAM: &str = "Vote111111111111111111111111111111111111111";
+
+/// The window's non-vote transactions as (signers, ok, slot), plus the
+/// number of vote transactions skipped.
+async fn block_transactions(
+    rpc_url: &str,
     after_slot: u64,
     until_slot: u64,
-) -> Result<(u64, u64)> {
-    let (mut ok, mut failed) = (0, 0);
-    let mut before: Option<Signature> = None;
-    loop {
-        let page = chain
-            .rpc()
-            .get_signatures_for_address_with_config(
-                wallet,
-                GetConfirmedSignaturesForAddress2Config {
-                    before,
-                    until: None,
-                    limit: Some(1_000),
-                    commitment: Some(CommitmentConfig::confirmed()),
-                },
+) -> Result<(Vec<(Vec<String>, bool, u64)>, u64)> {
+    let client = reqwest::Client::new();
+    let blocks = futures::stream::iter((after_slot + 1..=until_slot).map(|slot| {
+        let client = &client;
+        async move {
+            let response: Value = client
+                .post(rpc_url)
+                .json(&json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "getBlock",
+                    "params": [slot, {
+                        "encoding": "json", "transactionDetails": "accounts", "rewards": false,
+                        "maxSupportedTransactionVersion": 1, "commitment": "confirmed",
+                    }],
+                }))
+                .send()
+                .await?
+                .json()
+                .await?;
+            // Skipped slots answer with an error or a null block.
+            let block = &response["result"];
+            let empty = vec![];
+            Ok::<_, anyhow::Error>(
+                block["transactions"]
+                    .as_array()
+                    .unwrap_or(&empty)
+                    .iter()
+                    .map(|tx| {
+                        let keys = tx["transaction"]["accountKeys"]
+                            .as_array()
+                            .unwrap_or(&empty);
+                        let vote = keys
+                            .iter()
+                            .any(|key| key["pubkey"].as_str() == Some(VOTE_PROGRAM));
+                        let signers = keys
+                            .iter()
+                            .filter(|key| key["signer"].as_bool() == Some(true))
+                            .filter_map(|key| key["pubkey"].as_str().map(str::to_owned))
+                            .collect();
+                        (vote, (signers, tx["meta"]["err"].is_null(), slot))
+                    })
+                    .collect::<Vec<_>>(),
             )
-            .await?;
-        let Some(last) = page.last() else { break };
-        let oldest = last.slot;
-        before = Some(Signature::from_str(&last.signature)?);
-        for status in &page {
-            if status.slot > after_slot && status.slot <= until_slot {
-                if status.err.is_none() {
-                    ok += 1;
-                } else {
-                    failed += 1;
-                }
+        }
+    }))
+    .buffered(CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let (mut out, mut votes) = (Vec::new(), 0);
+    for block in blocks {
+        for (vote, tx) in block? {
+            if vote {
+                votes += 1;
+            } else {
+                out.push(tx);
             }
         }
-        if oldest <= after_slot || page.len() < 1_000 {
-            break;
-        }
     }
-    Ok((ok, failed))
+    Ok((out, votes))
 }
 
 async fn prometheus(
@@ -348,7 +468,7 @@ async fn prometheus(
 }
 
 pub async fn report(
-    chain: &ChainClient,
+    rpc_url: &str,
     start: &Snapshot,
     end: &Snapshot,
     prometheus_url: Option<&str>,
@@ -399,18 +519,49 @@ pub async fn report(
         trades.insert("flow (all takers)".into(), flow);
     }
 
+    let pairs: Vec<(&Holdings, &Holdings)> = end
+        .participants
+        .iter()
+        .filter_map(|e| Some((start.participants.iter().find(|p| p.role == e.role)?, e)))
+        .collect();
+    let (transactions, votes) = block_transactions(rpc_url, start.slot, end.slot).await?;
+    // Per signer wallet: (landed, failed); per slot: landed count.
+    let mut signed: HashMap<&str, (u64, u64)> = HashMap::new();
+    let mut per_slot: BTreeMap<u64, u64> = BTreeMap::new();
+    let (mut network_ok, mut network_failed) = (0_u64, 0_u64);
+    for (signers, ok, slot) in &transactions {
+        if *ok {
+            network_ok += 1;
+            *per_slot.entry(*slot).or_default() += 1;
+        } else {
+            network_failed += 1;
+        }
+        for signer in signers {
+            let entry = signed.entry(signer.as_str()).or_default();
+            if *ok {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+    }
+    // Busiest ~10 s: 25 consecutive slots, at the window's mean slot time.
+    const PEAK_SLOTS: u64 = 25;
+    let slot_seconds = window_s / (end.slot.saturating_sub(start.slot)).max(1) as f64;
+    let peak_tps = (start.slot + 1..=end.slot.saturating_sub(PEAK_SLOTS - 1))
+        .map(|first| {
+            (first..first + PEAK_SLOTS)
+                .filter_map(|slot| per_slot.get(&slot))
+                .sum::<u64>()
+        })
+        .max()
+        .map_or(0.0, |landed| {
+            landed as f64 / (PEAK_SLOTS as f64 * slot_seconds)
+        });
     let mut rows = Vec::new();
+    let mut by_kind: BTreeMap<String, Vec<(Decimal, Decimal, u64, u64)>> = BTreeMap::new();
     let mut totals = (Decimal::ZERO, Decimal::ZERO, 0_u64, 0_u64);
-    for end_holdings in &end.participants {
-        let Some(start_holdings) = start
-            .participants
-            .iter()
-            .find(|p| p.role == end_holdings.role)
-        else {
-            continue;
-        };
-        let wallet = Pubkey::from_str(&end_holdings.wallet)?;
-        let (ok, failed) = transactions(chain, &wallet, start.slot, end.slot).await?;
+    for (start_holdings, end_holdings) in &pairs {
         // Trading PnL values both inventories at end prices, removing the
         // market move; mark-to-market PnL includes it.
         let trading =
@@ -425,10 +576,18 @@ pub async fn report(
                 (name.clone(), (*amount - before).round_dp(6).to_string())
             })
             .collect();
+        let (ok_n, failed_n) = signed
+            .get(end_holdings.wallet.as_str())
+            .copied()
+            .unwrap_or_default();
         totals.0 += trading;
         totals.1 += mtm;
-        totals.2 += ok;
-        totals.3 += failed;
+        totals.2 += ok_n;
+        totals.3 += failed_n;
+        by_kind
+            .entry(end_holdings.kind.clone())
+            .or_default()
+            .push((trading, mtm, ok_n, failed_n));
         rows.push(json!({
             "role": end_holdings.role,
             "kind": end_holdings.kind,
@@ -438,23 +597,57 @@ pub async fn report(
             "markToMarketPnlUsd": mtm.round_dp(2).to_string(),
             "solSpent": (start_holdings.sol - end_holdings.sol).round_dp(6).to_string(),
             "tokenDeltas": deltas,
-            "transactionsLanded": ok,
-            "transactionsFailed": failed,
+            "transactionsLanded": ok_n,
+            "transactionsFailed": failed_n,
             "trades": trades.get(&end_holdings.role).cloned().unwrap_or(Value::Null),
         }));
     }
+    let kinds: BTreeMap<String, Value> = by_kind
+        .into_iter()
+        .map(|(kind, mut rows)| {
+            rows.sort_by_key(|row| row.0);
+            let n = rows.len();
+            let sum: Decimal = rows.iter().map(|row| row.0).sum();
+            let profitable = rows.iter().filter(|row| row.0 > Decimal::ZERO).count();
+            (
+                kind,
+                json!({
+                    "participants": n,
+                    "tradingPnlUsd": sum.round_dp(2).to_string(),
+                    "markToMarketPnlUsd": rows.iter().map(|row| row.1).sum::<Decimal>().round_dp(2).to_string(),
+                    "meanTradingPnlUsd": (sum / Decimal::from(n.max(1))).round_dp(2).to_string(),
+                    "medianTradingPnlUsd": rows[n / 2].0.round_dp(2).to_string(),
+                    "minTradingPnlUsd": rows[0].0.round_dp(2).to_string(),
+                    "maxTradingPnlUsd": rows[n - 1].0.round_dp(2).to_string(),
+                    "profitable": profitable,
+                    "transactionsLanded": rows.iter().map(|row| row.2).sum::<u64>(),
+                    "transactionsFailed": rows.iter().map(|row| row.3).sum::<u64>(),
+                }),
+            )
+        })
+        .collect();
     Ok(json!({
         "windowSeconds": window_s.round(),
         "slots": { "start": start.slot, "end": end.slot },
         "prices": { "start": start.prices, "end": end.prices },
+        "byKind": kinds,
         "participants": rows,
         "flowTrades": trades.get("flow (all takers)").cloned().unwrap_or(Value::Null),
+        "network": {
+            "transactionsLanded": network_ok,
+            "transactionsFailed": network_failed,
+            "landedTps": (network_ok as f64 / window_s.max(1.0) * 100.0).round() / 100.0,
+            "peakLandedTps": (peak_tps * 10.0).round() / 10.0,
+            "slotSeconds": (slot_seconds * 1000.0).round() / 1000.0,
+            "voteTransactionsExcluded": votes,
+            "note": "every non-vote transaction in the window's blocks (failed = landed with an error; preflight rejections never land)",
+        },
         "totals": {
             "tradingPnlUsd": totals.0.round_dp(2).to_string(),
             "markToMarketPnlUsd": totals.1.round_dp(2).to_string(),
             "transactionsLanded": totals.2,
             "transactionsFailed": totals.3,
-            "note": "transactions are counted per wallet (a tx touching two participants counts for each); minted refills inside the window would show as PnL, so run with taker refills disabled",
+            "note": "transactions here are counted per signing wallet (a tx two participants sign counts for each; see `network` for unique); minted refills inside the window would show as PnL, so run with taker refills disabled",
         },
     }))
 }
