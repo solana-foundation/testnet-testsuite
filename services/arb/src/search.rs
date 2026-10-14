@@ -107,10 +107,26 @@ impl<'s> Searcher<'s> {
                 })
             })
             .collect::<Result<_>>()?;
-        // Register the accounting series at zero, so `increase()` sees the
-        // first trade of each bot instead of dropping it.
+        // Register the trade and accounting series at zero, so `increase()`
+        // sees the first trade of each bot instead of dropping it.
         for bot in &bots {
             let name = bot.config.name.clone();
+            for status in [
+                "reverted",
+                "expired",
+                "ambiguous",
+                "send_failed",
+                "below_floor",
+                "simulation_failed",
+                "quote_failed",
+                "error",
+            ] {
+                counter!("arb_trades_total", "bot" => name.clone(), "status" => status).absolute(0);
+            }
+            for legs in ["2", "3"] {
+                counter!("arb_trades_total", "bot" => name.clone(), "status" => "landed", "legs" => legs)
+                    .absolute(0);
+            }
             counter!("arb_profit_micro_usd_total", "bot" => name.clone()).absolute(0);
             counter!("arb_loss_micro_usd_total", "bot" => name.clone()).absolute(0);
             counter!("arb_fees_lamports_total", "bot" => name).absolute(0);
