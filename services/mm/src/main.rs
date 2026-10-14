@@ -64,7 +64,8 @@ async fn main() -> Result<()> {
     // Venue futures hold `&dyn Signer` across awaits (not `Send`), so the
     // makers share one thread; they are I/O-bound.
     let local = tokio::task::LocalSet::new();
-    let mut tasks = 0;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut tasks = Vec::new();
     for maker in &scenario.config.makers {
         if !cli.makers.is_empty() && !cli.makers.contains(&maker.name) {
             continue;
@@ -77,15 +78,37 @@ async fn main() -> Result<()> {
         )
         .await?;
         info!(maker = %maker.name, wallet = %ctx.wallet_pubkey(), venue = maker.venue.as_str(), "maker starting");
-        local.spawn_local(maker::run(ctx));
-        tasks += 1;
+        tasks.push(local.spawn_local(maker::run(ctx, stopped.clone())));
     }
-    anyhow::ensure!(tasks > 0, "no makers selected");
+    anyhow::ensure!(!tasks.is_empty(), "no makers selected");
     local
         .run_until(async {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
+            info!("shutdown signal received; letting makers finish their ticks");
+            let _ = stop.send(true);
+            let drained = futures::future::join_all(tasks);
+            if tokio::time::timeout(std::time::Duration::from_secs(60), drained)
+                .await
+                .is_err()
+            {
+                tracing::warn!("makers still busy after 60 s; exiting");
+            }
         })
         .await;
-    info!("shutdown signal received");
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM (`docker stop`, `scenario.sh down`).
+async fn shutdown_signal() {
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = async {
+            match terminate.as_mut() {
+                Some(signal) => { signal.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+    }
 }

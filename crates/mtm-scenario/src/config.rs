@@ -97,6 +97,20 @@ pub struct MakerConfig {
     pub sol: Decimal,
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
+    /// Transaction settings for this maker's venue client; unset fields keep
+    /// the strategy's defaults. A priority fee keeps quotes and re-centres
+    /// landing in full blocks, where fee-less makers lose to taker flow.
+    #[serde(default)]
+    pub execution: MakerExecution,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct MakerExecution {
+    /// Venue slippage tolerance (LP deposits/withdrawals, swaps).
+    pub slippage_bps: Option<u16>,
+    pub compute_unit_limit: Option<u32>,
+    #[serde(default)]
+    pub priority_fee_micro_lamports: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +197,43 @@ fn default_max_price_age_ms() -> u64 {
 fn default_orca_tick_spacing() -> u16 {
     64
 }
+impl MakerConfig {
+    /// Parameter ranges a strategy needs to make sense.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let fail = |reason: &str| anyhow::bail!("maker {}: {reason}", self.name);
+        if self.execution.slippage_bps.is_some_and(|bps| bps > 10_000) {
+            return fail("execution.slippage_bps cannot exceed 10000");
+        }
+        match &self.strategy {
+            Strategy::ClobLadder {
+                levels,
+                target_base_ratio,
+                ..
+            } => {
+                if *levels == 0 {
+                    return fail("clob-ladder needs at least one level");
+                }
+                if *target_base_ratio < Decimal::ZERO || *target_base_ratio > Decimal::ONE {
+                    return fail("target_base_ratio must be between 0 and 1");
+                }
+            }
+            Strategy::ClmmRange {
+                width_bps,
+                recenter_bps,
+                ..
+            } => {
+                // Past half the width the price leaves the range before a
+                // re-centre triggers, and the position sits out of range.
+                if u64::from(*recenter_bps) * 2 >= u64::from(*width_bps) {
+                    return fail("recenter_bps must be below half of width_bps");
+                }
+            }
+            Strategy::PoolArb { .. } => {}
+        }
+        Ok(())
+    }
+}
+
 fn default_sol() -> Decimal {
     Decimal::TWO
 }
@@ -200,4 +251,60 @@ fn default_slippage_bps() -> u16 {
 }
 fn default_refill_ratio() -> Decimal {
     Decimal::new(25, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn maker(strategy: Strategy) -> MakerConfig {
+        MakerConfig {
+            name: "m".to_owned(),
+            venue: Venue::OrcaWhirlpool,
+            base: "A".to_owned(),
+            quote: "B".to_owned(),
+            strategy,
+            inventory: BTreeMap::new(),
+            sol: Decimal::ONE,
+            interval_ms: 1_000,
+            execution: MakerExecution::default(),
+        }
+    }
+
+    fn range(width_bps: u32, recenter_bps: u32) -> Strategy {
+        Strategy::ClmmRange {
+            width_bps,
+            recenter_bps,
+            position_usd: Decimal::ONE,
+        }
+    }
+
+    #[test]
+    fn recenter_must_trigger_inside_the_range() {
+        assert!(maker(range(600, 200)).validate().is_ok());
+        assert!(maker(range(600, 300)).validate().is_err());
+    }
+
+    #[test]
+    fn ladder_parameters_are_checked() {
+        let ladder = |levels, ratio| Strategy::ClobLadder {
+            levels,
+            spread_bps: 10,
+            step_bps: 5,
+            level_size: Decimal::ONE,
+            refresh_bps: 10,
+            skew_bps: 0,
+            target_base_ratio: ratio,
+        };
+        assert!(maker(ladder(3, Decimal::new(5, 1))).validate().is_ok());
+        assert!(maker(ladder(0, Decimal::new(5, 1))).validate().is_err());
+        assert!(maker(ladder(3, Decimal::new(15, 1))).validate().is_err());
+    }
+
+    #[test]
+    fn execution_overrides_are_bounded() {
+        let mut m = maker(range(600, 200));
+        m.execution.slippage_bps = Some(10_001);
+        assert!(m.validate().is_err());
+    }
 }

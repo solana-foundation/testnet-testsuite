@@ -23,17 +23,20 @@ pub struct Clob {
     client: ManifestClient,
     /// Mid and `(sequence, base atoms)` of the ladder last placed.
     last: Option<(Decimal, Vec<(u64, u64)>)>,
+    /// Whether the ladder was pulled for a stale oracle (and not re-quoted).
+    pulled: bool,
 }
 
 impl Clob {
     pub async fn start(ctx: &Ctx) -> Result<Self> {
+        let (slippage_bps, compute_units, priority_fee) = ctx.execution(0, 400_000);
         let client = ManifestClient::new(
             ctx.chain.clone(),
             ctx.scenario.programs.manifest,
             Arc::clone(&ctx.wallet) as _,
-            0,
-            400_000,
-            0,
+            slippage_bps,
+            compute_units,
+            priority_fee,
             CommitmentConfig::confirmed(),
         )?;
         client.claim_seat(ctx.pool).await.context("claiming seat")?;
@@ -53,7 +56,11 @@ impl Clob {
                 info!(maker = %ctx.maker.name, token = %token.name, amount = %to_ui(token, atoms), "deposited into seat");
             }
         }
-        Ok(Self { client, last: None })
+        Ok(Self {
+            client,
+            last: None,
+            pulled: false,
+        })
     }
 
     pub async fn tick(&mut self, ctx: &Ctx) -> Result<()> {
@@ -70,7 +77,25 @@ impl Clob {
             unreachable!("clob maker with a non-clob strategy");
         };
         let prices = ctx.prices().await?;
-        let mid = prices.pair(&ctx.base, &ctx.quote)?;
+        let mid = match prices.pair(&ctx.base, &ctx.quote) {
+            Ok(mid) => mid,
+            Err(error) => {
+                // Orders quoted on an old price get picked off: pull them
+                // once until the oracle is fresh again (also orders left
+                // from before a restart).
+                if !self.pulled {
+                    self.client
+                        .cancel_all_orders(ctx.pool)
+                        .await
+                        .context("pulling quotes on a stale oracle")?;
+                    self.pulled = true;
+                    self.last = None;
+                    ctx.action("pull");
+                }
+                return Err(error);
+            }
+        };
+        self.pulled = false;
         let snapshot = self.client.load_market(ctx.pool).await?;
         let seat = snapshot
             .book
@@ -142,8 +167,11 @@ impl Clob {
         let mut orders = Vec::new();
         for level in 0..u32::try_from(levels.mantissa()).unwrap_or(1) {
             let offset = Decimal::from(spread_bps + level * step_bps) / Decimal::from(10_000);
-            let bid = (skewed * (Decimal::ONE - offset)).round_dp(8);
-            let ask = (skewed * (Decimal::ONE + offset)).round_dp(8);
+            // Significant figures, not decimal places: 8 places is ~5 bps
+            // at BONK's price, enough to collapse levels onto one price.
+            let round = |price: Decimal| price.round_sf(8).unwrap_or(price);
+            let bid = round(skewed * (Decimal::ONE - offset));
+            let ask = round(skewed * (Decimal::ONE + offset));
             let bid_size = level_size.min(quote / levels / bid);
             for (side, price, size) in [(Side::Bid, bid, bid_size), (Side::Ask, ask, ask_size)] {
                 let size = size

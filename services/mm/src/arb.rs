@@ -34,7 +34,7 @@ impl Arb {
             ctx.pool,
         )
         .await?;
-        let spot = spot_price(&snapshot, &ctx.base, &ctx.quote);
+        let spot = spot_price(&snapshot, &ctx.base, &ctx.quote, oracle);
         ctx.record_prices(oracle, spot);
         let base_atoms = ctx.wallet_balance(&ctx.base).await?;
         let quote_atoms = ctx.wallet_balance(&ctx.quote).await?;
@@ -71,8 +71,36 @@ impl Arb {
         else {
             return Ok(());
         };
-        let quote = snapshot.quote(input.mint, output.mint, amount, true, 100)?;
-        let outcome = execute(&ctx.chain, ctx.wallet.as_ref(), &snapshot, &quote).await?;
+        // Never accept a worse fill than the oracle price: the instruction's
+        // floor is the oracle-value of the input (at most `slippage_bps`
+        // below the quote), so a pool that moves before the swap lands makes
+        // it fail instead of trading at a loss against the oracle.
+        let (slippage_bps, _, priority_fee) = ctx.execution(100, 0);
+        let expected = snapshot
+            .quote(input.mint, output.mint, amount, true, 0)?
+            .out_amount;
+        let input_ui = mtm_scenario::venue::to_ui(input, amount);
+        let oracle_out = if buy_base {
+            input_ui / oracle
+        } else {
+            input_ui * oracle
+        };
+        let floor = to_atoms(output, oracle_out).unwrap_or(u64::MAX);
+        if expected <= floor {
+            return Ok(()); // no edge left at this size
+        }
+        let room_bps = u16::try_from(u128::from(expected - floor) * 10_000 / u128::from(expected))
+            .unwrap_or(u16::MAX)
+            .min(slippage_bps);
+        let quote = snapshot.quote(input.mint, output.mint, amount, true, room_bps)?;
+        let outcome = execute(
+            &ctx.chain,
+            ctx.wallet.as_ref(),
+            &snapshot,
+            &quote,
+            priority_fee,
+        )
+        .await?;
         info!(
             maker = %ctx.maker.name, %deviation, input = %input.name, amount, out = quote.out_amount,
             signature = %outcome.signature, "arbitraged pool toward oracle"

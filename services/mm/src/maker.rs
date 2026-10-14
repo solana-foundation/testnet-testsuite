@@ -17,7 +17,7 @@ use rust_decimal::prelude::ToPrimitive;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{arb, clmm, clob};
 
@@ -82,6 +82,17 @@ impl Ctx {
         token_balance(&self.chain, &self.wallet_pubkey(), token).await
     }
 
+    /// Slippage, CU limit, and priority fee for this maker's transactions:
+    /// its `[execution]` overrides, else the strategy's defaults.
+    pub fn execution(&self, default_slippage_bps: u16, default_cu: u32) -> (u16, u32, u64) {
+        let execution = self.maker.execution;
+        (
+            execution.slippage_bps.unwrap_or(default_slippage_bps),
+            execution.compute_unit_limit.unwrap_or(default_cu),
+            execution.priority_fee_micro_lamports,
+        )
+    }
+
     /// Publish wallet (plus any venue-held) inventory and its USD value.
     pub fn record_inventory(&self, prices: &PriceBook, base_atoms: u64, quote_atoms: u64) {
         let maker = self.name();
@@ -133,8 +144,10 @@ enum State {
     Arb(arb::Arb),
 }
 
-/// Tick forever. Errors are logged and counted; the next tick retries.
-pub async fn run(ctx: Ctx) {
+/// Tick until `stop` flips. Errors are logged and counted; the next tick
+/// retries. A stop request waits for the current tick: a re-centre is never
+/// cut between its transactions.
+pub async fn run(ctx: Ctx, mut stop: tokio::sync::watch::Receiver<bool>) {
     let mut state = loop {
         let built = match &ctx.maker.strategy {
             Strategy::ClobLadder { .. } => clob::Clob::start(&ctx)
@@ -148,14 +161,23 @@ pub async fn run(ctx: Ctx) {
             Err(error) => {
                 warn!(maker = %ctx.maker.name, error = %format!("{error:#}"), "maker setup failed; retrying");
                 counter!("mm_errors_total", "maker" => ctx.name(), "stage" => "setup").increment(1);
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = stop.wait_for(|stop| *stop) => return,
+                }
             }
         }
     };
     let mut ticker = tokio::time::interval(Duration::from_millis(ctx.maker.interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = stop.wait_for(|stop| *stop) => {
+                info!(maker = %ctx.maker.name, "maker stopped");
+                return;
+            }
+        }
         let started = Instant::now();
         // A panic in venue code must not end this maker: count it and retry.
         let tick = async {

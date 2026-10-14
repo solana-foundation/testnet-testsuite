@@ -2567,6 +2567,7 @@ dependencies = [
  "metrics",
  "mtm-chain",
  "mtm-common",
+ "mtm-dex-harness",
  "mtm-scenario",
  "mtm-telemetry",
  "mtm-venues",
@@ -2662,6 +2663,7 @@ name = "mtm-scenario"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "manifest-dex-client",
  "mtm-chain",
  "mtm-common",

@@ -126,7 +126,14 @@ impl Scenario {
             self.token(&pool.base)?;
             self.token(&pool.quote)?;
         }
+        let mut names = std::collections::HashSet::new();
         for maker in &self.config.makers {
+            // The name derives the wallet and the state file: two makers with
+            // one name would race on both.
+            if !names.insert(maker.name.as_str()) {
+                bail!("maker name {} is used twice", maker.name);
+            }
+            maker.validate()?;
             self.token(&maker.base)?;
             self.token(&maker.quote)?;
             for name in maker.inventory.keys() {
