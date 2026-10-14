@@ -8,7 +8,7 @@
 import { createFromRoot } from "codama";
 import { rootNodeFromAnchor } from "@codama/nodes-from-anchor";
 import { renderVisitor } from "@codama/renderers-rust";
-import { readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const here = (rel) => fileURLToPath(new URL(rel, import.meta.url));
@@ -68,6 +68,12 @@ function fixupIdl(idl) {
 }
 
 for (const target of TARGETS) {
+  // A target whose IDL is not vendored on this branch (e.g. raydium-cpmm) is
+  // skipped rather than failing every other SDK's generation.
+  if (!existsSync(here(target.idl))) {
+    console.log(`skipping ${target.crate}: ${target.idl} is not present`);
+    continue;
+  }
   const idl = fixupIdl(JSON.parse(readFileSync(here(target.idl), "utf8")));
   const name = idl.metadata?.name ?? idl.name;
   console.log(`generating ${name} -> ${target.crate}/src/generated`);
