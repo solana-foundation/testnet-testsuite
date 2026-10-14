@@ -29,8 +29,9 @@
 #                                       local (SCENARIO_SWEEP_OPERATORS=0|1 overrides).
 #                                       SCENARIO_JANITOR=1 first upgrades the DEX programs
 #                                       to SCENARIO_JANITOR_SO and closes every account
-#                                       they own (pools, tick arrays, positions, markets),
-#                                       then restores the forks unless they are closed.
+#                                       they own (pools, tick arrays, positions, markets)
+#                                       and every vault their PDAs hold, then restores the
+#                                       forks unless they are closed.
 #
 # Secrets come from the environment (normally `doppler run --`; see
 # bootstrap/scenario/README.md). Every step is idempotent, so `up` can be
@@ -257,8 +258,7 @@ janitor() (
   "$bin/scenario" janitor --janitor-so "$so" | tee "$state/janitor.json"
   if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" != 1 ]]; then
     while IFS= read -r spec; do upgrade "${spec%%:*}" "${spec#*:}"; done < <(artifacts)
-    echo "janitor: forks restored with no accounts; Raydium cannot re-create its pools until" \
-      "its vaults (Token-program PDAs) are closed too: use a fresh chain for the next run" >&2
+    echo "janitor: forks restored with no accounts or vaults; bootstrap re-creates them" >&2
   fi
 )
 

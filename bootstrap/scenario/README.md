@@ -337,14 +337,22 @@ failure; `scenario leftovers` can also be run on its own at any time.
 ### The janitor (`programs/janitor`)
 
 The forked DEX programs have no instruction that closes pools, tick
-arrays or markets, but they own those accounts, and whatever code runs at a
-program ID can close what that ID owns. The janitor is a small Pinocchio
-program with one permissioned instruction, `Close`: the signer must be one
-of the authorities compiled into the binary (the program authority and the
-faucet of the Doppler config it was built for), every target must be
-writable, owned by the program ID it runs at and not executable, and each
-target's lamports go to the signer before the account is closed. Anything
-else fails the whole instruction.
+arrays, markets or their vaults, but whatever code runs at a program ID
+owns that ID's accounts and can sign for its PDAs. The janitor is a small
+Pinocchio program, deployed over each DEX program at the end of a run, with
+two permissioned instructions. The signer must be one of the authorities
+compiled into the binary (the program authority and the faucet of the
+Doppler config it was built for), and every account is checked before it is
+touched; any failure fails the whole instruction.
+
+- `Close`: accounts the program owns (writable, not executable); each
+  one's lamports go to the signer, then it is closed.
+- `CloseTokenAccounts`: token accounts (Token or Token-2022) held by one of
+  the program's PDAs. The client passes the PDA's seeds, so one instruction
+  covers every protocol's vault layout; the program derives the address
+  from them and its own ID, checks that each account is an initialized
+  account of the given mint held by that PDA, burns any balance and closes
+  it, signing as the PDA.
 
 ```sh
 just build-janitor dev        # target/janitor/dev/janitor.so, dev authorities baked in
@@ -354,27 +362,35 @@ SCENARIO_JANITOR=1 SCENARIO_CLOSE_PROGRAMS=1 \
 ```
 
 `teardown` upgrades each DEX program to the janitor (after the participant
-unwind, which still needs the real code), runs `scenario janitor` (which
-refuses to send anything unless every program's on-chain code is
-byte-for-byte that `.so`: a close sent to a real DEX program would be read
-as one of its own instructions), then either closes the programs
-(`SCENARIO_CLOSE_PROGRAMS=1`) or upgrades the forks back. Building needs
-the Agave platform tools (`cargo-build-sbf`, Agave >= 4.x) and
-`PUBKEY_PROGRAM_AUTHORITY` / `PUBKEY_FAUCET` in the Doppler config.
+unwind, which still needs the real code) and runs `scenario janitor`, which:
 
-Without closing the programs, the restored forks start from an empty
-state, and Raydium cannot re-create its pools: its token vaults are PDAs
-of the pool address, owned by the Token program (so the janitor cannot
-close them yet), and the re-created pool collides with them. Use a fresh
-chain, or close the programs, until a vault-closing instruction exists.
+1. refuses to send anything unless every program's on-chain code is
+   byte-for-byte that `.so` (a close sent to a real DEX program would be
+   read as one of its own instructions), then waits until the cluster is
+   past the upgrade slot (an upgraded program runs its new code from the
+   next slot);
+2. closes the vaults: it lists every token account of the scenario mints
+   and matches each owner against the venues' vault authorities (Orca: the
+   whirlpool `["whirlpool", config, mint_a, mint_b, tick_spacing]`; Raydium:
+   the pool `["pool", amm_config, mint_0, mint_1]` or the vault
+   `["pool_vault", pool, mint]`; Manifest: the vault itself, `["vault",
+market, mint]`); token accounts held by anyone else are left alone;
+3. closes every account the programs own.
+
+It then either closes the programs (`SCENARIO_CLOSE_PROGRAMS=1`) or
+upgrades the forks back, empty: `bootstrap` re-creates configs, pools and
+markets on the same chain. Building needs the Agave platform tools
+(`cargo-build-sbf`, Agave >= 4.x) and `PUBKEY_PROGRAM_AUTHORITY` /
+`PUBKEY_FAUCET` in the Doppler config.
 
 Without the janitor, what stays locked has no close instruction in the
 forked programs (or is a mint): pools, tick arrays, observation and bitmap
 accounts, venue configs, Manifest markets, pool/market vaults, the mints
 and their Metaplex metadata, and the 36-byte stubs of closed programs. With
-`SCENARIO_JANITOR=1 SCENARIO_CLOSE_PROGRAMS=1` only the vaults, the mints
-and their metadata, and the program stubs remain: 0.104 SOL on the base
-scenario (from 21.80), measured on a test validator on 2026-10-14. Measured on the x2000
+`SCENARIO_JANITOR=1 SCENARIO_CLOSE_PROGRAMS=1` only the mints (classic
+Token mints cannot be closed) with their metadata and the program stubs
+remain: 0.055 SOL on the base scenario (from 21.80), measured on a test
+validator on 2026-10-14. Measured on the x2000
 chain (33 086 participants, 3 tokens, 7 pools) on 2026-10-13:
 
 | recovered into the faucet                   | SOL       |
