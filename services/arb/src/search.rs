@@ -143,14 +143,20 @@ impl<'s> Searcher<'s> {
             .expect("cache lock")
             .clone_from(&snapshots);
         let prices = PriceBook::fetch(&self.oracle, self.scenario.config.max_price_age_ms).await?;
-        for bot in &self.bots {
-            let Some(best) = self.best_cycle(bot, &snapshots, &prices).await? else {
-                continue;
-            };
-            counter!("arb_opportunities_total", "bot" => bot.config.name.clone(), "legs" => best.hops.len().to_string(), "trigger" => trigger).increment(1);
-            self.execute(bot, &snapshots, &prices, best).await?;
-        }
-        Ok(())
+        // Bots race on the same snapshot, like independent searchers would:
+        // usually one lands and the rest revert on their profit floor.
+        let results = join_all(self.bots.iter().map(|bot| {
+            let (snapshots, prices) = (&snapshots, &prices);
+            async move {
+                let Some(best) = self.best_cycle(bot, snapshots, prices).await? else {
+                    return Ok(());
+                };
+                counter!("arb_opportunities_total", "bot" => bot.config.name.clone(), "legs" => best.hops.len().to_string(), "trigger" => trigger).increment(1);
+                self.execute(bot, snapshots, prices, best).await
+            }
+        }))
+        .await;
+        results.into_iter().collect::<Result<Vec<()>>>().map(drop)
     }
 
     /// Every 2- and 3-hop cycle from each start token, sized by ternary search.
@@ -298,7 +304,15 @@ impl<'s> Searcher<'s> {
             counter!("arb_trades_total", "bot" => bot.config.name.clone(), "status" => "simulation_failed").increment(1);
             return Ok(());
         }
-        let signature = self.chain.rpc().send_and_confirm_transaction(&tx).await?;
+        let signature = match self.chain.rpc().send_and_confirm_transaction(&tx).await {
+            Ok(signature) => signature,
+            Err(error) => {
+                // Lost the race (another searcher closed the gap first).
+                debug!(%error, route = ?route, "cycle transaction failed");
+                counter!("arb_trades_total", "bot" => bot.config.name.clone(), "status" => "reverted").increment(1);
+                return Ok(());
+            }
+        };
         let after = token_balance(&self.chain, &owner, start).await?;
         let realized = to_ui(start, after) - to_ui(start, before);
         let realized_usd = realized * prices.usd(start)?;
