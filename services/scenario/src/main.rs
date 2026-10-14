@@ -9,6 +9,7 @@
 //!
 //! `snapshot` and `report` account for every participant (see `pnl`).
 
+mod janitor;
 mod pnl;
 mod rpc;
 mod teardown;
@@ -107,6 +108,16 @@ enum Command {
         faucet_keypair_env: String,
         #[arg(long = "operator-env", default_values_t = OPERATOR_ENVS.map(String::from))]
         operator_envs: Vec<String>,
+    },
+    /// Close every account the DEX programs own, after the janitor program
+    /// was deployed over them; the rent goes to the signing authority.
+    Janitor {
+        /// The janitor binary deployed over the programs (checked on chain).
+        #[arg(long)]
+        janitor_so: PathBuf,
+        /// One of the authorities compiled into that binary.
+        #[arg(long, default_value = "KEYPAIR_FAUCET")]
+        authority_keypair_env: String,
     },
 }
 
@@ -218,6 +229,15 @@ async fn main() -> Result<()> {
                 Vec::new()
             };
             teardown::teardown(&chain, &rpc, &scenario, &faucet, operators).await?
+        }
+        Command::Janitor {
+            janitor_so,
+            authority_keypair_env,
+        } => {
+            let elf = std::fs::read(&janitor_so)
+                .with_context(|| format!("reading {}", janitor_so.display()))?;
+            let authority = keypair_from_environment(&authority_keypair_env)?;
+            janitor::run(&chain, &rpc, &scenario, &authority, &elf).await?
         }
         Command::Leftovers {
             faucet_keypair_env,

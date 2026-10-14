@@ -27,6 +27,10 @@
 #                                       DEX programs (rent to the faucet; pools become
 #                                       unusable). Operator wallets are swept too on
 #                                       local (SCENARIO_SWEEP_OPERATORS=0|1 overrides).
+#                                       SCENARIO_JANITOR=1 first upgrades the DEX programs
+#                                       to SCENARIO_JANITOR_SO and closes every account
+#                                       they own (pools, tick arrays, positions, markets),
+#                                       then restores the forks unless they are closed.
 #
 # Secrets come from the environment (normally `doppler run --`; see
 # bootstrap/scenario/README.md). Every step is idempotent, so `up` can be
@@ -213,6 +217,61 @@ program_exists() { # pubkey → 0 deployed, 1 absent; exits on an RPC error
   esac
 }
 
+artifacts() { # program keypair var:fork artifact, one per DEX (defaults: sibling fork checkouts)
+  printf '%s\n' \
+    "KEYPAIR_RAYDIUM_CLMM:${SCENARIO_RAYDIUM_SO:-../raydium-clmm/target/deploy/raydium_clmm.so}" \
+    "KEYPAIR_ORCA_WHIRLPOOL:${SCENARIO_ORCA_SO:-../whirlpools/target/deploy/whirlpool.so}" \
+    "KEYPAIR_MANIFEST:${SCENARIO_MANIFEST_SO:-../manifest/target/deploy/manifest.so}"
+}
+
+janitor() (
+  # Upgrade the three DEX programs to the janitor (programs/janitor, built
+  # with `just build-janitor`), close every account they own (rent to the
+  # faucet), then put the forks back unless the programs are being closed
+  # next: left as the janitor, a later `deploy` would skip them as
+  # "already deployed" and the scenario would run against the janitor.
+  so="${SCENARIO_JANITOR_SO:?set SCENARIO_JANITOR_SO to the janitor .so (just build-janitor)}"
+  umask 077
+  dir=""
+  trap '[[ -n "$dir" ]] && rm -rf "$dir"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [[ -d /dev/shm && -w /dev/shm ]]; then dir="$(mktemp -d /dev/shm/kp.XXXXXX)"; else dir="$(mktemp -d)"; fi
+  printf %s "${KEYPAIR_PROGRAM_AUTHORITY:?missing secret}" >"$dir/authority.json"
+  printf %s "${KEYPAIR_FAUCET:?missing secret}" >"$dir/faucet.json"
+  flags=()
+  [[ "$target" == local ]] && flags+=(--use-rpc)
+  upgrade() { # keypair var, artifact
+    printf %s "${!1:?missing secret: $1}" >"$dir/program.json"
+    solana program deploy -u "$rpc" "${flags[@]}" --program-id "$dir/program.json" \
+      --upgrade-authority "$dir/authority.json" --fee-payer "$dir/faucet.json" "$2" >&2 </dev/null
+  }
+  live=0
+  while IFS= read -r spec; do
+    key="$(pubkey_of "${spec%%:*}")"
+    if program_exists "$key" && ! program_closed "$key"; then live=$((live + 1)); fi
+  done < <(artifacts)
+  if [[ "$live" == 0 ]]; then echo "janitor: the DEX programs are already closed" >&2; exit 0; fi
+  [[ "$live" == 3 ]] || { echo "janitor: only $live of 3 DEX programs exist; refusing a partial run" >&2; exit 1; }
+  while IFS= read -r spec; do upgrade "${spec%%:*}" "$so"; done < <(artifacts)
+  "$bin/scenario" janitor --janitor-so "$so" | tee "$state/janitor.json"
+  if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" != 1 ]]; then
+    while IFS= read -r spec; do upgrade "${spec%%:*}" "${spec#*:}"; done < <(artifacts)
+    echo "janitor: forks restored with no accounts; Raydium cannot re-create its pools until" \
+      "its vaults (Token-program PDAs) are closed too: use a fresh chain for the next run" >&2
+  fi
+)
+
+program_closed() { # pubkey → 0 if it is an upgradeable program that was closed
+  # A closed program keeps its account (so program_exists says yes) but can
+  # never be deployed to or upgraded again.
+  # Captured, not piped into `grep -q`: under pipefail its early exit would
+  # SIGPIPE `solana` and fail the check even on a match.
+  local out
+  out="$(solana program show -u "$rpc" "$1" 2>&1 </dev/null || true)"
+  [[ "$out" == *"has been closed"* ]]
+}
+
 deploy() (
   # Deploys each fork artifact at its program keypair, skipping programs that
   # are already deployed. Paths default to sibling fork checkouts.
@@ -230,18 +289,18 @@ deploy() (
   printf %s "${KEYPAIR_FAUCET:?missing secret}" >"$dir/faucet.json"
   flags=()
   [[ "$target" == local ]] && flags+=(--use-rpc) # Surfpool has no TPU/QUIC
-  for spec in \
-    "KEYPAIR_RAYDIUM_CLMM:${SCENARIO_RAYDIUM_SO:-../raydium-clmm/target/deploy/raydium_clmm.so}" \
-    "KEYPAIR_ORCA_WHIRLPOOL:${SCENARIO_ORCA_SO:-../whirlpools/target/deploy/whirlpool.so}" \
-    "KEYPAIR_MANIFEST:${SCENARIO_MANIFEST_SO:-../manifest/target/deploy/manifest.so}"; do
+  while IFS= read -r spec; do
     var="${spec%%:*}" so="${spec#*:}"
     if program_exists "$(pubkey_of "$var")"; then
+      if program_closed "$(pubkey_of "$var")"; then
+        echo "$var was closed; closed program IDs cannot be reused: use a new keypair" >&2; exit 1
+      fi
       echo "$var already deployed"; continue
     fi
     printf %s "${!var:?missing secret: $var}" >"$dir/program.json"
     solana program deploy -u "$rpc" "${flags[@]}" --program-id "$dir/program.json" \
-      --upgrade-authority "$dir/authority.json" --fee-payer "$dir/faucet.json" "$so"
-  done
+      --upgrade-authority "$dir/authority.json" --fee-payer "$dir/faucet.json" "$so" </dev/null
+  done < <(artifacts)
 )
 
 observe() {
@@ -366,6 +425,8 @@ case "$cmd" in
       if [[ -f "$state/pids/$name" ]]; then stop "$name"; fi
     done
     "$bin/scenario" teardown | tee "$state/teardown.json"
+    # After the unwind (which needs the real DEX code), before any close.
+    if [[ "${SCENARIO_JANITOR:-0}" == 1 ]]; then janitor; fi
     if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" == 1 ]]; then (
       # Same key handling as deploy: tmpfs when available, removed on any exit.
       umask 077

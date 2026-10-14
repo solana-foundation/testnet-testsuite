@@ -318,22 +318,63 @@ the scale `up` recorded unless `SCENARIO_SCALE` names it:
    the faucet, and the remaining SOL follows, leaving each wallet at 0.
    Token accounts holding anything else (e.g. a position NFT whose close
    failed) are left open and listed instead of burned;
-4. with `SCENARIO_CLOSE_PROGRAMS=1`, closes the three DEX programs
-   (programdata rent to the faucet; the pools stop working);
-5. sweeps the operator wallets (program / mint / freeze / metadata
+4. with `SCENARIO_JANITOR=1`, closes every account the DEX programs own
+   (pools, tick arrays, positions, observation and bitmap accounts, venue
+   configs, Manifest markets) with the janitor (below);
+5. with `SCENARIO_CLOSE_PROGRAMS=1`, closes the three DEX programs
+   (programdata rent to the faucet; the pools stop working, and closed
+   program IDs can never be deployed to again: `deploy` refuses them);
+6. sweeps the operator wallets (program / mint / freeze / metadata
    authorities) into the faucet: by default on `local`, opt-in on testnet
    (`SCENARIO_SWEEP_OPERATORS=1`), where those keys are shared;
-6. writes `.scenario/teardown.json` (what moved) and
+7. writes `.scenario/teardown.json` (what moved) and
    `.scenario/leftovers.json` (`scenario leftovers`: the rent still locked,
    by owner program and account type).
 
 Every step is idempotent, so a teardown can be re-run after a partial
 failure; `scenario leftovers` can also be run on its own at any time.
 
-What stays locked has no close instruction in the forked programs (or is a
-mint): pools, tick arrays, observation and bitmap accounts, venue configs,
-Manifest markets, pool/market vaults, the mints and their Metaplex
-metadata, and the 36-byte stubs of closed programs. Measured on the x2000
+### The janitor (`programs/janitor`)
+
+The forked DEX programs have no instruction that closes pools, tick
+arrays or markets, but they own those accounts, and whatever code runs at a
+program ID can close what that ID owns. The janitor is a small Pinocchio
+program with one permissioned instruction, `Close`: the signer must be one
+of the authorities compiled into the binary (the program authority and the
+faucet of the Doppler config it was built for), every target must be
+writable, owned by the program ID it runs at and not executable, and each
+target's lamports go to the signer before the account is closed. Anything
+else fails the whole instruction.
+
+```sh
+just build-janitor dev        # target/janitor/dev/janitor.so, dev authorities baked in
+just test-janitor             # LiteSVM tests against a build with test-only authorities
+SCENARIO_JANITOR=1 SCENARIO_CLOSE_PROGRAMS=1 \
+  SCENARIO_JANITOR_SO=target/janitor/dev/janitor.so just scenario-teardown-dev
+```
+
+`teardown` upgrades each DEX program to the janitor (after the participant
+unwind, which still needs the real code), runs `scenario janitor` (which
+refuses to send anything unless every program's on-chain code is
+byte-for-byte that `.so`: a close sent to a real DEX program would be read
+as one of its own instructions), then either closes the programs
+(`SCENARIO_CLOSE_PROGRAMS=1`) or upgrades the forks back. Building needs
+the Agave platform tools (`cargo-build-sbf`, Agave >= 4.x) and
+`PUBKEY_PROGRAM_AUTHORITY` / `PUBKEY_FAUCET` in the Doppler config.
+
+Without closing the programs, the restored forks start from an empty
+state, and Raydium cannot re-create its pools: its token vaults are PDAs
+of the pool address, owned by the Token program (so the janitor cannot
+close them yet), and the re-created pool collides with them. Use a fresh
+chain, or close the programs, until a vault-closing instruction exists.
+
+Without the janitor, what stays locked has no close instruction in the
+forked programs (or is a mint): pools, tick arrays, observation and bitmap
+accounts, venue configs, Manifest markets, pool/market vaults, the mints
+and their Metaplex metadata, and the 36-byte stubs of closed programs. With
+`SCENARIO_JANITOR=1 SCENARIO_CLOSE_PROGRAMS=1` only the vaults, the mints
+and their metadata, and the program stubs remain: 0.104 SOL on the base
+scenario (from 21.80), measured on a test validator on 2026-10-14. Measured on the x2000
 chain (33 086 participants, 3 tokens, 7 pools) on 2026-10-13:
 
 | recovered into the faucet                   | SOL       |
