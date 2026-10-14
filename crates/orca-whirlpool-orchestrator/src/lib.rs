@@ -21,7 +21,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use thiserror::Error;
-use tracing::{info, info_span};
+use tracing::{Instrument, info, info_span};
 
 pub type Result<T> = std::result::Result<T, OrchestrationError>;
 
@@ -243,8 +243,9 @@ impl OrcaWhirlpoolOrchestrator {
             mint_b = %params.mint_b,
             payer = %self.payer(),
         );
-        let _entered = span.enter();
-
+        // `.instrument` rather than `span.enter()`: an entered guard held across
+        // `.await` attributes other tasks' events to this span.
+        async {
         self.validate_program().await?;
         let create_pool = self
             .client
@@ -271,6 +272,9 @@ impl OrcaWhirlpoolOrchestrator {
             create_pool,
             tick_arrays,
         })
+        }
+        .instrument(span)
+        .await
     }
 
     /// Fund the user, exercise an existing pool, then withdraw, collect, and
@@ -284,86 +288,88 @@ impl OrcaWhirlpoolOrchestrator {
             mint_b = %params.mint_b,
             payer = %self.payer(),
         );
-        let _entered = span.enter();
-
-        self.validate_program().await?;
-        let funding = self
-            .fund_payer(
+        async {
+            self.validate_program().await?;
+            let funding = self
+                .fund_payer(
+                    params.mint_a,
+                    params.funding_a,
+                    params.mint_b,
+                    params.funding_b,
+                )
+                .await?;
+            let (lower_price, upper_price) = normalized_range(
                 params.mint_a,
-                params.funding_a,
                 params.mint_b,
-                params.funding_b,
-            )
-            .await?;
-        let (lower_price, upper_price) = normalized_range(
-            params.mint_a,
-            params.mint_b,
-            params.lower_price,
-            params.upper_price,
-        )?;
-        let open_position = self
-            .client
-            .open_position(OpenPositionParams {
-                pool: params.pool,
-                lower_price,
-                upper_price,
-                input: TokenAmount {
-                    mint: params.mint_a,
-                    amount: params.open_amount,
-                },
-                with_metadata: params.with_metadata,
-            })
-            .await?;
-        let position_mint = open_position.accounts.position_mint;
-        let increase_liquidity = self
-            .client
-            .increase_liquidity(IncreaseLiquidityParams {
-                position_mint,
-                input: TokenAmount {
-                    mint: params.mint_a,
-                    amount: params.increase_amount,
-                },
-            })
-            .await?;
-        let swap_exact_in = self
-            .client
-            .swap_exact_in(SwapExactInParams {
-                pool: params.pool,
-                input_mint: params.mint_a,
-                output_mint: params.mint_b,
-                amount_in: params.exact_in_amount,
-            })
-            .await?;
-        let swap_exact_out = self
-            .client
-            .swap_exact_out(SwapExactOutParams {
-                pool: params.pool,
-                input_mint: params.mint_b,
-                output_mint: params.mint_a,
-                amount_out: params.exact_out_amount,
-            })
-            .await?;
-        let decrease_liquidity = self
-            .client
-            .decrease_liquidity(DecreaseLiquidityParams {
-                position_mint,
-                amount: None,
-            })
-            .await?;
-        let collect_position = self.client.collect_position(position_mint).await?;
-        let close_position = self.client.close_position(position_mint).await?;
+                params.lower_price,
+                params.upper_price,
+            )?;
+            let open_position = self
+                .client
+                .open_position(OpenPositionParams {
+                    pool: params.pool,
+                    lower_price,
+                    upper_price,
+                    input: TokenAmount {
+                        mint: params.mint_a,
+                        amount: params.open_amount,
+                    },
+                    with_metadata: params.with_metadata,
+                })
+                .await?;
+            let position_mint = open_position.accounts.position_mint;
+            let increase_liquidity = self
+                .client
+                .increase_liquidity(IncreaseLiquidityParams {
+                    position_mint,
+                    input: TokenAmount {
+                        mint: params.mint_a,
+                        amount: params.increase_amount,
+                    },
+                })
+                .await?;
+            let swap_exact_in = self
+                .client
+                .swap_exact_in(SwapExactInParams {
+                    pool: params.pool,
+                    input_mint: params.mint_a,
+                    output_mint: params.mint_b,
+                    amount_in: params.exact_in_amount,
+                })
+                .await?;
+            let swap_exact_out = self
+                .client
+                .swap_exact_out(SwapExactOutParams {
+                    pool: params.pool,
+                    input_mint: params.mint_b,
+                    output_mint: params.mint_a,
+                    amount_out: params.exact_out_amount,
+                })
+                .await?;
+            let decrease_liquidity = self
+                .client
+                .decrease_liquidity(DecreaseLiquidityParams {
+                    position_mint,
+                    amount: None,
+                })
+                .await?;
+            let collect_position = self.client.collect_position(position_mint).await?;
+            let close_position = self.client.close_position(position_mint).await?;
 
-        info!(pool = %params.pool, %position_mint, "Orca Whirlpool user flow complete");
-        Ok(UserFlowOutcome {
-            funding,
-            open_position,
-            increase_liquidity,
-            swap_exact_in,
-            swap_exact_out,
-            decrease_liquidity,
-            collect_position,
-            close_position,
-        })
+            info!(pool = %params.pool, %position_mint, "Orca Whirlpool user flow complete");
+            Ok(UserFlowOutcome {
+                funding,
+                open_position,
+                increase_liquidity,
+                swap_exact_in,
+                swap_exact_out,
+                decrease_liquidity,
+                collect_position,
+                close_position,
+            })
+        }
+        .instrument(span)
+        .await
     }
 
     pub async fn fund_payer(
