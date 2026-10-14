@@ -95,6 +95,16 @@ async fn main() -> Result<()> {
             None
         }
     };
+    // Every swap series at zero: `increase()` misses the first increment
+    // of a series that appears mid-window.
+    for (a, b) in &flow.pairs {
+        for size in ["normal", "large"] {
+            for outcome in Outcome::ALL {
+                counter!("flow_swaps_total", "pair" => format!("{a}/{b}"), "status" => outcome.status(), "outcome" => outcome.as_str(), "size" => size)
+                    .absolute(0);
+            }
+        }
+    }
     let takers: Vec<Keypair> = (0..flow.takers).map(|i| scenario.taker_wallet(i)).collect();
     anyhow::ensure!(!takers.is_empty(), "the flow needs at least one taker");
     // Takers are sharded over OS threads, each with its own single-threaded
@@ -235,6 +245,27 @@ enum Outcome {
 }
 
 impl Outcome {
+    const ALL: [Self; 10] = [
+        Self::Landed,
+        Self::Unaffordable,
+        Self::NoPrice,
+        Self::QuoteFailed,
+        Self::PreflightRejected,
+        Self::SendFailed,
+        Self::LandedFailed,
+        Self::Expired,
+        Self::RpcAmbiguous,
+        Self::Error,
+    ];
+
+    fn status(self) -> &'static str {
+        if self == Self::Landed {
+            "landed"
+        } else {
+            "failed"
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Landed => "landed",
@@ -352,8 +383,8 @@ impl Flow<'_> {
             };
             let label = format!("{}/{}", pair.0, pair.1);
             let size_label = if large { "large" } else { "normal" };
-            let (status, outcome) = match self.trade(taker, &trade).await {
-                Ok(()) => ("landed", Outcome::Landed),
+            let outcome = match self.trade(taker, &trade).await {
+                Ok(()) => Outcome::Landed,
                 Err(TradeError { outcome, error }) => {
                     // Routine market outcomes are metrics, not log lines: at
                     // high rates a warn per failed trade floods the logs.
@@ -362,14 +393,14 @@ impl Flow<'_> {
                     } else {
                         debug!(taker = index, %label, outcome = outcome.as_str(), error = %format!("{error:#}"), "trade failed");
                     }
-                    ("failed", outcome)
+                    outcome
                 }
             };
             self.tally.add(outcome.as_str());
             counter!(
                 "flow_swaps_total",
                 "pair" => label,
-                "status" => status,
+                "status" => outcome.status(),
                 "outcome" => outcome.as_str(),
                 "size" => size_label
             )
