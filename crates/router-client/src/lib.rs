@@ -37,7 +37,9 @@ pub struct QuoteRequest {
     pub slippage_bps: u16,
     #[serde(default)]
     pub execution: Execution,
-    /// when present, the response includes an unsigned transaction for this payer
+    /// when present, the response includes an unsigned transaction for this
+    /// payer. Without it the route is not fitted to one transaction, so a
+    /// split it shows may be narrowed when quoted again with a `user`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
@@ -57,6 +59,7 @@ pub struct RouteLeg {
     pub out_amount: u64,
     /// fees charged by the venue, in input atoms
     pub fee_amount: u64,
+    /// not computed yet: always 0
     pub price_impact_bps: u32,
     /// compute units this leg's swap is expected to consume
     pub cu_estimate: u32,
@@ -74,9 +77,11 @@ pub struct QuoteResponse {
     /// that predate the field)
     #[serde(default)]
     pub max_in_amount: u64,
+    /// not computed yet: always 0
     pub price_impact_bps: u32,
     pub route: Vec<RouteLeg>,
-    /// oldest state slot among quoted venues
+    /// slot the router observed when it planned the quote; pool snapshots
+    /// can be up to the router's `snapshot_ttl_ms` older than this
     pub state_slot: u64,
     /// compute units the route is expected to consume: the legs' estimates
     /// plus aggregator overhead for `jupiter` execution (no margin)
