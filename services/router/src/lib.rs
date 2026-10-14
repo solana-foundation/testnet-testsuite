@@ -10,10 +10,10 @@ pub mod config;
 pub mod engine;
 pub mod registry;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use config::AppConfig;
@@ -27,6 +27,7 @@ use tracing::{info, warn};
 
 pub struct AppState {
     pub registry: Arc<Registry>,
+    pub snapshots: SnapshotCache,
     pub chain: ChainClient,
     pub cfg: config::RouterConfig,
     pub bridge_mints: Vec<Pubkey>,
@@ -74,6 +75,7 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
         .transpose()?;
     let state = Arc::new(AppState {
         registry,
+        snapshots: SnapshotCache::new(Duration::from_millis(cfg.router.snapshot_ttl_ms)),
         chain,
         jupiter_overhead_cu: cfg.router.jupiter.overhead_cu,
         cfg: cfg.router.clone(),
@@ -111,7 +113,7 @@ pub async fn load_book(
     }
     let loads = entries
         .iter()
-        .map(|entry| PoolSnapshot::load(&state.chain, entry.kind, entry.program_id, entry.pool));
+        .map(|entry| state.snapshots.load(&state.chain, entry));
     let mut sources = Vec::new();
     for (entry, loaded) in entries.iter().zip(join_all(loads).await) {
         match loaded {
@@ -120,6 +122,58 @@ pub async fn load_book(
         }
     }
     Ok((Book::new(sources), state_slot))
+}
+
+type SharedSnapshot = Arc<tokio::sync::OnceCell<Result<PoolSnapshot, String>>>;
+
+/// Short-lived pool snapshots shared by concurrent quotes: within `ttl` each
+/// pool is loaded once (single flight) and every quote reuses that load.
+pub struct SnapshotCache {
+    ttl: Duration,
+    entries: tokio::sync::Mutex<HashMap<Pubkey, (Instant, SharedSnapshot)>>,
+}
+
+impl SnapshotCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn load(
+        &self,
+        chain: &ChainClient,
+        entry: &registry::Entry,
+    ) -> Result<PoolSnapshot, String> {
+        let fetch = || async {
+            PoolSnapshot::load(chain, entry.kind, entry.program_id, entry.pool)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        if self.ttl.is_zero() {
+            return fetch().await;
+        }
+        let cell = {
+            let mut entries = self.entries.lock().await;
+            let now = Instant::now();
+            match entries.get(&entry.pool) {
+                Some((loaded_at, cell)) if now.duration_since(*loaded_at) < self.ttl => {
+                    metrics::counter!("router_snapshot_cache_total", "result" => "hit")
+                        .increment(1);
+                    Arc::clone(cell)
+                }
+                _ => {
+                    metrics::counter!("router_snapshot_cache_total", "result" => "miss")
+                        .increment(1);
+                    let cell = SharedSnapshot::default();
+                    entries.insert(entry.pool, (now, Arc::clone(&cell)));
+                    cell
+                }
+            }
+        };
+        cell.get_or_init(fetch).await.clone()
+    }
 }
 
 async fn shutdown_signal() {

@@ -4,7 +4,8 @@
 //! Discovery sweeps each venue program with `getProgramAccounts` filtered by
 //! account discriminator. A discovered pool is loaded through its venue
 //! client (owner, layout, PDA, vault, and mint checks) and then probed: both
-//! directions must quote `probe_amount` input atoms. Pools that fail stay
+//! directions must quote `probe_amount` input atoms (escalated ×1000 up to
+//! three times for tokens where that rounds to nothing). Pools that fail stay
 //! `Quarantined` (listed, never routed) and are re-vetted every sweep, so
 //! transient failures such as an empty book heal on their own.
 
@@ -212,8 +213,17 @@ async fn vet(
         }
     };
     let (a, b) = snapshot.mints();
-    let functional = snapshot.quote(a, b, probe_amount, true, 0).is_ok()
-        && snapshot.quote(b, a, probe_amount, true, 0).is_ok();
+    // `probe_amount` atoms can be worth nothing for high-decimal or very
+    // cheap tokens (the output rounds to zero), so each direction may
+    // escalate by ×1000 up to 10^9 × the base probe.
+    let quotes = |input, output| {
+        (0..4).any(|step| {
+            probe_amount
+                .checked_mul(1_000_u64.pow(step))
+                .is_some_and(|amount| snapshot.quote(input, output, amount, true, 0).is_ok())
+        })
+    };
+    let functional = quotes(a, b) && quotes(b, a);
     let tier = if functional {
         Tier::Verified
     } else {
