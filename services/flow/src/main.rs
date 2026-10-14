@@ -82,15 +82,53 @@ async fn main() -> Result<()> {
         }
     };
     let takers: Vec<Keypair> = (0..flow.takers).map(|i| scenario.taker_wallet(i)).collect();
-    let engine = Flow {
-        router: RouterClient::new(&scenario.config.router_url),
-        oracle: OracleClient::new(&scenario.config.oracle_url),
-        chain,
-        scenario: &scenario,
-        flow: &flow,
-        refill,
-    };
-    engine.run(&takers).await
+    anyhow::ensure!(!takers.is_empty(), "the flow needs at least one taker");
+    // Takers are sharded over OS threads, each with its own single-threaded
+    // runtime and clients: one join_all over thousands of takers would run
+    // them all on one core (and the signer types are not Send, so they
+    // cannot be spawned onto the multi-threaded runtime instead).
+    let shards = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(takers.len());
+    info!(
+        takers = takers.len(),
+        shards,
+        rate_per_min = flow.rate_per_min,
+        "flow started"
+    );
+    let rpc = &cfg.rpc;
+    let (scenario, flow, takers) = (&scenario, &flow, &takers);
+    tokio::task::block_in_place(|| {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..shards)
+                .map(|shard| {
+                    let refill = refill.clone();
+                    scope.spawn(move || -> Result<()> {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        runtime.block_on(async {
+                            let engine = Flow {
+                                router: RouterClient::new(&scenario.config.router_url),
+                                oracle: OracleClient::new(&scenario.config.oracle_url),
+                                chain: ChainClient::new(&rpc.http_url, &rpc.commitment)?,
+                                scenario,
+                                flow,
+                                refill,
+                            };
+                            engine.run(takers, shard, shards).await
+                        })
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("flow shard panicked"))??;
+            }
+            Ok(())
+        })
+    })
 }
 
 struct Flow<'a> {
@@ -116,17 +154,13 @@ struct Trade<'t> {
 impl Flow<'_> {
     /// Every taker is an independent Poisson process at `rate / takers`
     /// with its own seeded RNG, so slow trades never delay other arrivals and
-    /// each taker's trade sequence still replays.
-    async fn run(&self, takers: &[Keypair]) -> Result<()> {
-        anyhow::ensure!(!takers.is_empty(), "the flow needs at least one taker");
-        info!(
-            takers = takers.len(),
-            rate_per_min = self.flow.rate_per_min,
-            "flow started"
-        );
+    /// each taker's trade sequence still replays. This shard runs every
+    /// `shards`-th taker.
+    async fn run(&self, takers: &[Keypair], shard: usize, shards: usize) -> Result<()> {
         let loops = takers
             .iter()
             .enumerate()
+            .filter(|(index, _)| index % shards == shard)
             .map(|(index, taker)| self.taker_loop(index, taker, takers.len()));
         for result in futures::future::join_all(loops).await {
             result?;
