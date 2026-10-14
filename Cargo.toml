@@ -49,6 +49,8 @@ router-client = { path = "crates/router-client" }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net"] }
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["timeout"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "http2", "rustls", "webpki-roots"] }
 # both ring (tungstenite) and aws-lc-rs (reqwest) end up compiled in — a
 # process-default CryptoProvider must be installed at startup or rustls panics

@@ -62,6 +62,32 @@ pub trait QuoteSource: Clone {
     ) -> Option<(Self::Quote, Amounts)>;
 }
 
+/// A shared source quotes like the source itself; the book and every
+/// candidate leg then hold a reference instead of a deep copy (a CLMM
+/// snapshot carries its tick arrays, up to ~0.5 MB).
+impl<T: QuoteSource> QuoteSource for std::sync::Arc<T> {
+    type Quote = T::Quote;
+
+    fn pool(&self) -> Pubkey {
+        (**self).pool()
+    }
+
+    fn venue(&self) -> &'static str {
+        (**self).venue()
+    }
+
+    fn quote(
+        &self,
+        input: &Pubkey,
+        output: &Pubkey,
+        amount: u64,
+        exact_in: bool,
+        slippage_bps: u16,
+    ) -> Option<(Self::Quote, Amounts)> {
+        (**self).quote(input, output, amount, exact_in, slippage_bps)
+    }
+}
+
 impl QuoteSource for mtm_venues::PoolSnapshot {
     type Quote = mtm_venues::LegQuote;
 
@@ -145,7 +171,9 @@ impl Request {
         let output_mint = Pubkey::from_str(&req.output_mint)
             .map_err(|_| EngineError::BadAddress(req.output_mint.clone()))?;
         if input_mint == output_mint {
-            return Err(EngineError::NoRoute);
+            return Err(EngineError::Unsupported(
+                "input_mint and output_mint are the same".to_owned(),
+            ));
         }
         Ok(Self {
             input_mint,
@@ -410,6 +438,10 @@ fn build_response<S: QuoteSource>(
         .first()
         .map(|segment| segment.legs.iter().map(|leg| leg.amounts.in_amount).sum())
         .unwrap_or(0);
+    let max_in_amount = segments
+        .first()
+        .map(|segment| segment.legs.iter().map(|leg| leg.amounts.max_in).sum())
+        .unwrap_or(0);
     let route = segments
         .iter()
         .flat_map(|segment| {
@@ -431,6 +463,7 @@ fn build_response<S: QuoteSource>(
         in_amount,
         out_amount: route_out(segments),
         min_out_amount: route_min_out(segments, request.execution, request.slippage_bps),
+        max_in_amount,
         price_impact_bps: 0,
         route,
         state_slot,

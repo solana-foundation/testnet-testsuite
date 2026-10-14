@@ -14,7 +14,7 @@ use std::collections::HashSet;
 
 use anyhow::Context;
 use base64::Engine;
-use mtm_venues::{PoolSnapshot, jupiter};
+use mtm_venues::jupiter;
 use router_client::Execution;
 use solana_hash::Hash;
 use solana_instruction::Instruction;
@@ -46,7 +46,7 @@ pub fn route_instructions(
     user: &Pubkey,
     execution: Execution,
     slippage_bps: u16,
-    segments: &[Segment<PoolSnapshot>],
+    segments: &[Segment<crate::Snapshot>],
 ) -> anyhow::Result<Assembled> {
     match execution {
         Execution::Direct => direct_instructions(user, segments),
@@ -56,7 +56,7 @@ pub fn route_instructions(
 
 fn direct_instructions(
     user: &Pubkey,
-    segments: &[Segment<PoolSnapshot>],
+    segments: &[Segment<crate::Snapshot>],
 ) -> anyhow::Result<Assembled> {
     let mut seen_atas = HashSet::new();
     let mut instructions = Vec::new();
@@ -88,11 +88,11 @@ fn jupiter_instructions(
     state: &AppState,
     user: &Pubkey,
     slippage_bps: u16,
-    segments: &[Segment<PoolSnapshot>],
+    segments: &[Segment<crate::Snapshot>],
 ) -> anyhow::Result<Assembled> {
-    let program_id = state
-        .jupiter_program
-        .context("execution = jupiter requires [router.jupiter] program_id")?;
+    let program_id = state.jupiter_program.ok_or_else(|| {
+        AssemblyFault::Config("execution = jupiter requires [router.jupiter] program_id".to_owned())
+    })?;
     let first = segments.first().context("empty route")?;
     let last = segments.last().context("empty route")?;
     let first_leg = first.legs.first().context("empty segment")?;
@@ -219,6 +219,16 @@ pub enum RouteTooLarge {
     Instructions(usize),
 }
 
+/// Assembly failed for a reason outside the route itself: callers map an RPC
+/// failure to 502 and router configuration to 400 (a bad route is 422).
+#[derive(Debug, thiserror::Error)]
+pub enum AssemblyFault {
+    #[error("RPC request failed: {0}")]
+    Rpc(String),
+    #[error("{0}")]
+    Config(String),
+}
+
 pub fn is_oversized(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RouteTooLarge>().is_some()
 }
@@ -313,7 +323,7 @@ pub async fn route_tx(
         .rpc()
         .get_latest_blockhash()
         .await
-        .context("fetching blockhash")?;
+        .map_err(|error| AssemblyFault::Rpc(format!("fetching blockhash: {error}")))?;
     let tx = compile_v1(
         user,
         &assembled.instructions,
