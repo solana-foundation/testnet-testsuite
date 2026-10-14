@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
             } else {
                 Vec::new()
             };
-            teardown::teardown(&chain, &scenario, &faucet, operators).await?
+            teardown::teardown(&chain, &rpc, &scenario, &faucet, operators).await?
         }
         Command::Leftovers {
             faucet_keypair_env,
@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
                     .into_iter()
                     .map(|(env, key)| (env, key.pubkey())),
             );
-            teardown::leftovers(&chain, &scenario, &keys).await?
+            teardown::leftovers(&chain, &rpc, &scenario, &keys).await?
         }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
