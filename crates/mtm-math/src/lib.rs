@@ -154,6 +154,8 @@ impl FromStr for Price {
 }
 
 /// Mantissa on the wire: serialize as decimal string, accept string or integer.
+pub mod clmm;
+
 mod mantissa_serde {
     use std::fmt;
 
