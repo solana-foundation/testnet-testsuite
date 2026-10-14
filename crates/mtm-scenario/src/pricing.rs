@@ -21,9 +21,15 @@ impl PriceBook {
         let prices = points
             .iter()
             .filter_map(|point| {
+                // Freshness is the age of the upstream observation: the
+                // oracle restamps `received_at_us` whenever it re-serves a
+                // price, so a halted feed would look fresh by that clock.
                 Some((
                     point.symbol.as_str().to_owned(),
-                    (mid(point)?, point.received_at_us),
+                    (
+                        mid(point)?,
+                        point.publish_time_us.unwrap_or(point.received_at_us),
+                    ),
                 ))
             })
             .collect();
@@ -37,11 +43,11 @@ impl PriceBook {
 
     /// USD price of `token`; errors when missing or stale.
     pub fn usd(&self, token: &Token) -> Result<Decimal> {
-        let (price, received_at_us) = self
+        let (price, observed_at_us) = self
             .prices
             .get(&token.oracle_symbol)
             .with_context(|| format!("oracle has no price for {}", token.oracle_symbol))?;
-        let age = mtm_common::time::now_us().saturating_sub(*received_at_us);
+        let age = mtm_common::time::now_us().saturating_sub(*observed_at_us);
         if age > self.max_age_us {
             bail!(
                 "oracle price for {} is {} ms old",

@@ -28,7 +28,7 @@ pub fn ui_price(base: &Token, quote: &Token, base_atoms: u64, quote_atoms: u64) 
     }
     let ratio = Decimal::from(quote_atoms).checked_div(Decimal::from(base_atoms))?;
     let shift = i32::from(base.decimals) - i32::from(quote.decimals);
-    let scale = Decimal::from_i128_with_scale(10_i128.pow(shift.unsigned_abs()), 0);
+    let scale = Decimal::from_i128_with_scale(10_i128.checked_pow(shift.unsigned_abs())?, 0);
     if shift >= 0 {
         ratio.checked_mul(scale)
     } else {
@@ -38,15 +38,33 @@ pub fn ui_price(base: &Token, quote: &Token, base_atoms: u64, quote_atoms: u64) 
 
 /// Probe size: 1/1000 of one UI unit, at least one atom.
 fn probe(token: &Token) -> u64 {
-    (10_u64.pow(u32::from(token.decimals)) / 1_000).max(1)
+    10_u64
+        .checked_pow(u32::from(token.decimals))
+        .map_or(u64::MAX, |unit| unit / 1_000)
+        .max(1)
 }
 
-/// Mid of the best sell and buy prices for a tiny size.
-pub fn spot_price(snapshot: &PoolSnapshot, base: &Token, quote: &Token) -> Option<Decimal> {
-    let base_probe = probe(base);
+/// Mid of the best sell and buy prices for a small size: both probes are
+/// worth about one quote unit at `reference` (quote per base, e.g. the
+/// oracle). A fixed 1/1000 of a token quotes to zero for cheap bases and to
+/// a few atoms for expensive ones, so the mid fell back to one fee-laden
+/// side or was quantized by tens of percent.
+pub fn spot_price(
+    snapshot: &PoolSnapshot,
+    base: &Token,
+    quote: &Token,
+    reference: Decimal,
+) -> Option<Decimal> {
+    let base_probe = Decimal::ONE
+        .checked_div(reference)
+        .and_then(|amount| to_atoms(base, amount))
+        .filter(|atoms| *atoms > 0)
+        .unwrap_or_else(|| probe(base));
+    let quote_probe = to_atoms(quote, Decimal::ONE)
+        .filter(|atoms| *atoms > 0)
+        .unwrap_or_else(|| probe(quote));
     let sell = out(snapshot, base, quote, base_probe)
         .and_then(|quote_out| ui_price(base, quote, base_probe, quote_out));
-    let quote_probe = probe(quote);
     let buy = out(snapshot, quote, base, quote_probe)
         .and_then(|base_out| ui_price(base, quote, base_out, quote_probe));
     match (sell, buy) {
@@ -126,13 +144,15 @@ pub fn size_to_target(
 
 /// UI amount → atoms (floor).
 pub fn to_atoms(token: &Token, amount: Decimal) -> Option<u64> {
-    let scale = Decimal::from_u64(10_u64.pow(u32::from(token.decimals)))?;
+    let scale = Decimal::from_u64(10_u64.checked_pow(u32::from(token.decimals))?)?;
     amount.checked_mul(scale)?.floor().to_u64()
 }
 
 /// Atoms → UI amount.
 pub fn to_ui(token: &Token, atoms: u64) -> Decimal {
-    Decimal::from(atoms) / Decimal::from(10_u64.pow(u32::from(token.decimals)))
+    // Decimal keeps up to 28 fractional digits; mint decimals above that are
+    // not representable and are clamped.
+    Decimal::from_i128_with_scale(i128::from(atoms), u32::from(token.decimals).min(28)).normalize()
 }
 
 /// Execute a quoted leg as one top-level venue swap signed by `owner`.
@@ -141,6 +161,7 @@ pub async fn execute(
     owner: &(dyn Signer + Send + Sync),
     snapshot: &PoolSnapshot,
     quote: &LegQuote,
+    priority_fee_micro_lamports: u64,
 ) -> Result<SubmissionOutcome> {
     let instructions = snapshot
         .swap_instructions(owner.pubkey(), quote)
@@ -152,6 +173,7 @@ pub async fn execute(
             &[],
             SubmissionConfig {
                 compute_unit_limit: quote.cu_estimate.saturating_add(50_000),
+                compute_unit_price_micro_lamports: priority_fee_micro_lamports,
                 ..SubmissionConfig::default()
             },
         )
