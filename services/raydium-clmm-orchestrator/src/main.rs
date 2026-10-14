@@ -24,9 +24,9 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
-
-const TOKEN_AMOUNT: core::ops::Range<usize> = 64..72;
-const MINT_DECIMALS: usize = 44;
+use spl_token_2022::extension::transfer_fee::TransferFeeAmount;
+use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
+use spl_token_2022::state::{Account as TokenAccount, Mint};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Commitment {
@@ -333,6 +333,10 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
         funded_users.push((pool, user, recovery_path, startup_funding));
     }
     let mut runs = Vec::new();
+    // Every funded user is run and reclaimed even after a failure: stopping at
+    // the first error would strand the SOL already sent to the later users.
+    let mut failures = Vec::new();
+    let total = funded_users.len();
     for (pool, user, recovery_path, startup_funding) in funded_users {
         let user_pubkey = user.pubkey();
         let orchestrator = RaydiumClmmOrchestrator::new(
@@ -374,25 +378,49 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
         if let Err(error) = &flow {
             tracing::error!(pool = %pool.pool, user = %user_pubkey, error = %error, "ephemeral user flow failed");
         }
-        let outcome = flow.context("run Raydium CLMM user flow")?;
-        let (token_returns, lamports_returned, lamport_return) =
-            recovery.context("return ephemeral user funds to KEYPAIR_FAUCET")?;
-        fs::remove_file(&recovery_path)
-            .with_context(|| format!("remove recovered keypair {}", recovery_path.display()))?;
-        runs.push(UserFlowRun {
-            pool,
-            user: user_pubkey,
-            startup_funding,
-            outcome,
-            token_returns,
-            lamports_returned,
-            lamport_return,
-        });
+        if recovery.is_ok()
+            && let Err(error) = fs::remove_file(&recovery_path)
+        {
+            tracing::warn!(path = %recovery_path.display(), %error, "failed to remove recovered keypair");
+        }
+        match (flow, recovery) {
+            (Ok(outcome), Ok((token_returns, lamports_returned, lamport_return))) => {
+                runs.push(UserFlowRun {
+                    pool,
+                    user: user_pubkey,
+                    startup_funding,
+                    outcome,
+                    token_returns,
+                    lamports_returned,
+                    lamport_return,
+                });
+            }
+            (flow, recovery) => {
+                let reason = match (flow.err(), recovery.err()) {
+                    (Some(flow), Some(recovery)) => {
+                        format!("flow: {flow:#}; recovery (keypair retained): {recovery:#}")
+                    }
+                    (Some(flow), None) => format!("flow: {flow:#}"),
+                    (None, Some(recovery)) => {
+                        format!("recovery (keypair retained): {recovery:#}")
+                    }
+                    (None, None) => unreachable!("both succeeded in the arm above"),
+                };
+                failures.push(format!("pool {} user {user_pubkey}: {reason}", pool.pool));
+            }
+        }
     }
     println!(
         "{}",
         serde_json::to_string_pretty(&runs.iter().map(user_flow_run_json).collect::<Vec<_>>())?
     );
+    if !failures.is_empty() {
+        bail!(
+            "{} of {total} Raydium CLMM user flows failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
     Ok(())
 }
 
@@ -474,12 +502,19 @@ async fn return_token_balance(
     else {
         return Ok(None);
     };
-    let amount = token_account_amount(&source_account.data, source)?;
+    let source_state = StateWithExtensions::<TokenAccount>::unpack(&source_account.data)
+        .with_context(|| format!("decode ephemeral user token account {source}"))?;
+    let amount = source_state.base.amount;
+    // Token-2022 refuses to close an account still holding withheld transfer
+    // fees; return the balance and leave that account open.
+    let withheld = source_state
+        .get_extension::<TransferFeeAmount>()
+        .map_or(0, |fees| u64::from(fees.withheld_amount));
     let destination = associated_token_address(faucet.pubkey(), mint, token_program)?;
-    let decimals = *mint_account
-        .data
-        .get(MINT_DECIMALS)
-        .with_context(|| format!("mint {mint} is too short to contain decimals"))?;
+    let decimals = StateWithExtensions::<Mint>::unpack(&mint_account.data)
+        .with_context(|| format!("decode mint {mint}"))?
+        .base
+        .decimals;
     let mut instructions = vec![create_ata_instruction(
         faucet.pubkey(),
         faucet.pubkey(),
@@ -500,12 +535,16 @@ async fn return_token_balance(
     }
     // Closing the now-empty ATA returns its rent to the faucet as well as its
     // token balance, so the generated user does not retain stranded lamports.
-    instructions.push(close_token_account_instruction(
-        source,
-        faucet.pubkey(),
-        user.pubkey(),
-        token_program,
-    ));
+    if withheld == 0 {
+        instructions.push(close_token_account_instruction(
+            source,
+            faucet.pubkey(),
+            user.pubkey(),
+            token_program,
+        ));
+    } else {
+        tracing::warn!(account = %source, withheld, "token account holds withheld transfer fees; leaving it open");
+    }
     let outcome = chain
         .submit(instructions, faucet, &[user], submission)
         .await?;
@@ -629,16 +668,6 @@ fn close_token_account_instruction(
         ],
         data: vec![9],
     }
-}
-
-fn token_account_amount(data: &[u8], address: Pubkey) -> Result<u64> {
-    let amount = data
-        .get(TOKEN_AMOUNT)
-        .with_context(|| format!("token account {address} is too short to contain a balance"))?;
-    let bytes: [u8; 8] = amount
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid token balance length"))?;
-    Ok(u64::from_le_bytes(bytes))
 }
 
 fn unique_mints(mints: Vec<Pubkey>, source: &str) -> Result<Vec<Pubkey>> {
