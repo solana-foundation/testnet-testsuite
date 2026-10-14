@@ -478,10 +478,7 @@ impl OrcaWhirlpoolClient {
             let position = self.load_position(params.position_mint).await?;
             let bundle = self.load_pool(position.pool).await?;
             let liquidity = match params.amount {
-                Some(amount) => {
-                    self.liquidity_quote(&bundle, position.tick_lower, position.tick_upper, amount)?
-                        .liquidity_delta
-                }
+                Some(amount) => self.withdraw_liquidity(&bundle, &position, amount)?,
                 None => position.liquidity,
             };
             if liquidity == 0 || liquidity > position.liquidity {
@@ -500,6 +497,13 @@ impl OrcaWhirlpoolClient {
                 bundle.transfer_fee_b,
             )
             .map_err(quote_error)?;
+            let quote = widen_decrease_bounds(
+                quote,
+                bundle.price_and_fees(),
+                position.tick_lower,
+                position.tick_upper,
+                self.slippage_bps,
+            )?;
             let accounts = self.position_addresses(
                 position.pool,
                 params.position_mint,
@@ -612,39 +616,63 @@ impl OrcaWhirlpoolClient {
     pub async fn position_value(&self, position_mint: Pubkey) -> Result<PositionValue> {
         let position = self.load_position(position_mint).await?;
         let bundle = self.load_pool(position.pool).await?;
+        // Fees earned since the position's last update live in the pool's
+        // fee growth, not in `fee_owed` yet. Read the whirlpool again in the
+        // same call as the position's tick arrays: one slot's global fee
+        // growth against another slot's ticks can wrap the fee-growth
+        // subtraction to ~2^128.
+        let spacing = bundle.whirlpool.tick_spacing;
+        let ticks = [position.tick_lower, position.tick_upper];
+        let starts = ticks.map(|tick| core::get_tick_array_start_tick_index(tick, spacing));
+        let keys = [
+            position.pool,
+            self.tick_array_address(position.pool, starts[0]),
+            self.tick_array_address(position.pool, starts[1]),
+        ];
+        let accounts = self.fetch_optional(&keys).await?;
+        let pool: orca::Whirlpool = self.decode_program_account(
+            position.pool,
+            require_account(&keys, &accounts, 0, "whirlpool")?,
+            "Whirlpool",
+            orca::Whirlpool::from_bytes,
+        )?;
+        let mut outside = [(0_u128, 0_u128); 2];
+        for (index, tick) in ticks.into_iter().enumerate() {
+            let key = keys[index + 1];
+            let array: orca::TickArray = self.decode_program_account(
+                key,
+                require_account(&keys, &accounts, index + 1, "position tick array")?,
+                "TickArray",
+                orca::TickArray::from_bytes,
+            )?;
+            if current_pubkey(array.whirlpool) != position.pool
+                || array.start_tick_index != starts[index]
+            {
+                return Err(OrcaWhirlpoolError::MalformedAccount {
+                    address: key,
+                    reason: "tick array pool or start index mismatch".to_owned(),
+                });
+            }
+            let state = usize::try_from((tick - starts[index]) / i32::from(spacing))
+                .ok()
+                .and_then(|offset| array.ticks.get(offset))
+                .ok_or_else(|| OrcaWhirlpoolError::MalformedAccount {
+                    address: key,
+                    reason: format!("tick {tick} is outside its tick array"),
+                })?;
+            outside[index] = (state.fee_growth_outside_a, state.fee_growth_outside_b);
+        }
         let quote = core::decrease_liquidity_quote(
             position.liquidity,
             0,
-            bundle.whirlpool.sqrt_price,
+            pool.sqrt_price,
             position.tick_lower,
             position.tick_upper,
             bundle.transfer_fee_a,
             bundle.transfer_fee_b,
         )
         .map_err(quote_error)?;
-        // Fees earned since the position's last update live in the pool's
-        // fee growth, not in `fee_owed` yet.
-        let spacing = bundle.whirlpool.tick_spacing;
-        let starts = [position.tick_lower, position.tick_upper]
-            .map(|tick| core::get_tick_array_start_tick_index(tick, spacing));
-        let keys = starts.map(|start| self.tick_array_address(position.pool, start));
-        let arrays = self.fetch_optional(&keys).await?;
-        let mut outside = [(0_u128, 0_u128); 2];
-        for (index, tick) in [position.tick_lower, position.tick_upper]
-            .into_iter()
-            .enumerate()
-        {
-            let array: orca::TickArray = self.decode_program_account(
-                keys[index],
-                require_account(&keys, &arrays, index, "position tick array")?,
-                "TickArray",
-                orca::TickArray::from_bytes,
-            )?;
-            let offset = usize::try_from((tick - starts[index]) / i32::from(spacing)).unwrap_or(0);
-            let state = &array.ticks[offset.min(array.ticks.len() - 1)];
-            outside[index] = (state.fee_growth_outside_a, state.fee_growth_outside_b);
-        }
-        let pool = &bundle.whirlpool;
+        let pool = &pool;
         let accrued = |global, lower, upper, checkpoint| {
             mtm_math::clmm::fees_accrued(
                 position.liquidity,
@@ -942,7 +970,26 @@ impl OrcaWhirlpoolClient {
                 reason: "whirlpool is not its canonical PDA".to_owned(),
             });
         }
-        let keys = [mint_a_key, mint_b_key, token_vault_a, token_vault_b];
+        // The payer's token accounts depend on each mint's token program,
+        // known only once the mints load: fetch both candidates in this batch
+        // (with the Clock sysvar for the transfer-fee epoch) instead of two
+        // more round trips.
+        let payer = self.payer();
+        let payer_atas = [mint_a_key, mint_b_key].map(|mint| {
+            [spl::TOKEN_PROGRAM_ID, spl::TOKEN_2022_PROGRAM_ID]
+                .map(|program| spl::associated_token_address(&payer, &mint, &program))
+        });
+        let keys = [
+            mint_a_key,
+            mint_b_key,
+            token_vault_a,
+            token_vault_b,
+            CLOCK_SYSVAR_ID,
+            payer_atas[0][0],
+            payer_atas[0][1],
+            payer_atas[1][0],
+            payer_atas[1][1],
+        ];
         let accounts = self.fetch_optional(&keys).await?;
         let mint_a = decode_mint(mint_a_key, require_account(&keys, &accounts, 0, "mint A")?)?;
         let mint_b = decode_mint(mint_b_key, require_account(&keys, &accounts, 1, "mint B")?)?;
@@ -958,22 +1005,16 @@ impl OrcaWhirlpoolClient {
             require_account(&keys, &accounts, 3, "vault B")?,
             &mint_b,
         )?;
-        let epoch = self
-            .chain
-            .rpc()
-            .get_epoch_info()
-            .await
-            .map_err(|error| OrcaWhirlpoolError::Rpc(error.to_string()))?
-            .epoch;
-        let user_token_a =
-            spl::associated_token_address(&self.payer(), &mint_a.key, &mint_a.token_program);
-        let user_token_b =
-            spl::associated_token_address(&self.payer(), &mint_b.key, &mint_b.token_program);
-        let user_accounts = self.fetch_optional(&[user_token_a, user_token_b]).await?;
-        let balance_a =
-            self.validate_token_account(user_token_a, user_accounts[0].as_ref(), &mint_a)?;
-        let balance_b =
-            self.validate_token_account(user_token_b, user_accounts[1].as_ref(), &mint_b)?;
+        let epoch = clock_epoch(require_account(&keys, &accounts, 4, "clock sysvar")?)?;
+        let payer_ata = |index: usize, mint: &MintInfo| {
+            let slot =
+                5 + 2 * index + usize::from(mint.token_program == spl::TOKEN_2022_PROGRAM_ID);
+            (keys[slot], accounts[slot].as_ref())
+        };
+        let (user_token_a, user_account_a) = payer_ata(0, &mint_a);
+        let (user_token_b, user_account_b) = payer_ata(1, &mint_b);
+        let balance_a = self.validate_token_account(user_token_a, user_account_a, &mint_a)?;
+        let balance_b = self.validate_token_account(user_token_b, user_account_b, &mint_b)?;
         Ok(PoolBundle {
             transfer_fee_a: current_transfer_fee(&mint_a, epoch)?,
             transfer_fee_b: current_transfer_fee(&mint_b, epoch)?,
@@ -1144,7 +1185,48 @@ impl OrcaWhirlpoolClient {
                 "token amount resolves to zero liquidity".to_owned(),
             ));
         }
-        Ok(quote)
+        widen_increase_bounds(
+            quote,
+            bundle.price_and_fees(),
+            tick_lower,
+            tick_upper,
+            self.slippage_bps,
+        )
+    }
+
+    /// Liquidity to withdraw so the position returns `amount` of one token
+    /// (net of its transfer fee) at the current price.
+    fn withdraw_liquidity(
+        &self,
+        bundle: &PoolBundle,
+        position: &PositionView,
+        amount: TokenAmount,
+    ) -> Result<u128> {
+        let mint = bundle.mint_for(amount.mint)?;
+        let amount_raw = ui_to_raw(amount.amount, mint.decimals)?;
+        let quote = if amount.mint == bundle.mint_a.key {
+            core::decrease_liquidity_quote_a(
+                amount_raw,
+                self.slippage_bps,
+                bundle.whirlpool.sqrt_price,
+                position.tick_lower,
+                position.tick_upper,
+                bundle.transfer_fee_a,
+                bundle.transfer_fee_b,
+            )
+        } else {
+            core::decrease_liquidity_quote_b(
+                amount_raw,
+                self.slippage_bps,
+                bundle.whirlpool.sqrt_price,
+                position.tick_lower,
+                position.tick_upper,
+                bundle.transfer_fee_a,
+                bundle.transfer_fee_b,
+            )
+        }
+        .map_err(quote_error)?;
+        Ok(quote.liquidity_delta)
     }
 
     fn increase_instruction(
@@ -1237,9 +1319,9 @@ impl OrcaWhirlpoolClient {
     /// Five tick arrays centred on the current tick (current, +1, +2, -1, -2),
     /// matching Orca's own SDK; uninitialized arrays quote as empty and are
     /// accepted on-chain by sparse swap.
-    /// Re-read the whirlpool together with the five tick arrays around its
-    /// current tick in one `getMultipleAccounts` (one slot), so liquidity and
-    /// ticks are consistent. Reading them in separate calls under live
+    ///
+    /// The whirlpool is re-read in the same `getMultipleAccounts` (one slot)
+    /// so liquidity and ticks are consistent: separate calls under live
     /// trading can pair one slot's liquidity with another slot's ticks, which
     /// makes the quote walk underflow. Retries while the current tick keeps
     /// moving into another array between the two reads.
@@ -1945,6 +2027,16 @@ struct PoolBundle {
 }
 
 impl PoolBundle {
+    /// Current sqrt price and the mints' transfer fees, as the liquidity
+    /// bound helpers take them.
+    fn price_and_fees(&self) -> (u128, Option<core::TransferFee>, Option<core::TransferFee>) {
+        (
+            self.whirlpool.sqrt_price,
+            self.transfer_fee_a,
+            self.transfer_fee_b,
+        )
+    }
+
     fn mint_for(&self, mint: Pubkey) -> Result<&MintInfo> {
         if mint == self.mint_a.key {
             Ok(&self.mint_a)
@@ -2082,22 +2174,139 @@ fn validate_vault(pool: Pubkey, key: Pubkey, account: &Account, mint: &MintInfo)
     Ok(())
 }
 
+/// The wallet must cover what the program transfers at the quoted price
+/// (`token_est_*`, transfer fee included), not the slippage maximum: the
+/// program moves the computed amount and only checks it against the max.
+const CLOCK_SYSVAR_ID: Pubkey =
+    Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
+
+/// Epoch from the Clock sysvar (`slot: u64, epoch_start_timestamp: i64,
+/// epoch: u64, ...`), the epoch Token-2022 uses for transfer fees.
+fn clock_epoch(account: &Account) -> Result<u64> {
+    account
+        .data
+        .get(16..24)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| OrcaWhirlpoolError::MalformedAccount {
+            address: CLOCK_SYSVAR_ID,
+            reason: "clock sysvar is shorter than its layout".to_owned(),
+        })
+}
+
 fn ensure_balances(bundle: &PoolBundle, quote: &IncreaseLiquidityQuote) -> Result<()> {
-    if bundle.balance_a < quote.token_max_a {
-        return Err(OrcaWhirlpoolError::InsufficientBalance {
-            mint: bundle.mint_a.key,
-            required: quote.token_max_a,
-            available: bundle.balance_a,
-        });
-    }
-    if bundle.balance_b < quote.token_max_b {
-        return Err(OrcaWhirlpoolError::InsufficientBalance {
-            mint: bundle.mint_b.key,
-            required: quote.token_max_b,
-            available: bundle.balance_b,
-        });
+    for (mint, required, available) in [
+        (&bundle.mint_a, quote.token_est_a, bundle.balance_a),
+        (&bundle.mint_b, quote.token_est_b, bundle.balance_b),
+    ] {
+        if available < required {
+            return Err(OrcaWhirlpoolError::InsufficientBalance {
+                mint: mint.key,
+                required,
+                available,
+            });
+        }
     }
     Ok(())
+}
+
+/// Sqrt prices for a ±`bps` price move around `sqrt_price`:
+/// `[√P·√(1−s), √P·√(1+s)]`, clamped to the program's sqrt-price range.
+fn sqrt_price_band(sqrt_price: u128, bps: u16) -> Result<(u128, u128)> {
+    let band = Decimal::new(i64::from(bps.min(10_000)), 4);
+    let q64 = Decimal::from(1_u64 << 32) * Decimal::from(1_u64 << 32);
+    let factor = |price_factor: Decimal, round_up: bool| {
+        price_factor
+            .sqrt()
+            .and_then(|root| root.checked_mul(q64))
+            .and_then(|scaled| {
+                if round_up {
+                    scaled.ceil()
+                } else {
+                    scaled.floor()
+                }
+                .to_u128()
+            })
+            .ok_or_else(|| OrcaWhirlpoolError::Quote("slippage band overflow".to_owned()))
+    };
+    let low = mtm_math::clmm::mul_shr_64(sqrt_price, factor(Decimal::ONE - band, false)?);
+    let high = mtm_math::clmm::mul_shr_64(sqrt_price, factor(Decimal::ONE + band, true)?)
+        .saturating_add(1);
+    Ok((
+        low.clamp(core::MIN_SQRT_PRICE, core::MAX_SQRT_PRICE),
+        high.clamp(core::MIN_SQRT_PRICE, core::MAX_SQRT_PRICE),
+    ))
+}
+
+/// Token amounts `liquidity` represents over `[tick_lower, tick_upper)` at
+/// `sqrt_price`: all A below the range, all B above it.
+fn position_amounts(
+    liquidity: u128,
+    sqrt_price: u128,
+    tick_lower: i32,
+    tick_upper: i32,
+    round_up: bool,
+) -> Result<(u64, u64)> {
+    let lower: u128 = core::tick_index_to_sqrt_price(tick_lower);
+    let upper: u128 = core::tick_index_to_sqrt_price(tick_upper);
+    let delta_a = |from: u128| core::try_get_amount_delta_a(from, upper, liquidity, round_up);
+    let delta_b = |to: u128| core::try_get_amount_delta_b(lower, to, liquidity, round_up);
+    let amounts = if sqrt_price <= lower {
+        (delta_a(lower), Ok(0))
+    } else if sqrt_price >= upper {
+        (Ok(0), delta_b(upper))
+    } else {
+        (delta_a(sqrt_price), delta_b(sqrt_price))
+    };
+    Ok((
+        amounts.0.map_err(quote_error)?,
+        amounts.1.map_err(quote_error)?,
+    ))
+}
+
+/// Deposit maxima that hold over the whole slippage band, not just at the
+/// current price. The liquidity is fixed, so the program's required A grows
+/// as the price falls and the required B as it rises; `est × (1 + s)` at the
+/// current price fails on far smaller moves for in-range positions, and
+/// allows zero of the missing side for a position quoted out of range.
+fn widen_increase_bounds(
+    mut quote: IncreaseLiquidityQuote,
+    (sqrt_price, fee_a, fee_b): (u128, Option<core::TransferFee>, Option<core::TransferFee>),
+    tick_lower: i32,
+    tick_upper: i32,
+    bps: u16,
+) -> Result<IncreaseLiquidityQuote> {
+    let (low, high) = sqrt_price_band(sqrt_price, bps)?;
+    let liquidity = quote.liquidity_delta;
+    let (a_at_low, _) = position_amounts(liquidity, low, tick_lower, tick_upper, true)?;
+    let (_, b_at_high) = position_amounts(liquidity, high, tick_lower, tick_upper, true)?;
+    let gross = |amount, fee: Option<core::TransferFee>| {
+        core::try_reverse_apply_transfer_fee(amount, fee.unwrap_or_default()).map_err(quote_error)
+    };
+    quote.token_max_a = quote.token_max_a.max(gross(a_at_low, fee_a)?);
+    quote.token_max_b = quote.token_max_b.max(gross(b_at_high, fee_b)?);
+    Ok(quote)
+}
+
+/// Withdrawal minima that hold over the whole slippage band: A is lowest at
+/// the top of the band and B at the bottom.
+fn widen_decrease_bounds(
+    mut quote: core::DecreaseLiquidityQuote,
+    (sqrt_price, fee_a, fee_b): (u128, Option<core::TransferFee>, Option<core::TransferFee>),
+    tick_lower: i32,
+    tick_upper: i32,
+    bps: u16,
+) -> Result<core::DecreaseLiquidityQuote> {
+    let (low, high) = sqrt_price_band(sqrt_price, bps)?;
+    let liquidity = quote.liquidity_delta;
+    let (a_at_high, _) = position_amounts(liquidity, high, tick_lower, tick_upper, false)?;
+    let (_, b_at_low) = position_amounts(liquidity, low, tick_lower, tick_upper, false)?;
+    let net = |amount, fee: Option<core::TransferFee>| {
+        core::try_apply_transfer_fee(amount, fee.unwrap_or_default()).map_err(quote_error)
+    };
+    quote.token_min_a = quote.token_min_a.min(net(a_at_high, fee_a)?);
+    quote.token_min_b = quote.token_min_b.min(net(b_at_low, fee_b)?);
+    Ok(quote)
 }
 
 fn current_transfer_fee(mint: &MintInfo, epoch: u64) -> Result<Option<TransferFee>> {
@@ -2479,5 +2688,108 @@ mod tests {
                 "a_to_b={a_to_b} exact_in={exact_in}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod liquidity_bound_tests {
+    use super::*;
+
+    const Q64: u128 = 1 << 64;
+    const RANGE: (i32, i32) = (-1000, 1000);
+    const LIQUIDITY: u128 = 1_000_000_000_000;
+
+    fn moved(sqrt_price: u128, price_factor: f64) -> u128 {
+        (sqrt_price as f64 * price_factor.sqrt()) as u128
+    }
+
+    #[test]
+    fn band_brackets_the_price_by_the_slippage() {
+        let (low, high) = sqrt_price_band(Q64, 100).expect("band");
+        let ratio = |sqrt: u128| (sqrt as f64 / Q64 as f64).powi(2);
+        assert!((ratio(low) - 0.99).abs() < 1e-12);
+        assert!((ratio(high) - 1.01).abs() < 1e-12);
+        let (min, max) = sqrt_price_band(core::MAX_SQRT_PRICE, 10_000).expect("band");
+        assert_eq!((min, max), (core::MIN_SQRT_PRICE, core::MAX_SQRT_PRICE));
+    }
+
+    #[test]
+    fn position_amounts_follow_the_range() {
+        let (lower, upper) = RANGE;
+        let below = core::tick_index_to_sqrt_price(lower - 10);
+        let above = core::tick_index_to_sqrt_price(upper + 10);
+        let (a, b) = position_amounts(LIQUIDITY, below, lower, upper, true).expect("below");
+        assert!(a > 0 && b == 0);
+        let (a, b) = position_amounts(LIQUIDITY, above, lower, upper, true).expect("above");
+        assert!(a == 0 && b > 0);
+        let (a, b) = position_amounts(LIQUIDITY, Q64, lower, upper, true).expect("inside");
+        assert!(a > 0 && b > 0);
+    }
+
+    #[test]
+    fn deposit_maxima_cover_a_move_within_the_slippage() {
+        let (lower, upper) = RANGE;
+        let bps = 50;
+        let quote = core::increase_liquidity_quote(LIQUIDITY, bps, Q64, lower, upper, None, None)
+            .expect("quote");
+        // A 0.4% rise (inside 0.5% slippage) needs more B than est × (1 + s).
+        let (_, needed_b) =
+            position_amounts(LIQUIDITY, moved(Q64, 1.004), lower, upper, true).expect("moved");
+        assert!(
+            needed_b > quote.token_max_b,
+            "core's bound should fail this move"
+        );
+        let widened =
+            widen_increase_bounds(quote, (Q64, None, None), lower, upper, bps).expect("widen");
+        assert!(needed_b <= widened.token_max_b);
+        let (needed_a, _) =
+            position_amounts(LIQUIDITY, moved(Q64, 0.996), lower, upper, true).expect("moved");
+        assert!(needed_a <= widened.token_max_a);
+        assert!(widened.token_max_a >= quote.token_max_a);
+    }
+
+    #[test]
+    fn deposit_maxima_allow_the_missing_side_when_quoted_out_of_range() {
+        let (lower, upper) = RANGE;
+        let just_below: u128 = core::tick_index_to_sqrt_price(lower - 1);
+        let quote =
+            core::increase_liquidity_quote(LIQUIDITY, 50, just_below, lower, upper, None, None)
+                .expect("quote");
+        assert_eq!(quote.token_max_b, 0);
+        let widened = widen_increase_bounds(quote, (just_below, None, None), lower, upper, 50)
+            .expect("widen");
+        assert!(widened.token_max_b > 0);
+    }
+
+    #[test]
+    fn withdrawal_minima_hold_over_the_band() {
+        let (lower, upper) = RANGE;
+        let bps = 50;
+        let quote = core::decrease_liquidity_quote(LIQUIDITY, bps, Q64, lower, upper, None, None)
+            .expect("quote");
+        let widened =
+            widen_decrease_bounds(quote, (Q64, None, None), lower, upper, bps).expect("widen");
+        let (got_a, _) =
+            position_amounts(LIQUIDITY, moved(Q64, 1.004), lower, upper, false).expect("up");
+        let (_, got_b) =
+            position_amounts(LIQUIDITY, moved(Q64, 0.996), lower, upper, false).expect("down");
+        assert!(got_a >= widened.token_min_a && got_b >= widened.token_min_b);
+        assert!(got_a < quote.token_min_a || got_b < quote.token_min_b);
+    }
+
+    #[test]
+    fn clock_epoch_reads_the_epoch_field() {
+        let mut data = vec![0_u8; 40];
+        data[16..24].copy_from_slice(&9_u64.to_le_bytes());
+        let account = Account {
+            data,
+            ..Account::default()
+        };
+        assert_eq!(clock_epoch(&account).expect("epoch"), 9);
+        let short = Account {
+            data: vec![0; 10],
+            ..Account::default()
+        };
+        assert!(clock_epoch(&short).is_err());
     }
 }
