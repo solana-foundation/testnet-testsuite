@@ -354,3 +354,13 @@ fn user_flow_json(outcome: &UserFlowOutcome) -> Value {
         "swaps": { "exactIn": { "transaction": tx_json(&outcome.swap_exact_in.transaction), "expectedInputRaw": outcome.swap_exact_in.quote.expected_input_raw, "expectedOutputRaw": outcome.swap_exact_in.quote.expected_output_raw }, "exactOut": { "transaction": tx_json(&outcome.swap_exact_out.transaction), "expectedInputRaw": outcome.swap_exact_out.quote.expected_input_raw, "expectedOutputRaw": outcome.swap_exact_out.quote.expected_output_raw } },
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn command_line_is_well_formed() {
+        super::Cli::command().debug_assert();
+    }
+}
