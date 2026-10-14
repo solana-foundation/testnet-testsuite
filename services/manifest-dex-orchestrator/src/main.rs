@@ -33,7 +33,7 @@ enum Command {
     CreateMarkets(CreateMarketsArgs),
     /// Run one random user's maker/taker lifecycle on every pair's existing market.
     #[command(alias = "flow")]
-    UserFlow(UserFlowArgs),
+    UserFlow(Box<UserFlowArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -79,6 +79,11 @@ struct UserFlowArgs {
     /// Mint public key. Repeat this flag; each pair's lower address is the base mint.
     #[arg(long = "mint", value_name = "MINT")]
     mints: Vec<Pubkey>,
+    /// Market to use for a pair instead of the first one listed for it (lowest
+    /// address), e.g. one just created with `--allow-duplicate`. Repeatable; a
+    /// market applies to the pair it trades.
+    #[arg(long = "market", value_name = "MARKET")]
+    markets: Vec<Pubkey>,
     #[command(flatten)]
     users: EphemeralUserArgs,
     /// Directory for ephemeral user keypairs, retained when a flow or recovery fails.
@@ -119,7 +124,7 @@ async fn main() -> Result<()> {
     init("manifest-dex-orchestrator", None)?;
     match Cli::parse().command {
         Command::CreateMarkets(args) => create_all_markets(args).await,
-        Command::UserFlow(args) => execute_user_flows(args).await,
+        Command::UserFlow(args) => execute_user_flows(*args).await,
     }
 }
 
@@ -159,7 +164,8 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
     let mut targets = Vec::new();
     for (base_mint, quote_mint) in unordered_pairs(&unique_mints(args.mints, "--mint")?) {
         let markets = find_markets(&chain, program_id, base_mint, quote_mint).await?;
-        let Some(market) = markets.first().copied() else {
+        let chosen = args.markets.iter().find(|market| markets.contains(market));
+        let Some(market) = chosen.or(markets.first()).copied() else {
             bail!("no Manifest market trades {base_mint}/{quote_mint}; run create-markets first")
         };
         targets.push(EphemeralTarget {
@@ -262,4 +268,14 @@ fn user_flow_run_json(run: &EphemeralRun<UserMarket, UserFlowOutcome>) -> Value 
             "withdraw": { "transaction": optional_tx_json(flow.withdraw.transaction.as_ref()), "baseLeft": flow.withdraw.seat.base_withdrawable, "quoteLeft": flow.withdraw.seat.quote_withdrawable },
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn command_line_is_well_formed() {
+        super::Cli::command().debug_assert();
+    }
 }
