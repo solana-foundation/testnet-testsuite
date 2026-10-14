@@ -72,6 +72,35 @@ pub fn decode_token_account(data: &[u8]) -> Option<TokenAccountSummary> {
     })
 }
 
+/// Transfer fees withheld on a Token-2022 account (its `TransferFeeAmount`
+/// extension), or 0. Token-2022 refuses to close an account while any are
+/// withheld. Extensions follow the 165-byte base account: an account-type
+/// byte, then `(u16 type, u16 length, value)` entries.
+pub fn withheld_transfer_fee(data: &[u8]) -> u64 {
+    const BASE: usize = 165;
+    const TRANSFER_FEE_AMOUNT: u16 = 2;
+    let mut cursor = BASE + 1;
+    while let (Some(kind), Some(length)) = (
+        data.get(cursor..cursor + 2),
+        data.get(cursor + 2..cursor + 4),
+    ) {
+        let kind = u16::from_le_bytes([kind[0], kind[1]]);
+        let length = usize::from(u16::from_le_bytes([length[0], length[1]]));
+        let value = cursor + 4;
+        if kind == 0 {
+            break;
+        }
+        if kind == TRANSFER_FEE_AMOUNT {
+            return data
+                .get(value..value + 8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map_or(0, u64::from_le_bytes);
+        }
+        cursor = value + length;
+    }
+    0
+}
+
 fn coption_pubkey(data: &[u8], offset: usize) -> Option<Option<Pubkey>> {
     let tag = u32::from_le_bytes(data.get(offset..offset + 4)?.try_into().ok()?);
     match tag {
@@ -216,6 +245,19 @@ pub fn ui_to_raw(amount: Decimal, decimals: u8) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn withheld_transfer_fee_reads_the_extension() {
+        let mut data = vec![0_u8; 165];
+        assert_eq!(super::withheld_transfer_fee(&data), 0);
+        data.push(2); // AccountType::Account
+        // An unrelated extension (type 7, 1 byte) before TransferFeeAmount.
+        data.extend_from_slice(&[7, 0, 1, 0, 0xff]);
+        data.extend_from_slice(&[2, 0, 8, 0]);
+        data.extend_from_slice(&42_u64.to_le_bytes());
+        assert_eq!(super::withheld_transfer_fee(&data), 42);
+        assert_eq!(super::withheld_transfer_fee(&data[..data.len() - 4]), 0);
+    }
+
     use super::*;
 
     fn mint_bytes(authority: Option<Pubkey>, decimals: u8, freeze: Option<Pubkey>) -> Vec<u8> {
