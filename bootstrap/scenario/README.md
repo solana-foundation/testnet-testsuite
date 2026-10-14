@@ -252,6 +252,8 @@ and flow's per-swap RPC round trips.
 
 #### Test-validator ceiling (x200 → x2000)
 
+Lessons, footguns, and how this maps to testnet: `docs/scenario-load-findings.md`.
+
 Same machine, 2026-10-13, fresh chain per row. From x1000 up the router
 runs with `MTM_ROUTER__SNAPSHOT_TTL_MS=400` (without it quotes average 5 s
 at x1000 and the router caps the run at 750 TPS):
