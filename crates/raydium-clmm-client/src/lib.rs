@@ -519,12 +519,66 @@ impl RaydiumClmmClient {
             let quote = self.decrease_quote(&bundle, &position, position.liquidity)?;
             (quote.amount_0_raw, quote.amount_1_raw)
         };
+        // Fees earned since the position's last update live in the pool's
+        // fee growth, not in `fees_owed` yet.
+        let spacing = bundle.pool.tick_spacing;
+        let ticks = [position.tick_lower, position.tick_upper];
+        let keys = ticks.map(|tick| {
+            self.tick_array_address(
+                position.pool,
+                TickArrayState::get_array_start_index(tick, spacing),
+            )
+        });
+        let arrays = self.fetch_optional(&keys).await?;
+        let mut outside = [(0_u128, 0_u128); 2];
+        for (index, tick) in ticks.into_iter().enumerate() {
+            let array: TickArrayState = self.decode_program_account(
+                keys[index],
+                require_account(&keys, &arrays, index, "position tick array")?,
+            )?;
+            let state = array.get_tick_state(tick, spacing).map_err(|error| {
+                RaydiumClmmError::Quote(format!("position tick {tick}: {error}"))
+            })?;
+            outside[index] = (
+                state.fee_growth_outside_0_x64,
+                state.fee_growth_outside_1_x64,
+            );
+        }
+        let pool = &bundle.pool;
+        let accrued = |global, lower, upper, checkpoint| {
+            mtm_math::clmm::fees_accrued(
+                position.liquidity,
+                global,
+                lower,
+                upper,
+                pool.tick_current,
+                position.tick_lower,
+                position.tick_upper,
+                checkpoint,
+            )
+        };
+        let fees_0 = accrued(
+            pool.fee_growth_global_0_x64,
+            outside[0].0,
+            outside[1].0,
+            position.fee_checkpoint.0,
+        );
+        let fees_1 = accrued(
+            pool.fee_growth_global_1_x64,
+            outside[0].1,
+            outside[1].1,
+            position.fee_checkpoint.1,
+        );
         Ok(PositionValue {
             pool: position.pool,
             mint_a: bundle.mint_0.key,
             mint_b: bundle.mint_1.key,
-            amount_a: amount_0.saturating_add(position.fees_owed_0),
-            amount_b: amount_1.saturating_add(position.fees_owed_1),
+            amount_a: amount_0
+                .saturating_add(position.fees_owed_0)
+                .saturating_add(fees_0),
+            amount_b: amount_1
+                .saturating_add(position.fees_owed_1)
+                .saturating_add(fees_1),
             liquidity: position.liquidity,
         })
     }
@@ -1167,6 +1221,10 @@ impl RaydiumClmmClient {
             tick_upper: state.tick_upper_index,
             liquidity: state.liquidity,
             fees_owed_0: state.token_fees_owed_0,
+            fee_checkpoint: (
+                state.fee_growth_inside_0_last_x64,
+                state.fee_growth_inside_1_last_x64,
+            ),
             fees_owed_1: state.token_fees_owed_1,
             rewards_owed: state.reward_infos.map(|reward| reward.reward_amount_owed),
         })
@@ -1220,6 +1278,7 @@ impl RaydiumClmmClient {
             liquidity: 0,
             fees_owed_0: 0,
             fees_owed_1: 0,
+            fee_checkpoint: (0, 0),
             rewards_owed: [0; 3],
         };
         self.position_quote_for_ticks(bundle, &position, input)
@@ -2174,6 +2233,7 @@ struct PositionView {
     liquidity: u128,
     fees_owed_0: u64,
     fees_owed_1: u64,
+    fee_checkpoint: (u128, u128),
     rewards_owed: [u64; 3],
 }
 

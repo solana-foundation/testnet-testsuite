@@ -3164,6 +3164,7 @@ dependencies = [
  "anchor-lang",
  "metrics",
  "mtm-chain",
+ "mtm-math",
  "raydium-clmm",
  "rust_decimal",
  "solana-account 4.7.0",
