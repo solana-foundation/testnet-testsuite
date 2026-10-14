@@ -5,7 +5,7 @@
 //! and calls [`load`]. Env overrides use `__` as the section separator, e.g.
 //! `MTM_RPC__HTTP_URL=https://... MTM_PROFILE=testnet cargo run -p oracle`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
@@ -25,17 +25,39 @@ fn default_commitment() -> String {
 }
 
 pub fn load<T: for<'de> Deserialize<'de>>() -> Result<T, Box<figment::Error>> {
-    // `MTM_PROFILE=a,b` layers b.toml over a.toml (e.g. a scale overlay).
-    let profiles = std::env::var("MTM_PROFILE").unwrap_or_else(|_| "local".to_string());
-    let root = config_root();
-    let mut figment = Figment::new().merge(Toml::file(root.join("default.toml")));
-    for profile in profiles.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        figment = figment.merge(Toml::file(root.join(format!("{profile}.toml"))));
-    }
-    figment
-        .merge(Env::prefixed("MTM_").split("__"))
+    let profile = std::env::var("MTM_PROFILE").ok();
+    figment(&config_root(), profile.as_deref())?
         .extract()
         .map_err(Box::new)
+}
+
+/// `MTM_PROFILE=a,b` layers b.toml over a.toml (e.g. a scale overlay). A
+/// profile that was named but has no file is an error: a typo would
+/// otherwise run on the defaults (localhost RPC, base load). Unset, the
+/// profile is `local`, and a missing local.toml is fine.
+fn figment(root: &Path, profile: Option<&str>) -> Result<Figment, Box<figment::Error>> {
+    let mut figment = Figment::new().merge(Toml::file(root.join("default.toml")));
+    for name in profile
+        .unwrap_or("local")
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let path = root.join(format!("{name}.toml"));
+        if profile.is_some() && !path.is_file() {
+            return Err(Box::new(figment::Error::from(format!(
+                "MTM_PROFILE names `{name}`, but {} does not exist",
+                path.display()
+            ))));
+        }
+        figment = figment.merge(Toml::file(path));
+    }
+    // The loader's own variables are not config.
+    Ok(figment.merge(
+        Env::prefixed("MTM_")
+            .ignore(&["PROFILE", "CONFIG_DIR"])
+            .split("__"),
+    ))
 }
 
 /// Config directory; override with MTM_CONFIG_DIR when running outside the repo root.
@@ -67,5 +89,32 @@ mod tests {
             .extract()
             .expect("config should parse");
         assert_eq!(cfg.rpc.commitment, "confirmed");
+    }
+
+    #[test]
+    fn named_profiles_must_exist_and_layer_in_order() {
+        let root = std::env::temp_dir().join(format!("mtm-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let write = |name: &str, url: &str| {
+            std::fs::write(
+                root.join(format!("{name}.toml")),
+                format!("[rpc]\nhttp_url = \"{url}\"\nws_url = \"ws://x\"\n"),
+            )
+            .expect("write profile");
+        };
+        write("default", "http://default");
+        write("base", "http://base");
+        write("overlay", "http://overlay");
+        let url = |profile: Option<&str>| -> Result<String, Box<figment::Error>> {
+            let cfg: TestConfig = figment(&root, profile)?.extract().map_err(Box::new)?;
+            Ok(cfg.rpc.http_url)
+        };
+        assert_eq!(url(Some("base,overlay")).expect("layers"), "http://overlay");
+        assert_eq!(url(Some("overlay,base")).expect("layers"), "http://base");
+        // unset: `local`, whose file may be missing
+        assert_eq!(url(None).expect("defaults"), "http://default");
+        let typo = url(Some("base,overlya")).expect_err("missing profile");
+        assert!(typo.to_string().contains("overlya"), "{typo}");
+        std::fs::remove_dir_all(&root).ok();
     }
 }
