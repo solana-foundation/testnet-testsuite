@@ -282,7 +282,9 @@ transactions failed). The limits, in order:
   be needed to find the validator's own ceiling.
 - **Ledger.** At ~1k TPS the blockstore grows ~0.5 GB/min; keep it capped
   (`--limit-blockstore-size 5000000` retains ~40 min at x2000, enough for a
-  report window) or a tmpfs quota stops the validator.
+  report window) or a tmpfs quota stops the validator. On `/dev/shm` that
+  cap is ~20 GB of RAM; `SCENARIO_TV_SHREDS` changes it for
+  `just scenario-test-validator`.
 
 ## Teardown
 

@@ -93,6 +93,8 @@ scenario-surfpool-offline:
 # but not on testnet; the Raydium and Orca forks are v0 builds, so it is
 # deactivated. The faucet is the genesis mint; run scenario-test-validator-fund next.
 # Local Agave validator (real banking stage) to compare against Surfpool; ledger on tmpfs.
+# The ledger lives in RAM when /dev/shm is writable: the default 5M-shred cap is
+# ~20 GB (~40 min at x2000); SCENARIO_TV_SHREDS lowers or raises it.
 scenario-test-validator:
     test -f .scenario/metaplex.json || python3 -I bootstrap/scenario/metaplex-snapshot.py .scenario/metaplex.json
     python3 -I bootstrap/scenario/metaplex-snapshot.py --account-dir .scenario/metaplex-accounts .scenario/metaplex.json
@@ -100,7 +102,7 @@ scenario-test-validator:
         ledger="$([[ -w /dev/shm ]] && echo /dev/shm/mtm-test-ledger || echo .scenario/test-ledger)"; \
         solana-test-validator --ledger "$ledger" --reset --quiet --mint "$PUBKEY_FAUCET" \
             --account-dir .scenario/metaplex-accounts \
-            --account-index program-id spl-token-owner spl-token-mint --limit-blockstore-size 5000000 \
+            --account-index program-id spl-token-owner spl-token-mint --limit-blockstore-size "${SCENARIO_TV_SHREDS:-5000000}" \
             --deactivate-feature B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g'
 
 # Fund the program authority on a fresh test validator (Surfpool airdrops it instead).
