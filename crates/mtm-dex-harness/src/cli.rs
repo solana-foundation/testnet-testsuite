@@ -113,14 +113,22 @@ pub fn keypair_from_encoded(encoded: &str) -> Result<Keypair> {
     Keypair::try_from(bytes.as_slice()).context("invalid keypair bytes")
 }
 
-/// Use an explicit public key, or derive it from a named keypair variable.
+/// Use an explicit public key, or read it from a named variable that holds
+/// either the address itself or the keypair. Accepting an address lets
+/// commands that only need it run without the secret in their environment.
 pub fn resolve_pubkey(value: Option<Pubkey>, keypair_env: &str, label: &str) -> Result<Pubkey> {
-    match value {
-        Some(pubkey) => Ok(pubkey),
-        None => keypair_from_environment(keypair_env)
-            .map(|keypair| keypair.pubkey())
-            .with_context(|| format!("derive {label} address from {keypair_env}")),
+    if let Some(pubkey) = value {
+        return Ok(pubkey);
     }
+    if let Some(pubkey) = env::var(keypair_env)
+        .ok()
+        .and_then(|value| value.trim().parse::<Pubkey>().ok())
+    {
+        return Ok(pubkey);
+    }
+    keypair_from_environment(keypair_env)
+        .map(|keypair| keypair.pubkey())
+        .with_context(|| format!("derive {label} address from {keypair_env}"))
 }
 
 pub fn unique_mints(mints: Vec<Pubkey>, source: &str) -> Result<Vec<Pubkey>> {
@@ -204,7 +212,9 @@ pub struct EphemeralConfig {
 ///
 /// Every user's keypair is persisted (0600, inside a 0700 directory) before
 /// it receives SOL, and is deleted only after its funds are back with the
-/// faucet. A failed flow or recovery leaves the keypair on disk.
+/// faucet. A failed recovery leaves the keypair on disk. Every funded user is
+/// run and reclaimed even after another fails, so a failure never strands the
+/// SOL already sent to the remaining users; failures are reported together.
 pub async fn run_ephemeral_users<P, T, F, Fut>(
     chain: &ChainClient,
     faucet: Arc<dyn Signer + Send + Sync>,
@@ -236,8 +246,8 @@ where
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                for (funded_target, funded_user, _, _) in funded {
-                    let _ = reclaim_user_funds(
+                for (funded_target, funded_user, funded_path, _) in funded {
+                    let recovery = reclaim_user_funds(
                         chain,
                         faucet.as_ref(),
                         funded_user.as_ref(),
@@ -245,6 +255,7 @@ where
                         config.submission,
                     )
                     .await;
+                    finish_recovery(&funded_target.label, &funded_path, recovery.as_ref());
                 }
                 return Err(error).context("fund ephemeral user from the faucet");
             }
@@ -252,7 +263,9 @@ where
         funded.push((target, user, recovery_path, startup_funding));
     }
 
-    let mut runs = Vec::with_capacity(funded.len());
+    let total = funded.len();
+    let mut runs = Vec::with_capacity(total);
+    let mut failures = Vec::new();
     for (target, user, recovery_path, startup_funding) in funded {
         let user_pubkey = user.pubkey();
         tracing::info!(target = %target.label, user = %user_pubkey, "starting ephemeral user flow");
@@ -265,25 +278,61 @@ where
             config.submission,
         )
         .await;
-        if let Err(error) = &recovery {
-            tracing::error!(target = %target.label, user = %user_pubkey, error = %error, "failed to return ephemeral user funds; recovery keypair retained");
-        }
+        finish_recovery(&target.label, &recovery_path, recovery.as_ref());
         if let Err(error) = &result {
             tracing::error!(target = %target.label, user = %user_pubkey, error = %error, "ephemeral user flow failed");
         }
-        let outcome = result.context("run ephemeral user flow")?;
-        let recovery = recovery.context("return ephemeral user funds to the faucet")?;
-        fs::remove_file(&recovery_path)
-            .with_context(|| format!("remove recovered keypair {}", recovery_path.display()))?;
-        runs.push(EphemeralRun {
-            target: target.target,
-            user: user_pubkey,
-            startup_funding,
-            outcome,
-            recovery,
-        });
+        match (result, recovery) {
+            (Ok(outcome), Ok(recovery)) => runs.push(EphemeralRun {
+                target: target.target,
+                user: user_pubkey,
+                startup_funding,
+                outcome,
+                recovery,
+            }),
+            (result, recovery) => {
+                let mut reasons = Vec::new();
+                if let Err(error) = result {
+                    reasons.push(format!("flow: {error:#}"));
+                }
+                if let Err(error) = recovery {
+                    reasons.push(format!("recovery (keypair retained): {error:#}"));
+                }
+                failures.push(format!(
+                    "{} user {user_pubkey}: {}",
+                    target.label,
+                    reasons.join("; ")
+                ));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{} of {total} ephemeral user flows failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
     Ok(runs)
+}
+
+/// Delete a user's recovery keypair once its funds are back with the faucet;
+/// keep it (and say so) when the recovery failed.
+fn finish_recovery(
+    label: &str,
+    path: &Path,
+    recovery: std::result::Result<&Recovery, &anyhow::Error>,
+) {
+    match recovery {
+        Ok(_) => {
+            if let Err(error) = fs::remove_file(path) {
+                tracing::warn!(target = %label, path = %path.display(), %error, "failed to remove recovered keypair");
+            }
+        }
+        Err(error) => {
+            tracing::error!(target = %label, path = %path.display(), error = %error, "failed to return ephemeral user funds; recovery keypair retained");
+        }
+    }
 }
 
 fn prepare_recovery_dir(dir: &Path) -> Result<()> {
@@ -323,11 +372,13 @@ pub async fn reclaim_user_funds(
             token_returns.push(transaction);
         }
     }
+    // Read at the submission commitment, after the token returns confirmed.
     let lamports = chain
         .rpc()
-        .get_balance(&user.pubkey())
+        .get_balance_with_commitment(&user.pubkey(), submission.commitment)
         .await
-        .context("read ephemeral user balance before recovery")?;
+        .context("read ephemeral user balance before recovery")?
+        .value;
     let lamport_return = if lamports == 0 {
         None
     } else {
@@ -369,13 +420,14 @@ async fn return_token_balance(
         .with_context(|| format!("token account {source} is too short to contain a balance"))?
         .amount;
     let destination = spl::associated_token_address(&faucet.pubkey(), &mint, &token_program);
-    let mut instructions = vec![spl::create_associated_token_account_idempotent(
-        &faucet.pubkey(),
-        &faucet.pubkey(),
-        &mint,
-        &token_program,
-    )];
+    let mut instructions = Vec::new();
     if amount > 0 {
+        instructions.push(spl::create_associated_token_account_idempotent(
+            &faucet.pubkey(),
+            &faucet.pubkey(),
+            &mint,
+            &token_program,
+        ));
         instructions.push(spl::transfer_checked(
             &token_program,
             &source,
@@ -388,12 +440,21 @@ async fn return_token_balance(
     }
     // Closing the now-empty ATA returns its rent to the faucet as well as its
     // token balance, so the generated user does not retain stranded lamports.
-    instructions.push(spl::close_account(
-        &token_program,
-        &source,
-        &faucet.pubkey(),
-        &user.pubkey(),
-    ));
+    // Token-2022 refuses to close it while transfer fees are withheld on it.
+    let withheld = spl::withheld_transfer_fee(&source_account.data);
+    if withheld == 0 {
+        instructions.push(spl::close_account(
+            &token_program,
+            &source,
+            &faucet.pubkey(),
+            &user.pubkey(),
+        ));
+    } else {
+        tracing::warn!(account = %source, withheld, "token account holds withheld transfer fees; leaving it open");
+    }
+    if instructions.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(
         chain
             .submit(instructions, faucet, &[user], submission)
