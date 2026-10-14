@@ -1,8 +1,8 @@
 # mtm — Claude Code notes
 
 Solana **testnet** traffic-testing stack (testnet is the target, not devnet — the goal
-is exercising testnet itself). Rust workspace; no on-chain programs yet (Pyth pull
-oracle instead of a custom one — `programs/` is reserved).
+is exercising testnet itself). Rust workspace; the only on-chain program is the
+teardown janitor in `programs/janitor` (Pyth pull oracle instead of a custom one).
 
 ## Commands
 
@@ -12,6 +12,8 @@ oracle instead of a custom one — `programs/` is reserved).
   (oracle + prometheus + grafana via ops/compose.yaml; local profile expects
   surfpool running on the host)
 - `just bootstrap-tokens[-dev]` — token bootstrap via doppler-managed secrets
+- `just build-janitor [config]` / `just test-janitor` — the teardown janitor program
+  (needs `cargo-build-sbf`; not part of `just ci`)
 - `just scenario-dev` / `scenario-testnet` / `scenario-down` — market-making scenario
   (oracle + router + mm + flow + Prometheus/Grafana; bootstrap/scenario/README.md).
   Scenario ports: oracle 8180, router 8181, metrics 9180-9183, Prometheus 9190, Grafana 3100
@@ -29,5 +31,6 @@ oracle instead of a custom one — `programs/` is reserved).
   solana-sdk/solana-client meta-crates have unresolvable version conflicts at 4.x.
   Keep the solana-rpc-client floor at 4.2.1 (4.1.x resolves a broken wincode mix)
   and pin majors to match the Agave 4.x CLI.
-- When adding an on-chain program later: Anchor workspace under `programs/`, plus a
-  `<name>-interface` crate in `crates/` shared by the program and off-chain code.
+- On-chain programs live under `programs/` (the janitor is Pinocchio, in its own
+  workspace built with `cargo-build-sbf`), each with a `<name>-interface` crate in
+  `crates/` shared by the program and off-chain code.

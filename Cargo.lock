@@ -2195,6 +2195,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "janitor-interface"
+version = "0.1.0"
+dependencies = [
+ "solana-instruction 3.5.1",
+ "solana-pubkey 4.4.0",
+]
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3884,6 +3892,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "janitor-interface",
  "manifest-dex-client",
  "manifest-dex-orchestrator",
  "mtm-chain",

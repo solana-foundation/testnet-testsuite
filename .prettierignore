@@ -1,3 +1,5 @@
 # Vendored upstream artifacts: keep byte-identical to their sources.
 crates/sdks/*/idl/
 codegen/pnpm-lock.yaml
+# solana-keygen keypair files
+programs/*/tests/fixtures/*.json
