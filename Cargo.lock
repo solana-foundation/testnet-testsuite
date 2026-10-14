@@ -3325,17 +3325,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "mtm-chain",
+ "mtm-dex-harness",
  "mtm-telemetry",
  "raydium-clmm-orchestrator",
  "rust_decimal",
  "serde_json",
- "solana-commitment-config",
- "solana-instruction 3.5.1",
- "solana-keypair",
  "solana-pubkey 4.4.0",
- "solana-signer 3.0.1",
- "spl-token-2022 7.0.0",
  "tokio",
  "tracing",
 ]
