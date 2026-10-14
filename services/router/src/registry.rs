@@ -98,7 +98,10 @@ impl Registry {
         Arc::new(Self::default())
     }
 
-    /// Load every curated pool; a pool that fails to load aborts startup.
+    /// Load every curated pool. Configuration errors (bad addresses, a
+    /// missing program id) abort startup; a pool that fails to load (closed,
+    /// or an RPC error) is logged and left unroutable, so one bad entry does
+    /// not take the router down.
     pub async fn add_curated(
         &self,
         chain: &ChainClient,
@@ -118,9 +121,13 @@ impl Registry {
                 })?,
             };
             let pool = Pubkey::from_str(&entry.address).context("pool address")?;
-            let snapshot = PoolSnapshot::load(chain, kind, program_id, pool)
-                .await
-                .with_context(|| format!("loading curated pool {pool}"))?;
+            let snapshot = match PoolSnapshot::load(chain, kind, program_id, pool).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    warn!(%pool, venue = kind.as_str(), %error, "curated pool failed to load; not routable");
+                    continue;
+                }
+            };
             info!(%pool, venue = kind.as_str(), "curated pool loaded");
             self.insert(Entry {
                 kind,
@@ -240,7 +247,10 @@ pub fn spawn_discovery(
     probe_amount: u64,
 ) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        // The startup sweep just ran: first tick one interval from now, and
+        // a slow sweep delays the next one instead of bursting to catch up.
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             registry.sweep(&chain, &programs, probe_amount).await;

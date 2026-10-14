@@ -2613,6 +2613,7 @@ name = "mtm-venues"
 version = "0.1.0"
 dependencies = [
  "manifest-dex-client",
+ "metrics",
  "mtm-chain",
  "orca-whirlpool-client",
  "raydium-clmm-client",
@@ -3604,6 +3605,8 @@ dependencies = [
  "solana-transaction",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
+ "tower-http",
  "tracing",
  "wincode",
 ]
@@ -3614,6 +3617,7 @@ version = "0.1.0"
 dependencies = [
  "reqwest 0.13.1",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -7364,6 +7368,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",

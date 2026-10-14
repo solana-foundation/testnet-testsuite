@@ -25,6 +25,9 @@ use registry::{Programs, Registry};
 use solana_pubkey::Pubkey;
 use tracing::{info, warn};
 
+/// Pool snapshots are shared between the cache, the book, and planned legs.
+pub type Snapshot = Arc<PoolSnapshot>;
+
 pub struct AppState {
     pub registry: Arc<Registry>,
     pub snapshots: SnapshotCache,
@@ -96,7 +99,7 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
 pub async fn load_book(
     state: &AppState,
     request: &Request,
-) -> Result<(Book<PoolSnapshot>, u64), EngineError> {
+) -> Result<(Book<Snapshot>, u64), EngineError> {
     let state_slot = state
         .chain
         .current_slot()
@@ -115,50 +118,63 @@ pub async fn load_book(
         .iter()
         .map(|entry| state.snapshots.load(&state.chain, entry));
     let mut sources = Vec::new();
+    let mut failures = Vec::new();
     for (entry, loaded) in entries.iter().zip(join_all(loads).await) {
         match loaded {
             Ok(snapshot) => sources.push((snapshot.mints(), snapshot)),
-            Err(error) => warn!(pool = %entry.pool, error = %error, "pool snapshot failed"),
+            Err(error) => {
+                warn!(pool = %entry.pool, error = %error, "pool snapshot failed");
+                metrics::counter!("router_snapshot_failures_total").increment(1);
+                failures.push(format!("{}: {error}", entry.pool));
+            }
         }
+    }
+    // Every candidate failing is an upstream problem (502), not "no route".
+    if sources.is_empty() && !failures.is_empty() {
+        return Err(EngineError::Rpc(format!(
+            "every candidate pool failed to load: {}",
+            failures.join("; ")
+        )));
     }
     Ok((Book::new(sources), state_slot))
 }
 
-type SharedSnapshot = Arc<tokio::sync::OnceCell<Result<PoolSnapshot, String>>>;
+type SharedSnapshot = Arc<tokio::sync::OnceCell<Result<Snapshot, String>>>;
 
-/// Short-lived pool snapshots shared by concurrent quotes: within `ttl` each
-/// pool is loaded once (single flight) and every quote reuses that load.
+/// Pool snapshots shared by concurrent quotes. A pool is loaded once per
+/// `ttl` window (single flight), and an in-flight load is always shared, even
+/// with `ttl` 0; hits hand out the shared snapshot, never a copy.
 pub struct SnapshotCache {
     ttl: Duration,
-    entries: tokio::sync::Mutex<HashMap<Pubkey, (Instant, SharedSnapshot)>>,
+    // Never held across an await: only to find or insert a pool's cell.
+    entries: std::sync::Mutex<HashMap<Pubkey, (Instant, SharedSnapshot)>>,
 }
 
 impl SnapshotCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            entries: tokio::sync::Mutex::new(HashMap::new()),
+            entries: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    async fn load(
-        &self,
-        chain: &ChainClient,
-        entry: &registry::Entry,
-    ) -> Result<PoolSnapshot, String> {
+    async fn load(&self, chain: &ChainClient, entry: &registry::Entry) -> Result<Snapshot, String> {
         let fetch = || async {
             PoolSnapshot::load(chain, entry.kind, entry.program_id, entry.pool)
                 .await
+                .map(Arc::new)
                 .map_err(|error| error.to_string())
         };
-        if self.ttl.is_zero() {
-            return fetch().await;
-        }
         let cell = {
-            let mut entries = self.entries.lock().await;
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let now = Instant::now();
             match entries.get(&entry.pool) {
-                Some((loaded_at, cell)) if now.duration_since(*loaded_at) < self.ttl => {
+                Some((loaded_at, cell))
+                    if !cell.initialized() || now.duration_since(*loaded_at) < self.ttl =>
+                {
                     metrics::counter!("router_snapshot_cache_total", "result" => "hit")
                         .increment(1);
                     Arc::clone(cell)

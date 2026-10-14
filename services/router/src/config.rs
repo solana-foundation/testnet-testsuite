@@ -38,11 +38,19 @@ pub struct RouterConfig {
     /// intermediate mints multi-hop routes may pass through
     #[serde(default)]
     pub bridge_mints: Vec<String>,
-    /// Reuse a pool snapshot across quotes for this long (0 = load per
-    /// quote). Concurrent quotes inside the window share one load, which
-    /// bounds RPC load under heavy quote traffic at the cost of staleness.
-    #[serde(default)]
+    /// Reuse a pool snapshot across quotes for this long (default 400 ms,
+    /// about one slot; 0 = a fresh load per quote). Concurrent quotes always
+    /// share an in-flight load. Without reuse every quote reloads every
+    /// candidate pool: ~900 quotes/s averaged 5 s per quote in load tests.
+    #[serde(default = "default_snapshot_ttl_ms")]
     pub snapshot_ttl_ms: u64,
+    /// A request still running after this long is answered 408, so slow RPC
+    /// cannot pile requests up without bound.
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// Requests served at once; further ones wait for a slot.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
     #[serde(default)]
     pub jupiter: JupiterConfig,
 }
@@ -96,6 +104,15 @@ pub struct PoolEntry {
 
 fn default_cu_price() -> u64 {
     1_000
+}
+fn default_request_timeout_ms() -> u64 {
+    10_000
+}
+fn default_max_concurrent_requests() -> usize {
+    1_024
+}
+fn default_snapshot_ttl_ms() -> u64 {
+    400
 }
 fn default_cu_margin() -> u32 {
     50_000

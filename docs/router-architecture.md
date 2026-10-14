@@ -42,7 +42,9 @@ What changed relative to the design below:
   atom on Surfpool for direct splits, 2-hop bridges, and exact-out. The
   ws/geyser cache (and CLMM tick-window subscriptions) is the latency step
   that replaces the per-request fetch later; `mtm-market-state` from the stash
-  is parked until then.
+  is parked until then. Meanwhile snapshots are shared: `snapshot_ttl_ms`
+  (default 400 ms) reuses a pool's snapshot across quotes, concurrent quotes
+  share one in-flight load, and the book holds `Arc` references.
 - **Venue trait (§3)** is `mtm_venues::PoolSnapshot` (enum dispatch over the
   three snapshots) plus the engine's `QuoteSource` trait, which lets the
   planner's unit tests run on a constant-product mock.
@@ -106,6 +108,14 @@ POST /v1/instructions  # same, but raw instructions — for callers
                        # composing their own tx (arb bot, CPI-style flows)
 GET  /v1/venues, /v1/pools   # registry introspection
 ```
+
+As built: one-shot only (`user` on `/v1/quote`, or `/v1/instructions`).
+There is no `quote_id`, `/v1/swap`, `/v1/venues`, `oracle_divergence_bps`, or
+per-venue staleness bound yet, and `price_impact_bps` is always 0. The
+response adds `max_in_amount` (the most input the route may debit),
+`cu_estimate`, and with a `user`, `compute_unit_limit` and `tx_base64`.
+Errors: 400 bad request, 404 no route, 408 timeout, 422 a route that cannot
+be built, 502 RPC failure (including every candidate pool failing to load).
 
 Design points:
 
@@ -287,8 +297,11 @@ Assembly pipeline:
 3. Compile a v1 message with the compute budget in its config (CU limit
    from summed leg estimates + margin; priority fee as total lamports;
    explicit loaded-accounts-data limit, since v1 treats unset as zero).
-4. Fit check — **which should never fail**, because the search already
-   received the budgets. Assembly-time overflow is a bug, not a fallback path.
+4. Fit check. As built, the search does not yet receive the budgets, so a
+   route that overflows v1 limits is narrowed and replanned: first fewer
+   same-pair split legs, then without the leg that lists the most accounts.
+   Planning within budgets (per-leg footprints from the venues) would remove
+   this loop.
 
 **The chaining caveat** (drives a future decision): with off-chain composed
 transactions, leg N's input amount is fixed at build time from simulation, so

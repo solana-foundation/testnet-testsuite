@@ -16,12 +16,19 @@ use crate::engine::{self, Book, EngineError, PlannedRoute, Request};
 use crate::{AppState, assemble};
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let timeout = std::time::Duration::from_millis(state.cfg.request_timeout_ms);
+    let concurrency = state.cfg.max_concurrent_requests.max(1);
     Router::new()
         .route("/health", get(health))
         .route("/v1/quote", post(quote))
         .route("/v1/instructions", post(instructions))
         .route("/v1/pools", get(pools))
         .with_state(state)
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            timeout,
+        ))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(concurrency))
 }
 
 async fn health() -> &'static str {
@@ -83,8 +90,8 @@ async fn planned(
 ) -> Result<
     (
         Request,
-        PlannedRoute<mtm_venues::PoolSnapshot>,
-        Book<mtm_venues::PoolSnapshot>,
+        PlannedRoute<crate::Snapshot>,
+        Book<crate::Snapshot>,
         u64,
     ),
     (StatusCode, String),
@@ -107,8 +114,8 @@ async fn plan_request(
 ) -> Result<
     (
         Request,
-        PlannedRoute<mtm_venues::PoolSnapshot>,
-        Book<mtm_venues::PoolSnapshot>,
+        PlannedRoute<crate::Snapshot>,
+        Book<crate::Snapshot>,
         u64,
     ),
     (StatusCode, String),
@@ -132,14 +139,7 @@ async fn fitted(
     state: &AppState,
     req: &QuoteRequest,
     user: &Pubkey,
-) -> Result<
-    (
-        PlannedRoute<mtm_venues::PoolSnapshot>,
-        assemble::Assembled,
-        String,
-    ),
-    (StatusCode, String),
-> {
+) -> Result<(PlannedRoute<crate::Snapshot>, assemble::Assembled, String), (StatusCode, String)> {
     let (mut request, mut planned, book, state_slot) = planned(state, req).await?;
     loop {
         let assembled = assemble::route_instructions(
@@ -187,7 +187,7 @@ async fn fitted(
 }
 
 /// Pool of the single-leg segment whose swap instruction lists the most accounts.
-fn widest_leg(user: &Pubkey, planned: &PlannedRoute<mtm_venues::PoolSnapshot>) -> Option<Pubkey> {
+fn widest_leg(user: &Pubkey, planned: &PlannedRoute<crate::Snapshot>) -> Option<Pubkey> {
     planned
         .segments
         .iter()
@@ -262,10 +262,10 @@ async fn instructions(
 
 fn assembly_error(error: anyhow::Error) -> (StatusCode, String) {
     warn!(error = %error, "route assembly failed");
-    let status = if error.to_string().contains("requires [router.jupiter]") {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::UNPROCESSABLE_ENTITY
+    let status = match error.downcast_ref::<assemble::AssemblyFault>() {
+        Some(assemble::AssemblyFault::Rpc(_)) => StatusCode::BAD_GATEWAY,
+        Some(assemble::AssemblyFault::Config(_)) => StatusCode::BAD_REQUEST,
+        None => StatusCode::UNPROCESSABLE_ENTITY,
     };
     (status, format!("{error:#}"))
 }

@@ -4,9 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SwapMode {
+    #[default]
     ExactIn,
     ExactOut,
 }
@@ -30,7 +31,7 @@ pub struct QuoteRequest {
     pub output_mint: String,
     /// atoms of input (ExactIn) or output (ExactOut)
     pub amount: u64,
-    #[serde(default = "default_mode")]
+    #[serde(default)]
     pub mode: SwapMode,
     #[serde(default = "default_slippage")]
     pub slippage_bps: u16,
@@ -41,9 +42,6 @@ pub struct QuoteRequest {
     pub user: Option<String>,
 }
 
-fn default_mode() -> SwapMode {
-    SwapMode::ExactIn
-}
 fn default_slippage() -> u16 {
     50
 }
@@ -71,6 +69,11 @@ pub struct QuoteResponse {
     pub out_amount: u64,
     /// slippage-adjusted floor enforced on-chain by the final leg
     pub min_out_amount: u64,
+    /// most input the route's instructions may debit: `in_amount` for
+    /// ExactIn, the slippage-adjusted ceiling for ExactOut (0 from routers
+    /// that predate the field)
+    #[serde(default)]
+    pub max_in_amount: u64,
     pub price_impact_bps: u32,
     pub route: Vec<RouteLeg>,
     /// oldest state slot among quoted venues
@@ -118,7 +121,15 @@ pub struct InstructionsResponse {
 pub enum RouterClientError {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    /// The router answered with an error status; `message` is its body
+    /// (404 no route, 400 bad request, 422 unbuildable route, 502 upstream
+    /// RPC failure, 408 timeout).
+    #[error("router returned {status}: {message}")]
+    Api { status: u16, message: String },
 }
+
+/// Per-request timeout unless [`RouterClient::with_timeout`] sets another.
+pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct RouterClient {
@@ -128,8 +139,19 @@ pub struct RouterClient {
 
 impl RouterClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_timeout(base_url, DEFAULT_TIMEOUT)
+    }
+
+    /// A client whose requests fail after `timeout` instead of hanging on a
+    /// stuck router.
+    pub fn with_timeout(base_url: impl Into<String>, timeout: std::time::Duration) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(timeout.min(std::time::Duration::from_secs(5)))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
@@ -140,9 +162,8 @@ impl RouterClient {
             .post(format!("{}/v1/quote", self.base_url))
             .json(request)
             .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json().await?)
+            .await?;
+        Ok(checked(resp).await?.json().await?)
     }
 
     /// Raw instructions for composing into your own transaction. `user` is
@@ -156,8 +177,51 @@ impl RouterClient {
             .post(format!("{}/v1/instructions", self.base_url))
             .json(request)
             .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json().await?)
+            .await?;
+        Ok(checked(resp).await?.json().await?)
+    }
+}
+
+/// The response, or its status and body as an [`RouterClientError::Api`].
+async fn checked(resp: reqwest::Response) -> Result<reqwest::Response, RouterClientError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let message = resp.text().await.unwrap_or_default();
+    Err(RouterClientError::Api {
+        status: status.as_u16(),
+        message,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_defaults_apply() {
+        let request: QuoteRequest =
+            serde_json::from_str(r#"{"input_mint":"a","output_mint":"b","amount":5}"#)
+                .expect("minimal request");
+        assert_eq!(request.mode, SwapMode::ExactIn);
+        assert_eq!(request.slippage_bps, 50);
+        assert_eq!(request.execution, Execution::Direct);
+        assert!(request.user.is_none());
+    }
+
+    #[test]
+    fn responses_without_newer_fields_still_decode() {
+        let response: QuoteResponse = serde_json::from_str(
+            r#"{"execution":"direct","in_amount":1,"out_amount":2,"min_out_amount":2,
+                "price_impact_bps":0,"route":[],"state_slot":3,"cu_estimate":4}"#,
+        )
+        .expect("older response");
+        assert_eq!(response.max_in_amount, 0);
+        assert!(response.compute_unit_limit.is_none() && response.tx_base64.is_none());
+        let round_trip: QuoteResponse =
+            serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round_trip.out_amount, 2);
     }
 }
