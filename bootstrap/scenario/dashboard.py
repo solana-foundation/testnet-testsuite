@@ -37,7 +37,7 @@ row("Scenario health")
 stat("Routed swaps landed (5m)", 'sum(increase(flow_swaps_total{status="landed"}[5m])) or vector(0)', x=0)
 stat("Routed swaps failed (5m)", 'sum(increase(flow_swaps_total{status="failed"}[5m])) or vector(0)', x=6)
 stat("Maker errors (5m)", '(sum(increase(mm_errors_total[5m])) or vector(0)) + (sum(increase(mm_panics_total[5m])) or vector(0))', x=12)
-stat("Flow notional (USD/min)", 'sum(rate(flow_notional_usd_total[5m])) * 60', unit="currencyUSD", x=18)
+stat("Flow notional (USD/min)", 'sum(rate(flow_notional_micro_usd_total[5m])) * 60 / 1e6', unit="currencyUSD", x=18)
 nl(4)
 row("Oracle")
 ts("Oracle pair prices", [("mm_oracle_price", "{{pair}}")], x=0)
@@ -63,25 +63,28 @@ nl(8)
 ts("Inventory by token", [("mm_inventory", "{{maker}} {{token}}")], x=0)
 ts("Quote skew (bps) and arb volume (USD/min)", [
     ("mm_skew_bps", "skew {{maker}}"),
-    ("sum by (maker) (rate(mm_arb_volume_usd[5m])) * 60", "arb {{maker}}")], x=12)
+    ("sum by (maker) (rate(mm_arb_volume_micro_usd_total[5m])) * 60 / 1e6", "arb {{maker}}")], x=12)
 nl(8)
 ts("Maker errors / min", [("sum by (maker, stage) (rate(mm_errors_total[5m])) * 60", "{{maker}} {{stage}}")], x=0)
 ts("Maker tick latency (p95)", [('mm_tick_seconds{quantile="0.95"}', "{{maker}}")], unit="s", x=12)
 nl(8)
 row("Uninformed flow + router")
 ts("Routed swaps / min", [("sum by (pair, status, size) (rate(flow_swaps_total[5m])) * 60", "{{pair}} {{status}} {{size}}")], x=0)
+ts("Swap outcomes / min", [("sum by (outcome) (rate(flow_swaps_total[5m])) * 60", "{{outcome}}")], x=12,
+   desc="landed, or why not: unaffordable / no_price / quote_failed / preflight_rejected / send_failed / landed_failed / expired / rpc_ambiguous / error")
+nl(8)
 ts("Cost vs oracle (bps)", [
     ('flow_cost_vs_oracle_bps{quantile="0.5"}', "p50 {{pair}}"),
-    ('flow_cost_vs_oracle_bps{quantile="0.95"}', "p95 {{pair}}")], unit="none", x=12,
+    ('flow_cost_vs_oracle_bps{quantile="0.95"}', "p95 {{pair}}")], unit="none", x=0,
    desc="value given up versus the oracle: spread + fees + impact paid by uninformed flow")
+ts("Landed vs quoted slippage (bps)", [('flow_slippage_bps{quantile="0.95"}', "p95 {{pair}}"), ('flow_slippage_bps{quantile="0.5"}', "p50 {{pair}}")], unit="none", x=12)
 nl(8)
-ts("Landed vs quoted slippage (bps)", [('flow_slippage_bps{quantile="0.95"}', "p95 {{pair}}"), ('flow_slippage_bps{quantile="0.5"}', "p50 {{pair}}")], unit="none", x=0)
-ts("Route legs by venue / min", [("sum by (venue) (rate(flow_route_legs_total[5m])) * 60", "{{venue}}")], x=12)
+ts("Route legs by venue / min", [("sum by (venue) (rate(flow_route_legs_total[5m])) * 60", "{{venue}}")], x=0)
+ts("Router quote latency", [('router_quote_seconds{quantile="0.5"}', "p50 {{execution}}"), ('router_quote_seconds{quantile="0.95"}', "p95 {{execution}}")], unit="s", x=12)
 nl(8)
-ts("Router quote latency", [('router_quote_seconds{quantile="0.5"}', "p50 {{execution}}"), ('router_quote_seconds{quantile="0.95"}', "p95 {{execution}}")], unit="s", x=0)
 ts("Router quotes and errors / min", [
     ("sum by (execution) (rate(router_quotes_total[5m])) * 60", "quotes {{execution}}"),
-    ("sum by (status) (rate(router_quote_errors_total[5m])) * 60", "errors {{status}}")], x=12)
+    ("sum by (status) (rate(router_quote_errors_total[5m])) * 60", "errors {{status}}")], x=0)
 nl(8)
 
 dash = {"uid": "mtm-scenario", "title": "mtm — market-making scenario", "tags": ["mtm"], "timezone": "browser",

@@ -147,7 +147,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(flow_notional_usd_total[5m])) * 60"
+          "expr": "sum(rate(flow_notional_micro_usd_total[5m])) * 60 / 1e6"
         }
       ],
       "id": 5
@@ -595,7 +595,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (maker) (rate(mm_arb_volume_usd[5m])) * 60",
+          "expr": "sum by (maker) (rate(mm_arb_volume_micro_usd_total[5m])) * 60 / 1e6",
           "legendFormat": "arb {{maker}}"
         }
       ],
@@ -733,8 +733,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Cost vs oracle (bps)",
-      "description": "value given up versus the oracle: spread + fees + impact paid by uninformed flow",
+      "title": "Swap outcomes / min",
+      "description": "landed, or why not: unaffordable / no_price / quote_failed / preflight_rejected / send_failed / landed_failed / expired / rpc_ambiguous / error",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -744,6 +744,45 @@
         "w": 12,
         "x": 12,
         "y": 57
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(flow_swaps_total[5m])) * 60",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "id": 23
+    },
+    {
+      "type": "timeseries",
+      "title": "Cost vs oracle (bps)",
+      "description": "value given up versus the oracle: spread + fees + impact paid by uninformed flow",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
       },
       "fieldConfig": {
         "defaults": {
@@ -773,7 +812,7 @@
           "legendFormat": "p95 {{pair}}"
         }
       ],
-      "id": 23
+      "id": 24
     },
     {
       "type": "timeseries",
@@ -786,7 +825,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 65
       },
       "fieldConfig": {
@@ -817,7 +856,7 @@
           "legendFormat": "p50 {{pair}}"
         }
       ],
-      "id": 24
+      "id": 25
     },
     {
       "type": "timeseries",
@@ -830,8 +869,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 65
+        "x": 0,
+        "y": 73
       },
       "fieldConfig": {
         "defaults": {
@@ -856,7 +895,7 @@
           "legendFormat": "{{venue}}"
         }
       ],
-      "id": 25
+      "id": 26
     },
     {
       "type": "timeseries",
@@ -869,7 +908,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 73
       },
       "fieldConfig": {
@@ -900,7 +939,7 @@
           "legendFormat": "p95 {{execution}}"
         }
       ],
-      "id": 26
+      "id": 27
     },
     {
       "type": "timeseries",
@@ -913,8 +952,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 73
+        "x": 0,
+        "y": 81
       },
       "fieldConfig": {
         "defaults": {
@@ -944,7 +983,7 @@
           "legendFormat": "errors {{status}}"
         }
       ],
-      "id": 27
+      "id": 28
     }
   ]
 }

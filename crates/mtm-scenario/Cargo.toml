@@ -19,8 +19,10 @@ raydium-clmm-client = { workspace = true }
 rust_decimal = { workspace = true, features = ["serde-str"] }
 serde = { workspace = true }
 sha2 = { workspace = true }
+solana-account-decoder-client-types = { workspace = true }
 solana-keypair = { workspace = true }
 solana-pubkey = { workspace = true }
+solana-rpc-client-api = { workspace = true }
 solana-signer = { workspace = true }
 
 [dev-dependencies]

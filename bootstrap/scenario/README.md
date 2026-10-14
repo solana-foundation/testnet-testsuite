@@ -97,16 +97,18 @@ endpoint for sustained runs. `SCENARIO_SEED` is mandatory there.
 
 ## Metrics
 
-| Metric                                                                               | Labels               | Meaning                                             |
-| ------------------------------------------------------------------------------------ | -------------------- | --------------------------------------------------- |
-| `mm_oracle_price`                                                                    | pair                 | oracle pair price the makers use                    |
-| `mm_venue_price`, `mm_deviation_bps`                                                 | maker, venue         | venue price and its gap to the oracle               |
-| `mm_inventory`, `mm_inventory_value_usd`                                             | maker, token         | holdings (wallet + seat) and USD value              |
-| `mm_actions_total`                                                                   | maker, action        | requote / open / close / arb_buy / arb_sell         |
-| `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                     | maker, stage / venue | failures (ticks retry)                              |
-| `mm_skew_bps`, `mm_arb_volume_usd`, `mm_tick_seconds`                                | maker                | skew, arbitrage volume, tick latency                |
-| `flow_swaps_total`                                                                   | pair, status, size   | routed swaps landed/failed, normal/large            |
-| `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                       | pair                 | cost to uninformed flow vs oracle; landed vs quoted |
-| `flow_route_legs_total`, `flow_notional_usd_total`, `flow_refills_total`             | venue / pair         | routing mix, volume, refills                        |
-| `router_quote_seconds`, `router_quote_errors_total`, `router_quotes_total`           | execution, status    | router latency and failures                         |
-| `oracle_price_updates_total`, `{orca_whirlpool,raydium_clmm,manifest}_actions_total` | —                    | feed health and per-venue transactions              |
+| Metric                                                                               | Labels                      | Meaning                                             |
+| ------------------------------------------------------------------------------------ | --------------------------- | --------------------------------------------------- |
+| `mm_oracle_price`                                                                    | pair                        | oracle pair price the makers use                    |
+| `mm_venue_price`, `mm_deviation_bps`                                                 | maker, venue                | venue price and its gap to the oracle               |
+| `mm_inventory`, `mm_inventory_value_usd`                                             | maker, token                | holdings (wallet + seat) and USD value              |
+| `mm_actions_total`                                                                   | maker, action               | requote / open / close / arb_buy / arb_sell         |
+| `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                     | maker, stage / venue        | failures (ticks retry)                              |
+| `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                    | maker                       | skew, arbitrage volume (µUSD), tick latency         |
+| `flow_swaps_total`                                                                   | pair, status, outcome, size | routed swaps landed/failed, why, normal/large       |
+| `flow_fee_lamports_total`, `flow_fill_read_errors_total`                             | —                           | fees paid by takers; landed swaps with unread fills |
+| `flow_takers_alive`, `flow_taker_restarts_total`                                     | —                           | taker loops running / restarted after an error      |
+| `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                       | pair                        | cost to uninformed flow vs oracle; landed vs quoted |
+| `flow_route_legs_total`, `flow_notional_micro_usd_total`, `flow_refills_total`       | venue / pair                | routing mix, volume (µUSD), refills                 |
+| `router_quote_seconds`, `router_quote_errors_total`, `router_quotes_total`           | execution, status           | router latency and failures                         |
+| `oracle_price_updates_total`, `{orca_whirlpool,raydium_clmm,manifest}_actions_total` | —                           | feed health and per-venue transactions              |

@@ -6,13 +6,15 @@ use futures::StreamExt;
 use mtm_chain::{ChainClient, SubmissionConfig};
 use mtm_dex_harness::spl;
 use rust_decimal::Decimal;
+use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_pubkey::Pubkey;
+use solana_rpc_client_api::config::RpcAccountInfoConfig;
 use solana_signer::Signer;
 
 use crate::Token;
 use crate::venue::to_atoms;
 
-const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct TopUp {
@@ -51,6 +53,63 @@ pub async fn token_balance(chain: &ChainClient, owner: &Pubkey, token: &Token) -
         .flatten()
         .and_then(|account| spl::decode_token_account(&account.data))
         .map_or(0, |state| state.amount))
+}
+
+/// One wallet's lamports and token balances, read in a single
+/// `getMultipleAccounts` at the client's commitment. With `min_context_slot`
+/// the node must have reached that slot, so a read right after a
+/// confirmation in that slot cannot see the pre-transaction state. Returns
+/// the context slot of the read alongside the balances.
+pub async fn wallet_balances(
+    chain: &ChainClient,
+    owner: &Pubkey,
+    tokens: &[&Token],
+    min_context_slot: Option<u64>,
+) -> Result<WalletBalances> {
+    let mut keys = vec![*owner];
+    keys.extend(
+        tokens
+            .iter()
+            .map(|token| spl::associated_token_address(owner, &token.mint, &token.token_program)),
+    );
+    let config = RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::Base64),
+        commitment: Some(chain.rpc().commitment()),
+        min_context_slot,
+        ..RpcAccountInfoConfig::default()
+    };
+    let response = chain
+        .rpc()
+        .get_multiple_ui_accounts_with_config(&keys, config)
+        .await
+        .context("reading wallet balances")?;
+    let mut accounts = response.value.into_iter();
+    let lamports = accounts
+        .next()
+        .flatten()
+        .map_or(0, |account| account.lamports);
+    let tokens = accounts
+        .map(|account| {
+            account
+                .and_then(|account| account.data.decode())
+                .and_then(|data| spl::decode_token_account(&data))
+                .map_or(0, |state| state.amount)
+        })
+        .collect();
+    Ok(WalletBalances {
+        slot: response.context.slot,
+        lamports,
+        tokens,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletBalances {
+    /// context slot the accounts were read at
+    pub slot: u64,
+    pub lamports: u64,
+    /// atoms, in the order the tokens were requested (0 for a missing ATA)
+    pub tokens: Vec<u64>,
 }
 
 /// Token balances for many `(owner, token)` pairs and SOL balances for

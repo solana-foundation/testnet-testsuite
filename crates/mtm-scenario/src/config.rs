@@ -197,6 +197,47 @@ fn default_max_price_age_ms() -> u64 {
 fn default_orca_tick_spacing() -> u16 {
     64
 }
+impl FlowConfig {
+    /// Checks the sampling parameters up front: a bad value would otherwise
+    /// end every taker loop at its first arrival.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let probability = |name: &str, p: f64| {
+            if (0.0..=1.0).contains(&p) {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("flow.{name} must be in [0, 1], got {p}"))
+            }
+        };
+        if self.takers == 0 {
+            anyhow::bail!("flow.takers must be positive");
+        }
+        if !(self.rate_per_min.is_finite() && self.rate_per_min > 0.0) {
+            anyhow::bail!("flow.rate_per_min must be positive");
+        }
+        if !(self.median_usd.is_finite() && self.median_usd > 0.0) {
+            anyhow::bail!("flow.median_usd must be positive");
+        }
+        if !(self.sigma.is_finite() && self.sigma >= 0.0) {
+            anyhow::bail!("flow.sigma must be non-negative");
+        }
+        if !(self.large_multiplier.is_finite() && self.large_multiplier > 0.0) {
+            anyhow::bail!("flow.large_multiplier must be positive");
+        }
+        probability("large_probability", self.large_probability)?;
+        probability("exact_out_probability", self.exact_out_probability)?;
+        if self.slippage_bps > 10_000 {
+            anyhow::bail!("flow.slippage_bps must be at most 10000");
+        }
+        if self.pairs.is_empty() {
+            anyhow::bail!("flow.pairs is empty");
+        }
+        if self.pairs.iter().any(|(a, b)| a == b) {
+            anyhow::bail!("flow.pairs has a token paired with itself");
+        }
+        Ok(())
+    }
+}
+
 impl MakerConfig {
     /// Parameter ranges a strategy needs to make sense.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -306,5 +347,38 @@ mod tests {
         let mut m = maker(range(600, 200));
         m.execution.slippage_bps = Some(10_001);
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn flow_sampling_parameters_are_checked() {
+        let flow = || FlowConfig {
+            takers: 2,
+            rate_per_min: 10.0,
+            median_usd: 50.0,
+            sigma: 0.8,
+            large_probability: 0.05,
+            large_multiplier: 20.0,
+            exact_out_probability: 0.2,
+            slippage_bps: 100,
+            pairs: vec![("SOL".to_owned(), "USDC".to_owned())],
+            inventory: BTreeMap::new(),
+            sol: Decimal::ONE,
+            refill_below_ratio: Decimal::new(3, 1),
+            rng_seed: 0,
+        };
+        assert!(flow().validate().is_ok());
+        let broken: [fn(&mut FlowConfig); 6] = [
+            |f| f.takers = 0,
+            |f| f.rate_per_min = 0.0,
+            |f| f.median_usd = f64::NAN,
+            |f| f.exact_out_probability = 1.5,
+            |f| f.pairs.clear(),
+            |f| f.pairs = vec![("SOL".to_owned(), "SOL".to_owned())],
+        ];
+        for breaker in broken {
+            let mut f = flow();
+            breaker(&mut f);
+            assert!(f.validate().is_err(), "{f:?}");
+        }
     }
 }
