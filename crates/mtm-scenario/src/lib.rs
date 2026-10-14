@@ -157,9 +157,13 @@ impl Scenario {
             }
         }
         if let Some(flow) = &self.config.flow {
+            flow.validate()?;
             for (a, b) in &flow.pairs {
                 self.token(a)?;
                 self.token(b)?;
+            }
+            for name in flow.inventory.keys() {
+                self.token(name)?;
             }
         }
         Ok(())

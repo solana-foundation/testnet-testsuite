@@ -106,12 +106,13 @@ impl Arb {
             signature = %outcome.signature, "arbitraged pool toward oracle"
         );
         ctx.action(if buy_base { "arb_buy" } else { "arb_sell" });
-        metrics::counter!("mm_arb_volume_usd", "maker" => ctx.name()).increment(
-            rust_decimal::prelude::ToPrimitive::to_u64(
-                &(mtm_scenario::venue::to_ui(input, amount) * prices.usd(input)?),
-            )
-            .unwrap_or_default(),
-        );
+        // Micro-USD: whole dollars would drop most of a small arb's volume.
+        let micro_usd = (mtm_scenario::venue::to_ui(input, amount)
+            * prices.usd(input)?
+            * rust_decimal::Decimal::from(1_000_000))
+        .round();
+        metrics::counter!("mm_arb_volume_micro_usd_total", "maker" => ctx.name())
+            .increment(rust_decimal::prelude::ToPrimitive::to_u64(&micro_usd).unwrap_or_default());
         Ok(())
     }
 }

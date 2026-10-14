@@ -25,6 +25,8 @@ rust_decimal = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 solana-keypair = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+solana-signature = { workspace = true }
 solana-signer = { workspace = true }
 solana-transaction = { workspace = true, features = ["wincode"] }
 tokio = { workspace = true }
