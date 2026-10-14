@@ -508,6 +508,27 @@ impl RaydiumClmmClient {
         .await
     }
 
+    /// Token amounts the payer's position would return if fully withdrawn
+    /// now (at the current pool price), plus fees already owed.
+    pub async fn position_value(&self, position_mint: Pubkey) -> Result<PositionValue> {
+        let position = self.load_position(position_mint).await?;
+        let bundle = self.load_pool(position.pool).await?;
+        let (amount_0, amount_1) = if position.liquidity == 0 {
+            (0, 0)
+        } else {
+            let quote = self.decrease_quote(&bundle, &position, position.liquidity)?;
+            (quote.amount_0_raw, quote.amount_1_raw)
+        };
+        Ok(PositionValue {
+            pool: position.pool,
+            mint_a: bundle.mint_0.key,
+            mint_b: bundle.mint_1.key,
+            amount_a: amount_0.saturating_add(position.fees_owed_0),
+            amount_b: amount_1.saturating_add(position.fees_owed_1),
+            liquidity: position.liquidity,
+        })
+    }
+
     pub async fn close_position(&self, position_mint: Pubkey) -> Result<ClosePositionOutcome> {
         self.run("close_position", position_mint, async move {
             let position = self.load_position(position_mint).await?;
@@ -2020,6 +2041,17 @@ pub struct PositionAccounts {
 pub struct CollectOutcome {
     pub transaction: TransactionOutcome,
     pub position: PositionAccounts,
+}
+
+/// Withdrawable value of one position, in raw atoms of the pool's mints.
+#[derive(Clone, Copy, Debug)]
+pub struct PositionValue {
+    pub pool: Pubkey,
+    pub mint_a: Pubkey,
+    pub mint_b: Pubkey,
+    pub amount_a: u64,
+    pub amount_b: u64,
+    pub liquidity: u128,
 }
 
 #[derive(Clone, Debug)]
