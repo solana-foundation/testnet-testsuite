@@ -57,7 +57,7 @@ All state is derived or idempotent, so every command can be re-run:
 Prerequisites: the three fork artifacts (see [docs/dex-forks.md](../../docs/dex-forks.md))
 at `../raydium-clmm`, `../whirlpools`, `../manifest` (or set
 `SCENARIO_RAYDIUM_SO`, `SCENARIO_ORCA_SO`, `SCENARIO_MANIFEST_SO`), an Agave
-≥ 4.x `solana` CLI (Manifest is SBPF v3), and `pnpm install`.
+≥ 4.x `solana` CLI (Manifest is SBPF v3), `curl` and `jq`, and `pnpm install`.
 
 ```sh
 NO_DNA=1 just scenario-surfpool      # terminal 1: Surfpool forking testnet (Metaplex for token metadata)

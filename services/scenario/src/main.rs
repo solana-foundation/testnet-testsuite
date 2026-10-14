@@ -14,10 +14,10 @@ use clap::{Parser, Subcommand};
 use mtm_chain::ChainClient;
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::{keypair_from_environment, signer_from_environment};
-use mtm_scenario::funding::{Funding, token_balance, top_up};
+use mtm_scenario::funding::{Funding, LAMPORTS_PER_SOL, balances, top_up};
 use mtm_scenario::pricing::PriceBook;
 use mtm_scenario::venue::to_ui;
-use mtm_scenario::{Scenario, ScenarioConfig, Venue};
+use mtm_scenario::{Scenario, ScenarioConfig, Token, Venue};
 use oracle_client::OracleClient;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -70,10 +70,12 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+    // Parse first: `--help` and argument errors need neither RPC nor secrets.
+    let cli = Cli::parse();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
-    let report = match Cli::parse().command {
+    let report = match cli.command {
         Command::Bootstrap {
             faucet_keypair_env,
             mint_authority_keypair_env,
@@ -171,7 +173,9 @@ async fn bootstrap(
                 .is_some(),
             None => false,
         };
-        let price = prices.pair(base, quote)?.round_dp(6);
+        // Significant figures, not decimal places: a fixed 6 dp is 2-5% off
+        // for a ~2e-5 pair and rounds anything below 5e-7 to zero.
+        let price = round_sf(prices.pair(base, quote)?, 8)?;
         let address = if exists {
             existing
         } else {
@@ -191,8 +195,8 @@ async fn bootstrap(
                         mint_a: base.mint,
                         mint_b: quote.mint,
                         initial_price: price,
-                        seed_lower_price: (price / Decimal::from(3)).round_dp(8),
-                        seed_upper_price: (price * Decimal::from(3)).round_dp(8),
+                        seed_lower_price: round_sf(price / Decimal::from(3), 8)?,
+                        seed_upper_price: round_sf(price * Decimal::from(3), 8)?,
                     })
                     .await?
                     .create_pool
@@ -327,19 +331,41 @@ async fn status(chain: &ChainClient, scenario: &Scenario) -> Result<Value> {
             )
         }));
     }
+    // Batched reads: one round trip per 100 accounts instead of one per
+    // (wallet, token).
+    let tokens: Vec<&Token> = scenario.tokens.values().collect();
+    let pairs: Vec<(solana_pubkey::Pubkey, &Token)> = roles
+        .iter()
+        .flat_map(|(_, wallet)| tokens.iter().map(|token| (*wallet, *token)))
+        .collect();
+    let owners: Vec<solana_pubkey::Pubkey> = roles.iter().map(|(_, wallet)| *wallet).collect();
+    let (atoms, lamports) = balances(chain, &pairs, &owners).await?;
     let mut wallets = Vec::new();
-    for (role, wallet) in roles {
-        let mut balances = serde_json::Map::new();
-        for token in scenario.tokens.values() {
-            let atoms = token_balance(chain, &wallet, token).await?;
-            balances.insert(token.name.clone(), json!(to_ui(token, atoms).to_string()));
+    for (index, (role, wallet)) in roles.into_iter().enumerate() {
+        let mut held = serde_json::Map::new();
+        for (token, atoms) in tokens
+            .iter()
+            .zip(&atoms[index * tokens.len()..(index + 1) * tokens.len()])
+        {
+            held.insert(token.name.clone(), json!(to_ui(token, *atoms).to_string()));
         }
-        let lamports = chain.rpc().get_balance(&wallet).await?;
-        balances.insert(
+        held.insert(
             "SOL".into(),
-            json!(Decimal::new(lamports as i64, 9).normalize().to_string()),
+            json!(
+                (Decimal::from(lamports[index]) / Decimal::from(LAMPORTS_PER_SOL))
+                    .normalize()
+                    .to_string()
+            ),
         );
-        wallets.push(json!({ "role": role, "wallet": wallet.to_string(), "balances": balances }));
+        wallets.push(json!({ "role": role, "wallet": wallet.to_string(), "balances": held }));
     }
     Ok(json!({ "pools": pools, "wallets": wallets }))
+}
+
+fn round_sf(value: Decimal, digits: u32) -> Result<Decimal> {
+    value
+        .round_sf(digits)
+        .map(|rounded| rounded.normalize())
+        .filter(|rounded| !rounded.is_zero())
+        .with_context(|| format!("price {value} does not round to a usable value"))
 }

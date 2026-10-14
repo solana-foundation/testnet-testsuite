@@ -7,6 +7,7 @@ use mtm_chain::{ChainClient, SubmissionConfig};
 use mtm_dex_harness::spl;
 use rust_decimal::Decimal;
 use solana_account_decoder_client_types::UiAccountEncoding;
+use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
 use solana_signer::Signer;
@@ -192,14 +193,17 @@ pub async fn top_up(
         .get_balance(owner)
         .await
         .context("reading SOL balance")?;
-    let mut instructions = Vec::new();
+    // Groups that must land together: a create-ATA and its mint share a
+    // transaction, or a failed second half would leave an empty ATA that
+    // `Endowment` then treats as already funded.
+    let mut groups: Vec<Vec<Instruction>> = Vec::new();
     if lamports < target_lamports {
         outcome.lamports_sent = target_lamports - lamports;
-        instructions.push(spl::system_transfer(
+        groups.push(vec![spl::system_transfer(
             &faucet.pubkey(),
             owner,
             outcome.lamports_sent,
-        ));
+        )]);
     }
     for (token, amount) in tokens {
         let target = to_atoms(token, *amount).context("token target overflow")?;
@@ -211,29 +215,36 @@ pub async fn top_up(
             continue;
         }
         let ata = spl::associated_token_address(owner, &token.mint, &token.token_program);
-        instructions.push(spl::create_associated_token_account_idempotent(
-            &faucet.pubkey(),
-            owner,
-            &token.mint,
-            &token.token_program,
-        ));
-        instructions.push(spl::mint_to_checked(
-            &token.token_program,
-            &token.mint,
-            &ata,
-            &mint_authority.pubkey(),
-            target - balance,
-            token.decimals,
-        ));
+        groups.push(vec![
+            spl::create_associated_token_account_idempotent(
+                &faucet.pubkey(),
+                owner,
+                &token.mint,
+                &token.token_program,
+            ),
+            spl::mint_to_checked(
+                &token.token_program,
+                &token.mint,
+                &ata,
+                &mint_authority.pubkey(),
+                target - balance,
+                token.decimals,
+            ),
+        ]);
         outcome.minted.push((token.name.clone(), target - balance));
     }
     // A legacy transaction fits the SOL transfer plus four (create ATA,
-    // mint) pairs; larger inventories go out in several transactions.
+    // mint) pairs; larger inventories go out in several transactions, whole
+    // groups at a time.
     const PER_TRANSACTION: usize = 9;
-    let mut remaining = instructions.as_slice();
-    while !remaining.is_empty() {
-        let (chunk, rest) = remaining.split_at(remaining.len().min(PER_TRANSACTION));
-        remaining = rest;
+    let mut transactions: Vec<Vec<Instruction>> = Vec::new();
+    for group in groups {
+        match transactions.last_mut() {
+            Some(last) if last.len() + group.len() <= PER_TRANSACTION => last.extend(group),
+            _ => transactions.push(group),
+        }
+    }
+    for chunk in transactions {
         // The mint authority signs only when the chunk mints.
         let mints = chunk.iter().any(|ix| {
             ix.accounts
@@ -242,7 +253,7 @@ pub async fn top_up(
         });
         let signers: &[&dyn Signer] = if mints { &[mint_authority] } else { &[] };
         chain
-            .submit(chunk.to_vec(), faucet, signers, SubmissionConfig::default())
+            .submit(chunk, faucet, signers, SubmissionConfig::default())
             .await
             .with_context(|| format!("topping up {owner}"))?;
     }
