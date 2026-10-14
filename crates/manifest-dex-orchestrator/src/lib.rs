@@ -18,7 +18,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use thiserror::Error;
-use tracing::{info, info_span};
+use tracing::{Instrument, info, info_span, warn};
 
 pub type Result<T> = std::result::Result<T, OrchestrationError>;
 
@@ -152,7 +152,8 @@ impl ManifestOrchestrator {
         self.payer
     }
 
-    /// Reuse the oldest market for the pair (by address) or create one.
+    /// Reuse the pair's first market as `find_markets` lists it (lowest
+    /// address, not oldest) or create one.
     pub async fn create_market_flow(
         &self,
         params: MarketCreationParams,
@@ -168,33 +169,38 @@ impl ManifestOrchestrator {
             quote_mint = %params.quote_mint,
             payer = %self.payer(),
         );
-        let _entered = span.enter();
-        self.validate_program().await?;
-        if !params.allow_duplicate
-            && let Some(market) = self
+        // `.instrument` rather than `span.enter()`: an entered guard held across
+        // `.await` attributes other tasks' events to this span.
+        async {
+            self.validate_program().await?;
+            if !params.allow_duplicate
+                && let Some(market) = self
+                    .client
+                    .find_markets(params.base_mint, params.quote_mint)
+                    .await?
+                    .first()
+            {
+                info!(%market, "reusing existing Manifest market");
+                return Ok(MarketCreationOutcome {
+                    market: *market,
+                    created: None,
+                });
+            }
+            let created = self
                 .client
-                .find_markets(params.base_mint, params.quote_mint)
-                .await?
-                .first()
-        {
-            info!(%market, "reusing existing Manifest market");
-            return Ok(MarketCreationOutcome {
-                market: *market,
-                created: None,
-            });
-        }
-        let created = self
-            .client
-            .create_market(CreateMarketParams {
-                base_mint: params.base_mint,
-                quote_mint: params.quote_mint,
+                .create_market(CreateMarketParams {
+                    base_mint: params.base_mint,
+                    quote_mint: params.quote_mint,
+                })
+                .await?;
+            info!(market = %created.market, "Manifest market created");
+            Ok(MarketCreationOutcome {
+                market: created.market,
+                created: Some(created),
             })
-            .await?;
-        info!(market = %created.market, "Manifest market created");
-        Ok(MarketCreationOutcome {
-            market: created.market,
-            created: Some(created),
-        })
+        }
+        .instrument(span)
+        .await
     }
 
     /// Fund the user, make and take on an existing market, then cancel and
@@ -208,82 +214,117 @@ impl ManifestOrchestrator {
             quote_mint = %params.quote_mint,
             payer = %self.payer(),
         );
-        let _entered = span.enter();
-        self.validate_program().await?;
+        async {
+            self.validate_program().await?;
 
-        let funding = self.fund_payer(params).await?;
-        let claim_seat = self.client.claim_seat(params.market).await?;
-        let deposit_base = self
-            .client
-            .deposit(
-                params.market,
-                TokenAmount {
-                    mint: params.base_mint,
-                    amount: params.deposit_base,
-                },
-            )
-            .await?;
-        let deposit_quote = self
-            .client
-            .deposit(
-                params.market,
-                TokenAmount {
-                    mint: params.quote_mint,
-                    amount: params.deposit_quote,
-                },
-            )
-            .await?;
-        let (bid, ask) = straddle(params.mid_price, params.spread_bps)?;
-        let place_orders = self
-            .client
-            .place_orders(
-                params.market,
-                &[
-                    OrderSpec {
-                        side: Side::Bid,
-                        price: bid,
-                        base_amount: params.order_size,
-                    },
-                    OrderSpec {
-                        side: Side::Ask,
-                        price: ask,
-                        base_amount: params.order_size,
-                    },
-                ],
-            )
-            .await?;
-        let swap_exact_in = self
-            .client
-            .swap_exact_in(SwapExactInParams {
-                market: params.market,
-                input_mint: params.base_mint,
-                output_mint: params.quote_mint,
-                amount_in: params.exact_in_amount,
+            let funding = self.fund_payer(params).await?;
+            let claim_seat = self.client.claim_seat(params.market).await?;
+            // From here the seat holds deposits and may rest orders: on failure,
+            // cancel and withdraw (best effort) before returning the error, so
+            // neither stays locked in the market nor pollutes later quotes.
+            let trading = async {
+                let deposit_base = self
+                    .client
+                    .deposit(
+                        params.market,
+                        TokenAmount {
+                            mint: params.base_mint,
+                            amount: params.deposit_base,
+                        },
+                    )
+                    .await?;
+                let deposit_quote = self
+                    .client
+                    .deposit(
+                        params.market,
+                        TokenAmount {
+                            mint: params.quote_mint,
+                            amount: params.deposit_quote,
+                        },
+                    )
+                    .await?;
+                let (bid, ask) = straddle(params.mid_price, params.spread_bps)?;
+                let place_orders = self
+                    .client
+                    .place_orders(
+                        params.market,
+                        &[
+                            OrderSpec {
+                                side: Side::Bid,
+                                price: bid,
+                                base_amount: params.order_size,
+                            },
+                            OrderSpec {
+                                side: Side::Ask,
+                                price: ask,
+                                base_amount: params.order_size,
+                            },
+                        ],
+                    )
+                    .await?;
+                let swap_exact_in = self
+                    .client
+                    .swap_exact_in(SwapExactInParams {
+                        market: params.market,
+                        input_mint: params.base_mint,
+                        output_mint: params.quote_mint,
+                        amount_in: params.exact_in_amount,
+                    })
+                    .await?;
+                let swap_exact_out = self
+                    .client
+                    .swap_exact_out(SwapExactOutParams {
+                        market: params.market,
+                        input_mint: params.quote_mint,
+                        output_mint: params.base_mint,
+                        amount_out: params.exact_out_amount,
+                    })
+                    .await?;
+                Ok::<_, OrchestrationError>((
+                    deposit_base,
+                    deposit_quote,
+                    place_orders,
+                    swap_exact_in,
+                    swap_exact_out,
+                ))
+            }
+            .await;
+            let (deposit_base, deposit_quote, place_orders, swap_exact_in, swap_exact_out) =
+                match trading {
+                    Ok(steps) => steps,
+                    Err(error) => {
+                        self.unwind(params.market).await;
+                        return Err(error);
+                    }
+                };
+            let cancel_orders = self.client.cancel_all_orders(params.market).await?;
+            let withdraw = self.client.withdraw_all(params.market).await?;
+            info!(market = %params.market, "Manifest user flow complete");
+            Ok(UserFlowOutcome {
+                funding,
+                claim_seat,
+                deposit_base,
+                deposit_quote,
+                place_orders,
+                swap_exact_in,
+                swap_exact_out,
+                cancel_orders,
+                withdraw,
             })
-            .await?;
-        let swap_exact_out = self
-            .client
-            .swap_exact_out(SwapExactOutParams {
-                market: params.market,
-                input_mint: params.quote_mint,
-                output_mint: params.base_mint,
-                amount_out: params.exact_out_amount,
-            })
-            .await?;
-        let cancel_orders = self.client.cancel_all_orders(params.market).await?;
-        let withdraw = self.client.withdraw_all(params.market).await?;
-        info!(market = %params.market, "Manifest user flow complete");
-        Ok(UserFlowOutcome {
-            funding,
-            claim_seat,
-            deposit_base,
-            deposit_quote,
-            place_orders,
-            swap_exact_in,
-            swap_exact_out,
-            cancel_orders,
-            withdraw,
-        })
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Best-effort cleanup after a failed flow: cancel the seat's resting
+    /// orders, then withdraw its balances.
+    async fn unwind(&self, market: Pubkey) {
+        if let Err(error) = self.client.cancel_all_orders(market).await {
+            warn!(%market, %error, "failed to cancel resting orders after a failed flow");
+        }
+        if let Err(error) = self.client.withdraw_all(market).await {
+            warn!(%market, %error, "failed to withdraw the seat after a failed flow");
+        }
     }
 
     async fn fund_payer(&self, params: UserFlowParams) -> Result<FundingOutcome> {
@@ -374,7 +415,13 @@ fn validate_user_flow_params(params: UserFlowParams) -> Result<()> {
         ));
     }
     let (bid, ask) = straddle(params.mid_price, params.spread_bps)?;
-    if params.order_size > params.deposit_base || params.order_size * bid > params.deposit_quote {
+    let notional = |base: Decimal, price: Decimal| {
+        base.checked_mul(price)
+            .ok_or_else(|| OrchestrationError::InvalidInput("order notional overflow".to_owned()))
+    };
+    if params.order_size > params.deposit_base
+        || notional(params.order_size, bid)? > params.deposit_quote
+    {
         return Err(OrchestrationError::InvalidInput(
             "deposits must cover one resting order per side".to_owned(),
         ));
@@ -384,8 +431,13 @@ fn validate_user_flow_params(params: UserFlowParams) -> Result<()> {
             "swaps must fit inside the resting orders".to_owned(),
         ));
     }
-    // The taker pays for the exact-out swap from its wallet, after the deposits.
-    if params.exact_out_amount * ask > params.funding_quote - params.deposit_quote {
+    // The taker swaps from its wallet, after the deposits.
+    if params.exact_in_amount > params.funding_base - params.deposit_base {
+        return Err(OrchestrationError::InvalidInput(
+            "funding_base must cover the exact-in swap after deposits".to_owned(),
+        ));
+    }
+    if notional(params.exact_out_amount, ask)? > params.funding_quote - params.deposit_quote {
         return Err(OrchestrationError::InvalidInput(
             "funding_quote must cover the exact-out swap after deposits".to_owned(),
         ));
@@ -447,5 +499,15 @@ mod tests {
             ..params()
         };
         assert!(validate_user_flow_params(too_big).is_err());
+    }
+
+    #[test]
+    fn rejects_an_exact_in_swap_the_wallet_cannot_fund() {
+        // Everything but 5 base goes into the seat; the swap needs 10 from the wallet.
+        let short = UserFlowParams {
+            funding_base: Decimal::from(1_005),
+            ..params()
+        };
+        assert!(validate_user_flow_params(short).is_err());
     }
 }
