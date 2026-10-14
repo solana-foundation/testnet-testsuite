@@ -611,8 +611,29 @@ impl OrcaWhirlpoolClient {
         .await
     }
 
-    /// Token amounts the payer's position would return if fully withdrawn
-    /// now (at the current pool price), plus fees already owed.
+    /// The mint a position over `[lower_price, upper_price]` (pool order, B per
+    /// A) is opened with at the pool's current price: a range above the price
+    /// holds only A and one at or below it only B, so a deposit of the other
+    /// mint resolves to zero liquidity. Inside the range either works; A is
+    /// returned.
+    pub async fn deposit_mint(
+        &self,
+        pool: Pubkey,
+        lower_price: Decimal,
+        upper_price: Decimal,
+    ) -> Result<Pubkey> {
+        let bundle = self.load_pool(pool).await?;
+        let (_, tick_upper) = self.price_range_to_ticks(&bundle, lower_price, upper_price)?;
+        Ok(if bundle.whirlpool.tick_current_index >= tick_upper {
+            bundle.mint_b.key
+        } else {
+            bundle.mint_a.key
+        })
+    }
+
+    /// What the position returns if fully withdrawn and its fees collected
+    /// now, in raw atoms received (net of each mint's transfer fee). Rewards
+    /// are not included.
     pub async fn position_value(&self, position_mint: Pubkey) -> Result<PositionValue> {
         let position = self.load_position(position_mint).await?;
         let bundle = self.load_pool(position.pool).await?;
@@ -697,18 +718,25 @@ impl OrcaWhirlpoolClient {
             outside[1].1,
             position.fee_checkpoint.1,
         );
+        // The liquidity estimate is already net of transfer fees; collected
+        // fees pay the mint's transfer fee too.
+        let net = |amount: u64, fee: Option<core::TransferFee>| {
+            core::try_apply_transfer_fee(amount, fee.unwrap_or_default()).map_err(quote_error)
+        };
+        let fees_a = net(
+            position.fee_owed_a.saturating_add(fees_a),
+            bundle.transfer_fee_a,
+        )?;
+        let fees_b = net(
+            position.fee_owed_b.saturating_add(fees_b),
+            bundle.transfer_fee_b,
+        )?;
         Ok(PositionValue {
             pool: position.pool,
             mint_a: bundle.mint_a.key,
             mint_b: bundle.mint_b.key,
-            amount_a: quote
-                .token_est_a
-                .saturating_add(position.fee_owed_a)
-                .saturating_add(fees_a),
-            amount_b: quote
-                .token_est_b
-                .saturating_add(position.fee_owed_b)
-                .saturating_add(fees_b),
+            amount_a: quote.token_est_a.saturating_add(fees_a),
+            amount_b: quote.token_est_b.saturating_add(fees_b),
             liquidity: position.liquidity,
         })
     }
@@ -2517,7 +2545,30 @@ fn quote_error(error: core::CoreError) -> OrcaWhirlpoolError {
 }
 
 /// Anchor account discriminator: `sha256("account:<Name>")[..8]`.
+/// Anchor account discriminator: the first 8 bytes of
+/// `sha256("account:<Name>")`. Cached for the accounts this client decodes,
+/// which are read on every quote (the generated client's constants are
+/// zeroed).
 fn account_discriminator(name: &str) -> [u8; 8] {
+    static KNOWN: std::sync::LazyLock<Vec<(&'static str, [u8; 8])>> =
+        std::sync::LazyLock::new(|| {
+            [
+                "Whirlpool",
+                "TickArray",
+                "Position",
+                "FeeTier",
+                "WhirlpoolsConfig",
+            ]
+            .map(|name| (name, compute_discriminator(name)))
+            .to_vec()
+        });
+    KNOWN.iter().find(|(known, _)| *known == name).map_or_else(
+        || compute_discriminator(name),
+        |(_, discriminator)| *discriminator,
+    )
+}
+
+fn compute_discriminator(name: &str) -> [u8; 8] {
     let digest = Sha256::digest(format!("account:{name}").as_bytes());
     let mut discriminator = [0_u8; 8];
     discriminator.copy_from_slice(&digest[..8]);
@@ -2775,6 +2826,20 @@ mod liquidity_bound_tests {
             position_amounts(LIQUIDITY, moved(Q64, 0.996), lower, upper, false).expect("down");
         assert!(got_a >= widened.token_min_a && got_b >= widened.token_min_b);
         assert!(got_a < quote.token_min_a || got_b < quote.token_min_b);
+    }
+
+    #[test]
+    fn cached_discriminators_match_their_hash() {
+        for name in [
+            "Whirlpool",
+            "TickArray",
+            "Position",
+            "FeeTier",
+            "WhirlpoolsConfig",
+            "Other",
+        ] {
+            assert_eq!(account_discriminator(name), compute_discriminator(name));
+        }
     }
 
     #[test]
