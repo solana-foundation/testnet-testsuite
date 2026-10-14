@@ -259,7 +259,7 @@ case "$cmd" in
     done
     ;;
   snapshot)
-    "$bin/scenario" snapshot --out "${args[0]}" --state-dir "$state/state"
+    "$bin/scenario" snapshot --out "${args[0]}"
     ;;
   report)
     "$bin/scenario" report --start "${args[0]}" --end "${args[1]}" \

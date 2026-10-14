@@ -118,8 +118,12 @@ plus uncollected fees). The report gives, per participant:
 
 - `tradingPnlUsd`: both inventories at end prices (the market move removed);
 - `markToMarketPnlUsd`: end value at end prices minus start value at start prices;
-- `solSpent` (fees), token deltas, landed/failed transactions in the slot
-  window (`getSignaturesForAddress`), and trade counts from service metrics.
+- `solSpent` (fees), token deltas, landed/failed transactions it signed in
+  the slot window (scanned block by block with `getBlock`, votes excluded),
+  and trade counts from service metrics.
+
+It also sums PnL per participant kind (`byKind`) and reports network-wide
+landed/failed transactions and TPS for the window (`network`).
 
 Taker refills mint tokens and would show up as PnL; for a clean window run
 flow with `MTM_SCENARIO__FLOW__REFILL_BELOW_RATIO=0`.

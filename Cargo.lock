@@ -3882,6 +3882,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "manifest-dex-client",
  "manifest-dex-orchestrator",
  "mtm-chain",
