@@ -141,9 +141,11 @@ pub struct UserFlowParams {
     pub lower_price: Decimal,
     /// Upper price in mint B per mint A.
     pub upper_price: Decimal,
-    /// UI amount of mint A used to open the position.
+    /// UI amount used to open the position, of mint A, or of mint B when the
+    /// pool price is at or above the range (the range then holds only B).
     pub open_amount: Decimal,
-    /// UI amount of mint A used to increase the position.
+    /// UI amount used to increase the position, in the same mint as
+    /// `open_amount`.
     pub increase_amount: Decimal,
     /// UI amount of mint A swapped to mint B.
     pub exact_in_amount: Decimal,
@@ -304,6 +306,11 @@ impl OrcaWhirlpoolOrchestrator {
                 params.lower_price,
                 params.upper_price,
             )?;
+            // A range the price has moved through takes only the other mint.
+            let deposit_mint = self
+                .client
+                .deposit_mint(params.pool, lower_price, upper_price)
+                .await?;
             let open_position = self
                 .client
                 .open_position(OpenPositionParams {
@@ -311,7 +318,7 @@ impl OrcaWhirlpoolOrchestrator {
                     lower_price,
                     upper_price,
                     input: TokenAmount {
-                        mint: params.mint_a,
+                        mint: deposit_mint,
                         amount: params.open_amount,
                     },
                     with_metadata: params.with_metadata,
@@ -323,7 +330,7 @@ impl OrcaWhirlpoolOrchestrator {
                 .increase_liquidity(IncreaseLiquidityParams {
                     position_mint,
                     input: TokenAmount {
-                        mint: params.mint_a,
+                        mint: deposit_mint,
                         amount: params.increase_amount,
                     },
                 })
