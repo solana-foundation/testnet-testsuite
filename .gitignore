@@ -6,6 +6,7 @@ dist/
 .surfpool
 .anchor
 /target
+programs/*/target
 /test-ledger
 /keys/*.json
 .pnpm-store/

@@ -1,0 +1,23 @@
+[package]
+name = "janitor-interface"
+description = "Instruction format shared by the janitor program and off-chain code"
+version = "0.1.0"
+edition = "2024"
+publish = false
+# No workspace inheritance: the janitor program builds in its own workspace
+# (programs/janitor) with the SBF toolchain and depends on this by path.
+
+[features]
+default = ["client"]
+# Instruction builders for off-chain code (the program uses only the core).
+client = ["dep:solana-instruction", "dep:solana-pubkey"]
+
+[dependencies]
+solana-instruction = { version = "3", optional = true }
+solana-pubkey = { version = "4", optional = true }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
