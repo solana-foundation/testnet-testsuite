@@ -8,6 +8,7 @@
 #   scenario.sh observe                 Prometheus :9190 + Grafana :3100 (dashboard
 #                                       "mtm — market-making scenario")
 #   scenario.sh down                    stop every service started by `up`/`observe`
+#                                       (TERM, then KILL after 30 s)
 #
 # Secrets come from the environment (normally `doppler run --`; see
 # bootstrap/scenario/README.md). Every step is idempotent, so `up` can be
@@ -51,14 +52,37 @@ pubkey_of() { # env var holding a keypair or pubkey → pubkey
   if [[ "$value" == \[* ]]; then solana-keygen pubkey <(printf %s "$value"); else printf %s "$value"; fi
 }
 
+running() { # name → true if its pid file names a live process running that binary
+  local pid
+  pid="$(cat "$state/pids/$1" 2>/dev/null)" || return 1
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
+  # A pid reused by an unrelated process does not count.
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- "$1"
+}
+
 start() { # name, command...
   local name="$1"; shift
-  if [[ -f "$state/pids/$name" ]] && kill -0 "$(cat "$state/pids/$name")" 2>/dev/null; then
+  if running "$name"; then
     echo "$name already running (pid $(cat "$state/pids/$name"))"; return
   fi
   nohup "$@" >>"$state/logs/$name.log" 2>&1 &
   echo $! >"$state/pids/$name"
   echo "started $name (pid $!, log .scenario/logs/$name.log)"
+}
+
+stop() { # name: TERM, wait up to 30 s, then KILL; the pid file goes only once it is gone
+  local name="$1" pid
+  running "$name" || { rm -f "$state/pids/$name"; return 0; }
+  pid="$(cat "$state/pids/$name")"
+  kill -CONT "$pid" 2>/dev/null || true # a SIGSTOPped process never handles TERM
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 60); do
+    kill -0 "$pid" 2>/dev/null || { rm -f "$state/pids/$name"; echo "stopped $name"; return 0; }
+    sleep 0.5
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$state/pids/$name"
+  echo "killed $name (no exit 30 s after TERM)"
 }
 
 wait_http() { # url, label
@@ -87,31 +111,51 @@ router_env() {
   export MTM_ROUTER__JUPITER__PROGRAM_ID="${PUBKEY_JUPITER_FORK:-}"
 }
 
-deploy() {
+program_exists() { # pubkey → 0 deployed, 1 absent; exits on an RPC error
+  # Only a definite "no account" may lead to `program deploy --program-id`,
+  # which would *upgrade* an existing program: a transient RPC error must not.
+  # At `confirmed`: the RPC default (finalized) misses a program deployed in
+  # the last ~30 slots.
+  local body
+  body="$(curl -sf -H 'content-type: application/json' "$rpc" -d \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$1\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\",\"dataSlice\":{\"offset\":0,\"length\":0}}]}")" \
+    || { echo "getAccountInfo $1 failed at $rpc" >&2; exit 1; }
+  case "$(jq -r 'if .error then "error" elif .result.value == null then "absent" else "present" end' <<<"$body")" in
+    present) return 0 ;;
+    absent) return 1 ;;
+    *) echo "getAccountInfo $1: $(jq -c .error <<<"$body")" >&2; exit 1 ;;
+  esac
+}
+
+deploy() (
   # Deploys each fork artifact at its program keypair, skipping programs that
   # are already deployed. Paths default to sibling fork checkouts.
   # Manifest is SBPF v3: use an Agave >= 4.x `solana` CLI.
+  # A subshell, so umask and traps stay local; the key directory is removed
+  # on any exit, Ctrl-C and SIGTERM included.
   umask 077
-  local dir
+  dir=""
+  trap '[[ -n "$dir" ]] && rm -rf "$dir"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   if [[ -d /dev/shm && -w /dev/shm ]]; then dir="$(mktemp -d /dev/shm/kp.XXXXXX)"; else dir="$(mktemp -d)"; fi
-  trap 'rm -rf "$dir"' RETURN
   printf %s "${KEYPAIR_PROGRAM_AUTHORITY:?missing secret}" >"$dir/authority.json"
   printf %s "${KEYPAIR_FAUCET:?missing secret}" >"$dir/faucet.json"
-  local flags=()
+  flags=()
   [[ "$target" == local ]] && flags+=(--use-rpc) # Surfpool has no TPU/QUIC
   for spec in \
     "KEYPAIR_RAYDIUM_CLMM:${SCENARIO_RAYDIUM_SO:-../raydium-clmm/target/deploy/raydium_clmm.so}" \
     "KEYPAIR_ORCA_WHIRLPOOL:${SCENARIO_ORCA_SO:-../whirlpools/target/deploy/whirlpool.so}" \
     "KEYPAIR_MANIFEST:${SCENARIO_MANIFEST_SO:-../manifest/target/deploy/manifest.so}"; do
-    local var="${spec%%:*}" so="${spec#*:}"
-    if solana program show -u "$rpc" "$(pubkey_of "$var")" >/dev/null 2>&1; then
+    var="${spec%%:*}" so="${spec#*:}"
+    if program_exists "$(pubkey_of "$var")"; then
       echo "$var already deployed"; continue
     fi
     printf %s "${!var:?missing secret: $var}" >"$dir/program.json"
     solana program deploy -u "$rpc" "${flags[@]}" --program-id "$dir/program.json" \
       --upgrade-authority "$dir/authority.json" --fee-payer "$dir/faucet.json" "$so"
   done
-}
+)
 
 observe() {
   # Docker when usable (ops/compose.scenario.yaml), else `prometheus` and
@@ -136,7 +180,7 @@ observe() {
     GF_SECURITY_ADMIN_PASSWORD="${GRAFANA_PASSWORD:-admin}" \
     GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH="$root/ops/grafana/dashboards/scenario.json" \
     start grafana grafana server --homepath "$home"
-  echo "grafana http://127.0.0.1:3100 (admin/${GRAFANA_PASSWORD:-admin}), prometheus http://127.0.0.1:9190"
+  echo "grafana http://127.0.0.1:3100 (user admin, password \$GRAFANA_PASSWORD or admin), prometheus http://127.0.0.1:9190"
 }
 
 case "$cmd" in
@@ -175,16 +219,19 @@ case "$cmd" in
     for pid in "$state"/pids/*; do
       [[ -f "$pid" ]] || continue
       name="$(basename "$pid")"
-      if kill -0 "$(cat "$pid")" 2>/dev/null; then echo "$name: running"; else echo "$name: stopped"; fi
+      if running "$name"; then echo "$name: running"; else echo "$name: stopped"; fi
     done
     ;;
   down)
+    # Takers first, so nothing trades against makers that are unwinding.
     for name in flow mm router oracle grafana prometheus; do
-      pid="$state/pids/$name"
-      [[ -f "$pid" ]] || continue
-      kill "$(cat "$pid")" 2>/dev/null && echo "stopped $name" || true
-      rm -f "$pid"
+      if [[ -f "$state/pids/$name" ]]; then stop "$name"; fi
     done
+    compose="${MTM_COMPOSE:-docker compose}"
+    if $compose version >/dev/null 2>&1 && ${compose%% *} ps >/dev/null 2>&1 \
+      && [[ -n "$($compose -f ops/compose.scenario.yaml ps -q 2>/dev/null)" ]]; then
+      $compose -f ops/compose.scenario.yaml down # volumes are kept
+    fi
     ;;
   *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|down)" >&2; exit 2 ;;
 esac

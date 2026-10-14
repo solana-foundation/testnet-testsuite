@@ -2678,6 +2678,7 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "solana-account-decoder-client-types",
+ "solana-instruction 3.5.1",
  "solana-keypair",
  "solana-pubkey 4.4.0",
  "solana-rpc-client-api",
