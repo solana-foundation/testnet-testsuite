@@ -361,4 +361,64 @@ mod tests {
             assert_eq!(profile.scenario.dev_seed.is_some(), dev_seed, "{name}");
         }
     }
+
+    /// Every generated scale overlay, layered over scenario-local the way
+    /// the config loader does (tables merge, arrays replace), parses and
+    /// passes the config checks the services run at start.
+    #[test]
+    fn scale_overlays_layer_and_validate() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct Profile {
+            scenario: ScenarioConfig,
+        }
+        fn merge(base: &mut toml::Value, over: toml::Value) {
+            match (base, over) {
+                (toml::Value::Table(base), toml::Value::Table(over)) => {
+                    for (key, value) in over {
+                        match base.get_mut(&key) {
+                            Some(slot) => merge(slot, value),
+                            None => {
+                                base.insert(key, value);
+                            }
+                        }
+                    }
+                }
+                (slot, value) => *slot = value,
+            }
+        }
+        let dir = format!("{}/../../config", env!("CARGO_MANIFEST_DIR"));
+        let read = |name: &str| -> toml::Value {
+            let text = std::fs::read_to_string(format!("{dir}/{name}")).expect("profile exists");
+            toml::from_str(&text).expect("parses")
+        };
+        let mut overlays: Vec<String> = std::fs::read_dir(&dir)
+            .expect("config dir")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("scale-") && name.ends_with(".toml"))
+            .collect();
+        overlays.sort();
+        assert!(!overlays.is_empty());
+        for overlay in overlays {
+            let mut layered = read("scenario-local.toml");
+            merge(&mut layered, read(&overlay));
+            let profile: Profile = layered.try_into().expect("layered profile deserializes");
+            let scenario = profile.scenario;
+            for maker in &scenario.makers {
+                maker.validate().expect(&overlay);
+            }
+            scenario
+                .flow
+                .as_ref()
+                .expect("flow")
+                .validate()
+                .expect(&overlay);
+            scenario
+                .arb
+                .as_ref()
+                .expect("arb")
+                .validate()
+                .expect(&overlay);
+        }
+    }
 }

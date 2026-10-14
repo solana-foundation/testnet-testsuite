@@ -8,8 +8,13 @@ mm, flow, arb, surfpool, prometheus, grafana): CPU (% of one core, from
 validator: landed transactions (getTransactionCount delta → TPS), slot
 rate, and RPC latency (getLatestBlockhash round trip). The output keeps
 every sample plus a summary (mean / p95 / max).
+
+TPS is getTransactionCount over time: against a local validator that is the
+scenario's own traffic; against a shared cluster (testnet) it counts every
+user's transactions and votes, so the summary labels it `tpsScope` and the
+participant-level counts in the report are the ones to use.
 """
-import argparse, json, os, statistics, time, urllib.request
+import argparse, json, os, statistics, time, urllib.parse, urllib.request
 
 SERVICES = ["oracle", "router", "mm", "flow", "arb", "surfpool", "prometheus", "grafana"]
 TICK = os.sysconf("SC_CLK_TCK")
@@ -57,7 +62,8 @@ def proc_times(pid):
 
 def machine():
     cpu = [int(v) for v in open("/proc/stat").readline().split()[1:]]
-    mem = {line.split(":")[0]: int(line.split()[1]) for line in open("/proc/meminfo")}
+    with open("/proc/meminfo") as meminfo:
+        mem = {line.split(":")[0]: int(line.split()[1]) for line in meminfo}
     return sum(cpu), cpu[3] + cpu[4], mem["MemAvailable"] * 1024
 
 
@@ -125,8 +131,12 @@ def main():
         time.sleep(max(0.0, args.interval - (time.monotonic() - now)))
 
     names = sorted({name for s in samples for name in s["services"]})
+    host = urllib.parse.urlparse(args.rpc).hostname or ""
+    local = host in ("127.0.0.1", "localhost", "::1")
     summary = {
         "samples": len(samples),
+        "cpus": os.cpu_count(),
+        "tpsScope": "local validator" if local else "network-wide (shared cluster: all users and votes)",
         "machineCpuPct": summarize([s["machineCpuPct"] for s in samples]),
         "memAvailableGiB": summarize([s["memAvailableGiB"] for s in samples]),
         "tps": summarize([s["tps"] for s in samples]),
@@ -140,7 +150,8 @@ def main():
             for name in names
         },
     }
-    json.dump({"summary": summary, "samples": samples}, open(args.out, "w"), indent=1)
+    with open(args.out, "w") as out:
+        json.dump({"summary": summary, "samples": samples}, out, indent=1)
     print(json.dumps(summary, indent=1))
 
 
