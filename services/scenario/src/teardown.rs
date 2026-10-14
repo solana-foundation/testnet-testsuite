@@ -20,14 +20,19 @@ use mtm_scenario::{Scenario, Strategy, Venue};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use solana_commitment_config::CommitmentConfig;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use tracing::{info, warn};
 
-/// One signature, no priority fee: what `ChainClient::submit` charges.
-const FEE_LAMPORTS: u64 = 5_000;
+use crate::rpc::JsonRpc;
+
+/// Compute-unit limits for teardown transactions: small, so they schedule
+/// easily next to other traffic (the default asks for 1.4M on every one).
+const CLOSE_CU_LIMIT: u32 = 200_000;
+const TRANSFER_CU_LIMIT: u32 = 2_000;
 /// Wallets swept concurrently.
 const CONCURRENCY: usize = 128;
 /// Token instructions per transaction (burn + close pairs).
@@ -38,34 +43,53 @@ const LAMPORTS_PER_SOL: f64 = 1e9;
 
 type SharedSigner = Arc<dyn Signer + Send + Sync>;
 
-/// Every participant wallet: makers, arb bots, takers.
+/// Every participant wallet with its keypair (the role is the wallet's
+/// derivation label).
 fn participants(scenario: &Scenario) -> Vec<(String, Keypair)> {
-    let mut out: Vec<(String, Keypair)> = scenario
-        .config
-        .makers
-        .iter()
-        .map(|maker| {
-            (
-                format!("maker/{}", maker.name),
-                scenario.maker_wallet(&maker.name),
-            )
+    scenario
+        .participants()
+        .into_iter()
+        .map(|p| {
+            let wallet = scenario.wallet(&p.role);
+            (p.role, wallet)
         })
-        .collect();
-    if let Some(arb) = &scenario.config.arb {
-        out.extend(
-            arb.bots
-                .iter()
-                .map(|bot| (format!("arb/{}", bot.name), scenario.arb_wallet(&bot.name))),
-        );
+        .collect()
+}
+
+/// `submit` settings for teardown: the client's defaults with a small
+/// compute-unit limit.
+fn submission(compute_unit_limit: u32) -> SubmissionConfig {
+    SubmissionConfig {
+        compute_unit_limit,
+        ..SubmissionConfig::default()
     }
-    if let Some(flow) = &scenario.config.flow {
-        out.extend((0..flow.takers).map(|i| (format!("taker/{i}"), scenario.taker_wallet(i))));
-    }
-    out
+}
+
+/// What the cluster charges for `instructions` as `submit` sends them
+/// (compute-budget instructions first), from `getFeeForMessage`: correct
+/// with or without a priority fee.
+async fn fee_for(
+    chain: &ChainClient,
+    payer: &Pubkey,
+    instructions: &[Instruction],
+    config: SubmissionConfig,
+) -> Result<u64> {
+    let mut all = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(config.compute_unit_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(config.compute_unit_price_micro_lamports),
+    ];
+    all.extend_from_slice(instructions);
+    let blockhash = chain.rpc().get_latest_blockhash().await?;
+    let message = solana_message::Message::new_with_blockhash(&all, Some(payer), &blockhash);
+    chain
+        .rpc()
+        .get_fee_for_message(&message)
+        .await
+        .context("getFeeForMessage")
 }
 
 /// Close every maker's venue exposure so its tokens are back in its wallet.
-async fn unwind_makers(chain: &ChainClient, scenario: &Scenario) -> Vec<Value> {
+async fn unwind_makers(chain: &ChainClient, rpc: &JsonRpc, scenario: &Scenario) -> Vec<Value> {
     futures::stream::iter(scenario.config.makers.iter().map(|maker| async move {
         let wallet: SharedSigner = Arc::new(scenario.maker_wallet(&maker.name));
         let outcome = match (&maker.strategy, maker.venue) {
@@ -73,7 +97,7 @@ async fn unwind_makers(chain: &ChainClient, scenario: &Scenario) -> Vec<Value> {
                 unwind_manifest(chain, scenario, maker, wallet).await
             }
             (_, Venue::OrcaWhirlpool | Venue::RaydiumClmm) => {
-                unwind_clmm(chain, scenario, maker.venue, wallet).await
+                unwind_clmm(chain, rpc, scenario, maker.venue, wallet).await
             }
             _ => Ok(json!({})),
         };
@@ -128,6 +152,7 @@ async fn unwind_manifest(
 /// wallet holds (closing returns the position, NFT mint, and NFT account rent).
 async fn unwind_clmm(
     chain: &ChainClient,
+    rpc: &JsonRpc,
     scenario: &Scenario,
     venue: Venue,
     wallet: SharedSigner,
@@ -135,7 +160,7 @@ async fn unwind_clmm(
     let owner = wallet.pubkey();
     let program = scenario.programs.of(venue);
     let confirmed = CommitmentConfig::confirmed();
-    let nfts: Vec<Pubkey> = token_accounts(chain, &owner)
+    let nfts: Vec<Pubkey> = token_accounts(rpc, &owner)
         .await?
         .into_iter()
         .filter(|account| account.decimals == 0 && account.amount == 1)
@@ -218,51 +243,48 @@ struct TokenAccount {
 
 /// Every token account `owner` holds under either token program, read at
 /// the client's commitment.
-async fn token_accounts(chain: &ChainClient, owner: &Pubkey) -> Result<Vec<TokenAccount>> {
-    let commitment = chain.rpc().commitment().commitment.to_string();
+async fn token_accounts(rpc: &JsonRpc, owner: &Pubkey) -> Result<Vec<TokenAccount>> {
     let mut out = Vec::new();
     for program in [spl::TOKEN_PROGRAM_ID, spl::TOKEN_2022_PROGRAM_ID] {
-        let response = raw_rpc(
-            chain,
-            "getTokenAccountsByOwner",
-            json!([owner.to_string(), { "programId": program.to_string() },
-                   { "encoding": "jsonParsed", "commitment": commitment }]),
-        )
-        .await?;
-        for account in response["value"].as_array().into_iter().flatten() {
+        let response = rpc
+            .call(
+                "getTokenAccountsByOwner",
+                json!([owner.to_string(), { "programId": program.to_string() },
+                       { "encoding": "jsonParsed", "commitment": rpc.commitment }]),
+            )
+            .await
+            .with_context(|| format!("listing {owner}'s token accounts"))?;
+        let accounts = response["value"]
+            .as_array()
+            .context("getTokenAccountsByOwner: no value array")?;
+        for account in accounts {
             let info = &account["account"]["data"]["parsed"]["info"];
             let parse = |value: &Value| value.as_str().and_then(|s| Pubkey::from_str(s).ok());
             let (Some(address), Some(mint)) = (parse(&account["pubkey"]), parse(&info["mint"]))
             else {
                 continue;
             };
+            // A balance that does not parse must not read as "empty": the
+            // account would be closed with tokens in it (which fails) or
+            // its tokens burned unseen.
+            let amount = info["tokenAmount"]["amount"]
+                .as_str()
+                .and_then(|a| a.parse().ok())
+                .with_context(|| format!("token account {address}: unreadable amount"))?;
+            let decimals = info["tokenAmount"]["decimals"]
+                .as_u64()
+                .and_then(|d| u8::try_from(d).ok())
+                .with_context(|| format!("token account {address}: unreadable decimals"))?;
             out.push(TokenAccount {
                 address,
                 program,
                 mint,
-                amount: info["tokenAmount"]["amount"]
-                    .as_str()
-                    .and_then(|a| a.parse().ok())
-                    .unwrap_or(0),
-                decimals: info["tokenAmount"]["decimals"].as_u64().unwrap_or(0) as u8,
+                amount,
+                decimals,
             });
         }
     }
     Ok(out)
-}
-
-async fn raw_rpc(chain: &ChainClient, method: &str, params: Value) -> Result<Value> {
-    let response: Value = reqwest::Client::new()
-        .post(chain.rpc().url())
-        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
-        .send()
-        .await?
-        .json()
-        .await?;
-    if let Some(error) = response.get("error") {
-        anyhow::bail!("{method}: {error}");
-    }
-    Ok(response["result"].clone())
 }
 
 /// `BurnChecked` (discriminant 15), same layout for Token and Token-2022.
@@ -296,6 +318,7 @@ struct Sweep {
 /// then send the wallet's remaining SOL to `treasury`, leaving it at zero.
 async fn sweep(
     chain: &ChainClient,
+    rpc: &JsonRpc,
     scenario: &Scenario,
     wallet: &Keypair,
     treasury: &Pubkey,
@@ -303,7 +326,7 @@ async fn sweep(
     let owner = wallet.pubkey();
     let mut out = Sweep::default();
     let mut instructions = Vec::new();
-    for account in token_accounts(chain, &owner).await? {
+    for account in token_accounts(rpc, &owner).await? {
         if account.amount > 0 && account.mint != NATIVE_MINT {
             if scenario.token_by_mint(&account.mint).is_none() {
                 out.left_open.push(account.address.to_string());
@@ -321,19 +344,28 @@ async fn sweep(
     }
     for chunk in instructions.chunks(PER_TRANSACTION) {
         chain
-            .submit(chunk.to_vec(), wallet, &[], SubmissionConfig::default())
+            .submit(chunk.to_vec(), wallet, &[], submission(CLOSE_CU_LIMIT))
             .await
             .with_context(|| format!("closing token accounts of {owner}"))?;
     }
     let lamports = chain.rpc().get_balance(&owner).await?;
-    if lamports > FEE_LAMPORTS {
-        let amount = lamports - FEE_LAMPORTS;
+    let config = submission(TRANSFER_CU_LIMIT);
+    // The transfer leaves exactly its own fee behind, priority fee included.
+    let fee = fee_for(
+        chain,
+        &owner,
+        &[spl::system_transfer(&owner, treasury, lamports)],
+        config,
+    )
+    .await?;
+    if lamports > fee {
+        let amount = lamports - fee;
         chain
             .submit(
                 vec![spl::system_transfer(&owner, treasury, amount)],
                 wallet,
                 &[],
-                SubmissionConfig::default(),
+                config,
             )
             .await
             .with_context(|| format!("sweeping SOL of {owner}"))?;
@@ -346,13 +378,14 @@ async fn sweep(
 
 async fn sweep_all(
     chain: &ChainClient,
+    rpc: &JsonRpc,
     scenario: &Scenario,
     wallets: Vec<(String, Keypair)>,
     treasury: &Pubkey,
 ) -> Value {
     let results: Vec<(String, Result<Sweep>)> =
         futures::stream::iter(wallets.into_iter().map(|(label, wallet)| async move {
-            let result = sweep(chain, scenario, &wallet, treasury).await;
+            let result = sweep(chain, rpc, scenario, &wallet, treasury).await;
             (label, result)
         }))
         .buffer_unordered(CONCURRENCY)
@@ -391,20 +424,21 @@ async fn sweep_all(
 /// also sweep these operator wallets (mint/program authorities, …).
 pub async fn teardown(
     chain: &ChainClient,
+    rpc: &JsonRpc,
     scenario: &Scenario,
     faucet: &Pubkey,
     operators: Vec<(String, Keypair)>,
 ) -> Result<Value> {
     let before = chain.rpc().get_balance(faucet).await?;
-    let makers = unwind_makers(chain, scenario).await;
+    let makers = unwind_makers(chain, rpc, scenario).await;
     let wallets = participants(scenario);
     let count = wallets.len();
     info!(wallets = count, "sweeping participant wallets");
-    let participants = sweep_all(chain, scenario, wallets, faucet).await;
+    let participants = sweep_all(chain, rpc, scenario, wallets, faucet).await;
     let operators = if operators.is_empty() {
         Value::Null
     } else {
-        sweep_all(chain, scenario, operators, faucet).await
+        sweep_all(chain, rpc, scenario, operators, faucet).await
     };
     let after = chain.rpc().get_balance(faucet).await?;
     Ok(json!({
@@ -479,17 +513,18 @@ fn render(buckets: BTreeMap<String, Bucket>) -> (Value, u64) {
 
 /// Accounts owned by `program`, labelled by Anchor discriminator (or size).
 async fn program_accounts(
-    chain: &ChainClient,
+    rpc: &JsonRpc,
     program: &Pubkey,
     names: &[&str],
 ) -> Result<BTreeMap<String, Bucket>> {
     let known: Vec<([u8; 8], &str)> = names.iter().map(|n| (discriminator(n), *n)).collect();
-    let accounts = raw_rpc(
-        chain,
-        "getProgramAccounts",
-        json!([program.to_string(), { "encoding": "base64", "dataSlice": { "offset": 0, "length": 8 } }]),
-    )
-    .await?;
+    let accounts = rpc
+        .call(
+            "getProgramAccounts",
+            json!([program.to_string(), { "encoding": "base64", "commitment": rpc.commitment, "dataSlice": { "offset": 0, "length": 8 } }]),
+        )
+        .await
+        .with_context(|| format!("listing {program}'s accounts"))?;
     let mut buckets = BTreeMap::new();
     for account in accounts.as_array().into_iter().flatten() {
         let lamports = account["account"]["lamports"].as_u64().unwrap_or(0);
@@ -515,6 +550,7 @@ fn base64_decode(text: &str) -> Result<Vec<u8>> {
 /// Rent still locked after a teardown, by owner and account type.
 pub async fn leftovers(
     chain: &ChainClient,
+    rpc: &JsonRpc,
     scenario: &Scenario,
     operators: &[(String, Pubkey)],
 ) -> Result<Value> {
@@ -527,7 +563,7 @@ pub async fn leftovers(
         ("raydium-clmm", programs.raydium_clmm, RAYDIUM_ACCOUNTS),
         ("manifest", programs.manifest, &[][..]),
     ] {
-        let mut buckets = program_accounts(chain, &program, names).await?;
+        let mut buckets = program_accounts(rpc, &program, names).await?;
         if name == "manifest" {
             // Manifest is not Anchor: its accounts are markets (and globals).
             buckets = buckets
@@ -551,16 +587,18 @@ pub async fn leftovers(
         .collect();
     let mut buckets = BTreeMap::new();
     for token in scenario.tokens.values() {
-        let accounts = raw_rpc(
-            chain,
-            "getProgramAccounts",
-            json!([token.token_program.to_string(), {
-                "encoding": "base64",
-                "dataSlice": { "offset": 32, "length": 32 },
-                "filters": [{ "memcmp": { "offset": 0, "bytes": token.mint.to_string() } }],
-            }]),
-        )
-        .await?;
+        let accounts = rpc
+            .call(
+                "getProgramAccounts",
+                json!([token.token_program.to_string(), {
+                    "encoding": "base64",
+                    "commitment": rpc.commitment,
+                    "dataSlice": { "offset": 32, "length": 32 },
+                    "filters": [{ "memcmp": { "offset": 0, "bytes": token.mint.to_string() } }],
+                }]),
+            )
+            .await
+            .with_context(|| format!("listing {}'s token accounts", token.name))?;
         for account in accounts.as_array().into_iter().flatten() {
             let lamports = account["account"]["lamports"].as_u64().unwrap_or(0);
             let owner = account["account"]["data"][0]
@@ -592,10 +630,13 @@ pub async fn leftovers(
             &[b"metadata", METAPLEX.as_ref(), token.mint.as_ref()],
             &METAPLEX,
         );
-        for (label, address) in [("mints", token.mint), ("Metaplex metadata", metadata)] {
-            let lamports = chain.rpc().get_balance(&address).await.unwrap_or(0);
-            if lamports > 0 {
-                add(&mut buckets, label.to_owned(), lamports);
+        let accounts = chain
+            .rpc()
+            .get_multiple_accounts(&[token.mint, metadata])
+            .await?;
+        for (label, account) in ["mints", "Metaplex metadata"].into_iter().zip(accounts) {
+            if let Some(account) = account {
+                add(&mut buckets, label.to_owned(), account.lamports);
             }
         }
     }
@@ -613,7 +654,16 @@ pub async fn leftovers(
         ("raydium-clmm", programs.raydium_clmm),
         ("manifest", programs.manifest),
     ] {
-        let Ok(account) = chain.rpc().get_account(&program).await else {
+        // Only a definitely absent account counts as closed; an RPC error
+        // fails the report instead of hiding the program's rent.
+        let Some(account) = chain
+            .rpc()
+            .get_multiple_accounts(&[program])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+        else {
             continue;
         };
         let mut lamports = account.lamports;
@@ -621,7 +671,7 @@ pub async fn leftovers(
         if let Some(raw) = account.data.get(4..36)
             && let Ok(programdata) = Pubkey::try_from(raw)
         {
-            lamports += chain.rpc().get_balance(&programdata).await.unwrap_or(0);
+            lamports += chain.rpc().get_balance(&programdata).await?;
         }
         add(&mut buckets, name.to_owned(), lamports);
     }
@@ -650,7 +700,7 @@ pub async fn leftovers(
     }
     let mut operator_balances = serde_json::Map::new();
     for (label, key) in operators {
-        let lamports = chain.rpc().get_balance(key).await.unwrap_or(0);
+        let lamports = chain.rpc().get_balance(key).await?;
         operator_balances.insert(label.clone(), json!(lamports as f64 / LAMPORTS_PER_SOL));
     }
     Ok(json!({

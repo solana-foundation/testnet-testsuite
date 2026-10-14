@@ -29,8 +29,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 solana-commitment-config = { workspace = true }
+solana-compute-budget-interface = { workspace = true }
 solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
+solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signer = { workspace = true }
 thiserror = { workspace = true }
