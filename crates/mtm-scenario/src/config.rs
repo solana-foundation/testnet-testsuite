@@ -215,6 +215,40 @@ pub struct ArbBotConfig {
     pub inventory: BTreeMap<String, Decimal>,
     #[serde(default = "default_sol")]
     pub sol: Decimal,
+    /// Priority fee on each cycle transaction, in lamports (v1
+    /// transactions carry it whole): with several bots chasing one gap, the
+    /// fee rather than arrival order should decide who lands.
+    #[serde(default)]
+    pub priority_fee_lamports: u64,
+    /// Reaction delay between finding a cycle and sending it, so a
+    /// population of bots does not act in lockstep.
+    #[serde(default)]
+    pub latency_ms: u64,
+}
+
+impl ArbConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut names = std::collections::HashSet::new();
+        for bot in &self.bots {
+            let fail = |reason: &str| anyhow::bail!("arb bot {}: {reason}", bot.name);
+            if !names.insert(bot.name.as_str()) {
+                return fail("name is used twice (it derives the wallet)");
+            }
+            if !(2..=3).contains(&bot.max_legs) {
+                return fail("max_legs must be 2 or 3");
+            }
+            if bot.start_tokens.is_empty() {
+                return fail("start_tokens is empty");
+            }
+            if bot.leg_slippage_bps > 10_000 {
+                return fail("leg_slippage_bps cannot exceed 10000");
+            }
+            if bot.max_trade_usd <= Decimal::ZERO || bot.min_profit_usd < Decimal::ZERO {
+                return fail("max_trade_usd must be positive and min_profit_usd non-negative");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_arb_poll_ms() -> u64 {
@@ -395,6 +429,35 @@ mod tests {
         let mut m = maker(range(600, 200));
         m.execution.slippage_bps = Some(10_001);
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn arb_bots_are_checked() {
+        let bot = |name: &str| ArbBotConfig {
+            name: name.to_owned(),
+            start_tokens: vec!["USDC".to_owned()],
+            max_legs: 3,
+            min_profit_usd: Decimal::new(5, 1),
+            max_trade_usd: Decimal::from(5_000),
+            leg_slippage_bps: 5,
+            inventory: BTreeMap::new(),
+            sol: Decimal::ONE,
+            priority_fee_lamports: 0,
+            latency_ms: 0,
+        };
+        let arb = |bots| ArbConfig {
+            bots,
+            poll_ms: 5_000,
+            debounce_ms: 250,
+        };
+        assert!(arb(vec![bot("a"), bot("b")]).validate().is_ok());
+        assert!(arb(vec![bot("a"), bot("a")]).validate().is_err());
+        let mut legs = bot("a");
+        legs.max_legs = 4;
+        assert!(arb(vec![legs]).validate().is_err());
+        let mut size = bot("a");
+        size.max_trade_usd = Decimal::ZERO;
+        assert!(arb(vec![size]).validate().is_err());
     }
 
     #[test]

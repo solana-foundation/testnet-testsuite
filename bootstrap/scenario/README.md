@@ -40,14 +40,17 @@ Binance ──▶ oracle ──▶ mm (12 makers) ──▶ Manifest / Orca / Ra
 - **cross-venue arbitrage** (`services/arb`, `[scenario.arb]`): subscribes
   to every pool and market account; each update (debounced) reloads the
   changed pools and searches every 2-leg (same pair, two venues) and 3-leg
-  (triangular) cycle starting from the bot's `start_tokens`. Cycle output is
-  concave in its input, so the size comes from a ternary search on pure
-  snapshot quotes, capped by `max_trade_usd` and inventory. The best cycle
-  above `min_profit_usd` is sent as one v1 transaction of top-level venue
-  swaps; legs chain on the previous leg's minimum and the last leg's
-  minimum is `input + min_profit`, so a stale cycle reverts rather than
-  losing money. Unlike `pool-arb` it never looks at the oracle to trade
-  (only to value profit).
+  (triangular) cycle starting from the bot's `start_tokens`. Each cycle is
+  sized on pure snapshot quotes as it will execute (legs chained on the
+  previous leg's slippage-adjusted minimum): log-spaced probes, then a
+  ternary search around the best, capped by `max_trade_usd` and inventory.
+  The best cycle above `min_profit_usd` is sent as one v1 transaction of
+  top-level venue swaps; the last leg's minimum is `input + min_profit`, so
+  a stale cycle reverts rather than losing money. Unlike `pool-arb` it
+  never looks at the oracle to trade (only to value profit). Bots race on
+  each snapshot; `priority_fee_lamports` and `latency_ms` per bot make them
+  differ. A bot with a cycle confirming sits out later scans, and scans
+  never wait for confirmations.
 
 Uninformed flow: Poisson arrivals at `rate_per_min`, lognormal notionals
 around `median_usd`, a `large_probability` share of blocks at
@@ -138,21 +141,23 @@ flow with `MTM_SCENARIO__FLOW__REFILL_BELOW_RATIO=0`.
 
 ## Metrics
 
-| Metric                                                                                         | Labels                      | Meaning                                                 |
-| ---------------------------------------------------------------------------------------------- | --------------------------- | ------------------------------------------------------- |
-| `mm_oracle_price`                                                                              | pair                        | oracle pair price the makers use                        |
-| `mm_venue_price`, `mm_deviation_bps`                                                           | maker, venue                | venue price and its gap to the oracle                   |
-| `mm_inventory`, `mm_inventory_value_usd`                                                       | maker, token                | holdings (wallet + seat) and USD value                  |
-| `mm_actions_total`                                                                             | maker, action               | requote / open / close / arb_buy / arb_sell             |
-| `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                               | maker, stage / venue        | failures (ticks retry)                                  |
-| `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                              | maker                       | skew, arbitrage volume (µUSD), tick latency             |
-| `flow_swaps_total`                                                                             | pair, status, outcome, size | routed swaps landed/failed, why, normal/large           |
-| `flow_fee_lamports_total`, `flow_fill_read_errors_total`                                       | —                           | fees paid by takers; landed swaps with unread fills     |
-| `flow_takers_alive`, `flow_taker_restarts_total`                                               | —                           | taker loops running / restarted after an error          |
-| `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                                 | pair                        | cost to uninformed flow vs oracle; landed vs quoted     |
-| `flow_route_legs_total`, `flow_notional_micro_usd_total`, `flow_refills_total`                 | venue / pair                | routing mix, volume (µUSD), refills                     |
-| `router_quote_seconds`, `router_quote_errors_total`, `router_quotes_total`                     | execution, status           | router latency and failures                             |
-| `oracle_price_updates_total`, `{orca_whirlpool,raydium_clmm,manifest}_actions_total`           | —                           | feed health and per-venue transactions                  |
-| `arb_trades_total`                                                                             | bot, status, legs           | landed / below_floor / simulation_failed / quote_failed |
-| `arb_opportunities_total`, `arb_profit_micro_usd_total`, `arb_last_profit_usd`                 | bot, legs, trigger          | cycles found, realized profit                           |
-| `arb_scans_total`, `arb_scan_seconds`, `arb_pool_updates_total`, `arb_snapshot_failures_total` | trigger / reason            | search cadence and latency, ws updates, slow reloads    |
+| Metric                                                                                         | Labels                      | Meaning                                                                                                        |
+| ---------------------------------------------------------------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `mm_oracle_price`                                                                              | pair                        | oracle pair price the makers use                                                                               |
+| `mm_venue_price`, `mm_deviation_bps`                                                           | maker, venue                | venue price and its gap to the oracle                                                                          |
+| `mm_inventory`, `mm_inventory_value_usd`                                                       | maker, token                | holdings (wallet + seat) and USD value                                                                         |
+| `mm_actions_total`                                                                             | maker, action               | requote / open / close / arb_buy / arb_sell                                                                    |
+| `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                               | maker, stage / venue        | failures (ticks retry)                                                                                         |
+| `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                              | maker                       | skew, arbitrage volume (µUSD), tick latency                                                                    |
+| `flow_swaps_total`                                                                             | pair, status, outcome, size | routed swaps landed/failed, why, normal/large                                                                  |
+| `flow_fee_lamports_total`, `flow_fill_read_errors_total`                                       | —                           | fees paid by takers; landed swaps with unread fills                                                            |
+| `flow_takers_alive`, `flow_taker_restarts_total`                                               | —                           | taker loops running / restarted after an error                                                                 |
+| `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                                 | pair                        | cost to uninformed flow vs oracle; landed vs quoted                                                            |
+| `flow_route_legs_total`, `flow_notional_micro_usd_total`, `flow_refills_total`                 | venue / pair                | routing mix, volume (µUSD), refills                                                                            |
+| `router_quote_seconds`, `router_quote_errors_total`, `router_quotes_total`                     | execution, status           | router latency and failures                                                                                    |
+| `oracle_price_updates_total`, `{orca_whirlpool,raydium_clmm,manifest}_actions_total`           | —                           | feed health and per-venue transactions                                                                         |
+| `arb_trades_total`                                                                             | bot, status, legs           | landed / reverted / expired / ambiguous / send_failed / below_floor / simulation_failed / quote_failed / error |
+| `arb_opportunities_total`, `arb_last_profit_usd`                                               | bot, legs, trigger          | cycles found, last realized PnL                                                                                |
+| `arb_profit_micro_usd_total`, `arb_loss_micro_usd_total`, `arb_fees_lamports_total`            | bot                         | realized gains and losses (all touched tokens), fees                                                           |
+| `arb_in_flight`                                                                                | —                           | cycles sent and not yet resolved                                                                               |
+| `arb_scans_total`, `arb_scan_seconds`, `arb_pool_updates_total`, `arb_snapshot_failures_total` | trigger / reason            | search cadence and latency, ws updates, slow reloads                                                           |

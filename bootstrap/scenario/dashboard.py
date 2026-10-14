@@ -40,7 +40,7 @@ stat("Maker errors (5m)", '(sum(increase(mm_errors_total[5m])) or vector(0)) + (
 stat("Flow notional (USD/min)", 'sum(rate(flow_notional_micro_usd_total[5m])) * 60 / 1e6', unit="currencyUSD", x=18)
 nl(4)
 stat("Arb trades landed (5m)", 'sum(increase(arb_trades_total{status="landed"}[5m])) or vector(0)', x=0)
-stat("Arb profit (USD, total)", 'sum(arb_profit_micro_usd_total) / 1e6 or vector(0)', unit="currencyUSD", x=6)
+stat("Arb net profit (USD, range)", '(sum(increase(arb_profit_micro_usd_total[$__range])) - sum(increase(arb_loss_micro_usd_total[$__range]))) / 1e6 or vector(0)', unit="currencyUSD", x=6)
 nl(4)
 row("Oracle")
 ts("Oracle pair prices", [("mm_oracle_price", "{{pair}}")], x=0)
@@ -95,15 +95,22 @@ ts("Arb trades / min", [
     ("sum by (bot, status, legs) (rate(arb_trades_total[5m])) * 60", "{{bot}} {{status}} {{legs}}-leg"),
     ("sum by (bot, legs) (rate(arb_opportunities_total[5m])) * 60", "opportunities {{bot}} {{legs}}-leg")], x=0,
    desc="cycles found (above the profit floor) vs executed; below_floor = the cycle closed before sending")
-ts("Arb realized profit (USD, cumulative)", [
-    ("sum by (bot) (arb_profit_micro_usd_total) / 1e6", "{{bot}}"),
-    ("arb_last_profit_usd", "last trade {{bot}}")], unit="currencyUSD", x=12)
+ts("Arb realized PnL (USD / 5m)", [
+    ("(sum by (bot) (increase(arb_profit_micro_usd_total[5m])) - sum by (bot) (increase(arb_loss_micro_usd_total[5m]))) / 1e6", "net {{bot}}"),
+    ("sum by (bot) (increase(arb_loss_micro_usd_total[5m])) / -1e6", "losses {{bot}}"),
+    ("arb_last_profit_usd", "last trade {{bot}}")], unit="currencyUSD", x=12,
+   desc="every token the cycle touched, valued at oracle prices; SOL fees are separate (lamports panel)")
 nl(8)
 ts("Arb scans / min by trigger", [
     ("sum by (trigger) (rate(arb_scans_total[5m])) * 60", "{{trigger}}"),
     ("sum(rate(arb_pool_updates_total[5m])) * 60", "pool updates (ws)"),
     ("sum(rate(arb_errors_total[5m])) * 60", "errors")], x=0)
 ts("Arb scan latency", [('arb_scan_seconds{quantile="0.5"}', "p50"), ('arb_scan_seconds{quantile="0.95"}', "p95")], unit="s", x=12)
+nl(8)
+ts("Arb fees (lamports / 5m) and cycles in flight", [
+    ("sum by (bot) (increase(arb_fees_lamports_total[5m]))", "fees {{bot}}"),
+    ("arb_in_flight", "in flight")], x=0,
+   desc="fees include reverted cycles (lost races still pay) and first-use ATA rent")
 nl(8)
 
 dash = {"uid": "mtm-scenario", "title": "mtm — market-making scenario", "tags": ["mtm"], "timezone": "browser",

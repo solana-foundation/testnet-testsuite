@@ -157,12 +157,10 @@ impl Scenario {
             }
         }
         if let Some(arb) = &self.config.arb {
+            arb.validate()?;
             for bot in &arb.bots {
                 for name in bot.start_tokens.iter().chain(bot.inventory.keys()) {
                     self.token(name)?;
-                }
-                if !(2..=3).contains(&bot.max_legs) {
-                    bail!("arb bot {}: max_legs must be 2 or 3", bot.name);
                 }
             }
         }

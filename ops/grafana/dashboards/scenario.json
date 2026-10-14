@@ -186,7 +186,7 @@
     },
     {
       "type": "stat",
-      "title": "Arb profit (USD, total)",
+      "title": "Arb net profit (USD, range)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -211,7 +211,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(arb_profit_micro_usd_total) / 1e6 or vector(0)"
+          "expr": "(sum(increase(arb_profit_micro_usd_total[$__range])) - sum(increase(arb_loss_micro_usd_total[$__range]))) / 1e6 or vector(0)"
         }
       ],
       "id": 7
@@ -1108,8 +1108,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Arb realized profit (USD, cumulative)",
-      "description": "",
+      "title": "Arb realized PnL (USD / 5m)",
+      "description": "every token the cycle touched, valued at oracle prices; SOL fees are separate (lamports panel)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1139,11 +1139,16 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (bot) (arb_profit_micro_usd_total) / 1e6",
-          "legendFormat": "{{bot}}"
+          "expr": "(sum by (bot) (increase(arb_profit_micro_usd_total[5m])) - sum by (bot) (increase(arb_loss_micro_usd_total[5m]))) / 1e6",
+          "legendFormat": "net {{bot}}"
         },
         {
           "refId": "B",
+          "expr": "sum by (bot) (increase(arb_loss_micro_usd_total[5m])) / -1e6",
+          "legendFormat": "losses {{bot}}"
+        },
+        {
+          "refId": "C",
           "expr": "arb_last_profit_usd",
           "legendFormat": "last trade {{bot}}"
         }
@@ -1242,6 +1247,50 @@
         }
       ],
       "id": 35
+    },
+    {
+      "type": "timeseries",
+      "title": "Arb fees (lamports / 5m) and cycles in flight",
+      "description": "fees include reverted cycles (lost races still pay) and first-use ATA rent",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 110
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (bot) (increase(arb_fees_lamports_total[5m]))",
+          "legendFormat": "fees {{bot}}"
+        },
+        {
+          "refId": "B",
+          "expr": "arb_in_flight",
+          "legendFormat": "in flight"
+        }
+      ],
+      "id": 36
     }
   ]
 }
