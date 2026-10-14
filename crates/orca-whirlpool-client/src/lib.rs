@@ -607,6 +607,31 @@ impl OrcaWhirlpoolClient {
         .await
     }
 
+    /// Token amounts the payer's position would return if fully withdrawn
+    /// now (at the current pool price), plus fees already owed.
+    pub async fn position_value(&self, position_mint: Pubkey) -> Result<PositionValue> {
+        let position = self.load_position(position_mint).await?;
+        let bundle = self.load_pool(position.pool).await?;
+        let quote = core::decrease_liquidity_quote(
+            position.liquidity,
+            0,
+            bundle.whirlpool.sqrt_price,
+            position.tick_lower,
+            position.tick_upper,
+            bundle.transfer_fee_a,
+            bundle.transfer_fee_b,
+        )
+        .map_err(quote_error)?;
+        Ok(PositionValue {
+            pool: position.pool,
+            mint_a: bundle.mint_a.key,
+            mint_b: bundle.mint_b.key,
+            amount_a: quote.token_est_a.saturating_add(position.fee_owed_a),
+            amount_b: quote.token_est_b.saturating_add(position.fee_owed_b),
+            liquidity: position.liquidity,
+        })
+    }
+
     pub async fn close_position(&self, position_mint: Pubkey) -> Result<ClosePositionOutcome> {
         self.run("close_position", position_mint, async move {
             let position = self.load_position(position_mint).await?;
@@ -1756,6 +1781,17 @@ pub struct PositionAccounts {
 pub struct CollectOutcome {
     pub transaction: TransactionOutcome,
     pub position: PositionAccounts,
+}
+
+/// Withdrawable value of one position, in raw atoms of the pool's mints.
+#[derive(Clone, Copy, Debug)]
+pub struct PositionValue {
+    pub pool: Pubkey,
+    pub mint_a: Pubkey,
+    pub mint_b: Pubkey,
+    pub amount_a: u64,
+    pub amount_b: u64,
+    pub liquidity: u128,
 }
 
 #[derive(Clone, Debug)]
