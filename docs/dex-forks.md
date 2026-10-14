@@ -35,9 +35,16 @@ are pinned to the matching Apache-2.0 releases:
 | ------------------------ | -------- | ---------- | ---------- |
 | `orca_whirlpools_client` | `=2.0.2` | 2025-02-21 | Apache-2.0 |
 | `orca_whirlpools_core`   | `=1.0.4` | 2025-02-21 | Apache-2.0 |
+| `orca_whirlpools_macros` | `=1.0.4` | 2025-02-21 | Apache-2.0 |
+
+`orca_whirlpools_macros` is not used directly: `orca_whirlpools_core 1.0.4`
+depends on it with a caret requirement, which resolves to 1.0.5 (published
+2025-02-28 under the Orca License) unless `orca-whirlpool-client` pins it.
 
 Do not merge or cherry-pick later upstream commits into the fork, and do not
-bump either crate, without a fresh licensing decision.
+bump any of these crates, without a fresh licensing decision. After a
+dependency change, check `Cargo.lock` still resolves every `orca_*` crate to
+the versions above.
 
 ### Create the fork
 

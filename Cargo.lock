@@ -2716,6 +2716,7 @@ dependencies = [
  "mtm-math",
  "orca_whirlpools_client",
  "orca_whirlpools_core",
+ "orca_whirlpools_macros",
  "rust_decimal",
  "sha2 0.10.9",
  "solana-account 4.7.0",
@@ -2791,9 +2792,9 @@ dependencies = [
 
 [[package]]
 name = "orca_whirlpools_macros"
-version = "1.0.5"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b093a9e60ca608c1dff40fcd841a2d5680b96f877080b6279044c159ebd50b78"
+checksum = "3db647505a145cbb680f08725e0112b1691d984334cd1abe0d9f5c5a6e2ec91e"
 dependencies = [
  "proc-macro2",
  "quote",
