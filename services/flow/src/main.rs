@@ -28,7 +28,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use metrics::{counter, gauge, histogram};
-use mtm_chain::ChainClient;
+use mtm_chain::{ChainClient, SubmissionError, VersionedSendConfig};
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::signer_from_environment;
 use mtm_scenario::funding::{Funding, LAMPORTS_PER_SOL, top_up, wallet_balances};
@@ -44,11 +44,8 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use solana_keypair::Keypair;
-use solana_rpc_client_api::client_error::ErrorKind as RpcErrorKind;
-use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_signature::Signature;
 use solana_signer::Signer;
-use solana_transaction::Hash;
 use solana_transaction::versioned::VersionedTransaction;
 use tracing::{debug, error, info, warn};
 
@@ -285,18 +282,6 @@ fn fail<T>(outcome: Outcome, error: anyhow::Error) -> std::result::Result<T, Tra
     Err(TradeError { outcome, error })
 }
 
-/// How long to poll a sent swap's status, and how often. Expiry normally
-/// ends the wait first; the deadline is a backstop for an RPC that keeps
-/// failing the expiry check or a stalled chain. It sits well above the ~60 s
-/// a blockhash lives at 400 ms blocks, so a slow chain still reports
-/// `expired` rather than `rpc_ambiguous`.
-const CONFIRM_DEADLINE: Duration = Duration::from_secs(180);
-const STATUS_POLL: Duration = Duration::from_millis(400);
-/// Check for expiry every this many status polls.
-const BLOCKHASH_CHECK_EVERY: u32 = 5;
-/// A status RPC failing this many polls in a row ends the wait.
-const MAX_STATUS_ERRORS: u32 = 5;
-
 impl Flow<'_> {
     /// Every taker is an independent Poisson process at `rate / takers`
     /// with its own seeded RNG, so slow trades never delay other arrivals and
@@ -529,45 +514,32 @@ impl Flow<'_> {
     }
 
     /// Sends with preflight (the RPC's simulation catches stale quotes
-    /// before they cost a fee) and polls the status until the client's
-    /// commitment. Returns the signature and the slot it landed in.
-    /// `last_valid_block_height` is the router's expiry for the
-    /// transaction's blockhash; without it (older routers) expiry is asked
-    /// of the RPC (`isBlockhashValid`).
+    /// before they cost a fee) and waits for the client's commitment.
+    /// Returns the signature and the slot it landed in.
     async fn send_and_confirm(
         &self,
         transaction: &VersionedTransaction,
-        last_valid_block_height: Option<u64>,
+        // The router's expiry for the blockhash; `send_versioned` does not take it yet.
+        _last_valid_block_height: Option<u64>,
     ) -> std::result::Result<(Signature, u64), TradeError> {
-        let rpc = self.chain.rpc();
-        let commitment = rpc.commitment();
-        let signature = transaction.signatures[0];
-        match rpc
-            .send_transaction_with_config(
-                transaction,
-                RpcSendTransactionConfig {
-                    preflight_commitment: Some(commitment.commitment),
-                    ..RpcSendTransactionConfig::default()
-                },
-            )
+        match self
+            .chain
+            .send_versioned(transaction, VersionedSendConfig::default())
             .await
         {
-            Ok(_) => {}
-            Err(error) if error.kind().get_transaction_error().is_some() => {
-                return fail(Outcome::PreflightRejected, error.into());
+            Ok(outcome) => Ok((outcome.signature, outcome.confirmation_slot)),
+            Err(error) => {
+                let outcome = match &error {
+                    SubmissionError::Simulation { .. } => Outcome::PreflightRejected,
+                    SubmissionError::Submission(_) => Outcome::SendFailed,
+                    SubmissionError::Execution { .. } => Outcome::LandedFailed,
+                    SubmissionError::Expired { .. } => Outcome::Expired,
+                    SubmissionError::AmbiguousConfirmation { .. } => Outcome::RpcAmbiguous,
+                    _ => Outcome::Error,
+                };
+                fail(outcome, error.into())
             }
-            // The request may have reached the node: wait for a status
-            // rather than calling it failed.
-            Err(error) if is_transport_error(error.kind()) => {
-                debug!(%signature, error = %error, "send response lost; polling status");
-            }
-            Err(error) => return fail(Outcome::SendFailed, error.into()),
         }
-        let expiry = match last_valid_block_height {
-            Some(height) => Expiry::Height(height),
-            None => Expiry::Blockhash(*transaction.message.recent_blockhash()),
-        };
-        await_status(&self.chain, signature, expiry).await
     }
 
     async fn refill(&self, taker: &Keypair) -> Result<()> {
@@ -607,137 +579,6 @@ impl Flow<'_> {
         }
         Ok(())
     }
-}
-
-/// When a sent swap can no longer land.
-#[derive(Clone, Copy, Debug)]
-enum Expiry {
-    /// The router's `last_valid_block_height`: expired once the block
-    /// height at our commitment is past it.
-    Height(u64),
-    /// Routers that predate the field: expired once the RPC says the
-    /// blockhash is no longer valid.
-    Blockhash(Hash),
-}
-
-/// A sent swap's status, as far as the confirmation wait needs it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SeenStatus {
-    /// landed and failed on-chain
-    Failed { slot: u64, error: String },
-    /// landed; `confirmed` once it satisfies our commitment
-    Landed { slot: u64, confirmed: bool },
-}
-
-/// The reads the confirmation wait makes (the chain client in production).
-trait StatusReader {
-    async fn status(&self, signature: &Signature) -> anyhow::Result<Option<SeenStatus>>;
-    async fn expired(&self, expiry: Expiry) -> anyhow::Result<bool>;
-}
-
-impl StatusReader for ChainClient {
-    async fn status(&self, signature: &Signature) -> anyhow::Result<Option<SeenStatus>> {
-        let rpc = self.rpc();
-        let response = rpc.get_signature_statuses(&[*signature]).await?;
-        Ok(response
-            .value
-            .into_iter()
-            .next()
-            .flatten()
-            .map(|status| match &status.err {
-                Some(error) => SeenStatus::Failed {
-                    slot: status.slot,
-                    error: format!("{error:?}"),
-                },
-                None => SeenStatus::Landed {
-                    slot: status.slot,
-                    confirmed: status.satisfies_commitment(rpc.commitment()),
-                },
-            }))
-    }
-
-    async fn expired(&self, expiry: Expiry) -> anyhow::Result<bool> {
-        let rpc = self.rpc();
-        Ok(match expiry {
-            Expiry::Height(last_valid) => {
-                rpc.get_block_height_with_commitment(rpc.commitment())
-                    .await?
-                    > last_valid
-            }
-            Expiry::Blockhash(blockhash) => {
-                !rpc.is_blockhash_valid(&blockhash, rpc.commitment()).await?
-            }
-        })
-    }
-}
-
-/// Poll `signature` until it lands at our commitment, fails, or expires.
-async fn await_status(
-    reader: &impl StatusReader,
-    signature: Signature,
-    expiry: Expiry,
-) -> std::result::Result<(Signature, u64), TradeError> {
-    let started = tokio::time::Instant::now();
-    let (mut polls, mut errors) = (0_u32, 0_u32);
-    loop {
-        tokio::time::sleep(STATUS_POLL).await;
-        polls += 1;
-        if started.elapsed() >= CONFIRM_DEADLINE {
-            return fail(
-                Outcome::RpcAmbiguous,
-                anyhow::anyhow!("{signature}: no confirmation within {CONFIRM_DEADLINE:?}"),
-            );
-        }
-        match reader.status(&signature).await {
-            Ok(status) => {
-                errors = 0;
-                match status {
-                    Some(SeenStatus::Failed { slot, error }) => {
-                        return fail(
-                            Outcome::LandedFailed,
-                            anyhow::anyhow!("{signature} failed in slot {slot}: {error}"),
-                        );
-                    }
-                    Some(SeenStatus::Landed {
-                        slot,
-                        confirmed: true,
-                    }) => {
-                        return Ok((signature, slot));
-                    }
-                    // Seen but not yet at our commitment: it cannot expire
-                    // any more, so skip the expiry check.
-                    Some(SeenStatus::Landed { .. }) => continue,
-                    None => {}
-                }
-            }
-            Err(error) => {
-                errors += 1;
-                if errors >= MAX_STATUS_ERRORS {
-                    return fail(Outcome::RpcAmbiguous, error);
-                }
-            }
-        }
-        if polls.is_multiple_of(BLOCKHASH_CHECK_EVERY)
-            && let Ok(true) = reader.expired(expiry).await
-        {
-            // One last look: it may have landed just before expiry, in which
-            // case the next poll classifies it.
-            if let Ok(Some(_)) = reader.status(&signature).await {
-                continue;
-            }
-            return fail(
-                Outcome::Expired,
-                anyhow::anyhow!("{signature}: blockhash expired with no status ({expiry:?})"),
-            );
-        }
-    }
-}
-
-fn is_transport_error(error: &RpcErrorKind) -> bool {
-    matches!(
-        error,
-        RpcErrorKind::Io(_) | RpcErrorKind::Reqwest(_) | RpcErrorKind::Middleware(_)
-    )
 }
 
 /// USD to whole micro-USD for the notional counter (counters are integers;
@@ -780,71 +621,6 @@ mod tests {
         // exact-out: quoted 1000 in, spent 1010 -> 100 bps worse
         assert!((-ratio_bps(1_000, 1_010) - 100.0).abs() < 1e-9);
         assert!(ratio_bps(0, 5).abs() < 1e-9);
-    }
-
-    /// A chain that adds a block every `block_time` and never reports the
-    /// signature: what a dropped swap looks like.
-    struct DroppedSwap {
-        started: tokio::time::Instant,
-        block_time: Duration,
-        /// the blockhash is valid through this height
-        last_valid: u64,
-    }
-
-    impl DroppedSwap {
-        fn height(&self) -> u64 {
-            (self.started.elapsed().as_millis() / self.block_time.as_millis()) as u64
-        }
-    }
-
-    impl StatusReader for DroppedSwap {
-        async fn status(&self, _signature: &Signature) -> anyhow::Result<Option<SeenStatus>> {
-            Ok(None)
-        }
-
-        async fn expired(&self, expiry: Expiry) -> anyhow::Result<bool> {
-            Ok(match expiry {
-                Expiry::Height(last_valid) => self.height() > last_valid,
-                Expiry::Blockhash(_) => self.height() > self.last_valid,
-            })
-        }
-    }
-
-    /// R2-FLOWARB-2: on a slow chain (600 ms blocks) a dropped swap's
-    /// blockhash lives ~91 s, longer than the old 90 s deadline, which
-    /// labelled it `rpc_ambiguous`. With the router's
-    /// `last_valid_block_height` it is `expired`, once the height passes it.
-    #[tokio::test(start_paused = true)]
-    async fn a_dropped_swap_on_a_slow_chain_expires() {
-        let chain = DroppedSwap {
-            started: tokio::time::Instant::now(),
-            block_time: Duration::from_millis(600),
-            last_valid: 151,
-        };
-        let started = tokio::time::Instant::now();
-        let outcome = await_status(&chain, Signature::default(), Expiry::Height(151))
-            .await
-            .expect_err("never lands");
-        assert_eq!(outcome.outcome, Outcome::Expired, "{:#}", outcome.error);
-        let waited = started.elapsed();
-        assert!(chain.height() > 151, "expired early: {waited:?}");
-        assert!(
-            waited <= Duration::from_millis(152 * 600) + STATUS_POLL * BLOCKHASH_CHECK_EVERY,
-            "{waited:?}"
-        );
-        // Routers without the field: the RPC's blockhash check, same answer.
-        let chain = DroppedSwap {
-            started: tokio::time::Instant::now(),
-            ..chain
-        };
-        let outcome = await_status(
-            &chain,
-            Signature::default(),
-            Expiry::Blockhash(Hash::default()),
-        )
-        .await
-        .expect_err("never lands");
-        assert_eq!(outcome.outcome, Outcome::Expired, "{:#}", outcome.error);
     }
 
     #[test]
