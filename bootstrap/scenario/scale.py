@@ -1,6 +1,7 @@
 """Generate scale overlays for the scenario (layered over scenario-local).
 
     python3 bootstrap/scenario/scale.py            # writes every overlay below
+    python3 bootstrap/scenario/scale.py scale-x10  # only the named overlays
     MTM_PROFILE=scenario-local,scale-x10 ...       # select one (scenario.sh: SCENARIO_SCALE=x10)
 
 | overlay       | takers | arb bots | makers per pool* | assets |
@@ -176,12 +177,20 @@ def overlay(name, takers, bots, density, capital, tokens, crosses, prices, new_t
 
 def main():
     tokens = BASE_TOKENS + list(NEW_TOKENS)
-    prices = {t: price(t) for t in tokens}
+    only = set(sys.argv[1:])
+    prices = {t: price(t) for t in (tokens if not only or "scale-assets" in only else BASE_TOKENS)}
     base_crosses = [("JUP", "RAY")]
-    overlay("scale-x10", 140, 6, 2, 3, BASE_TOKENS, base_crosses, prices)
-    overlay("scale-x100", 1650, 14, 3, 10, BASE_TOKENS, base_crosses, prices)
     crosses = base_crosses + [(t, "JUP") for t in NEW_TOKENS]
-    overlay("scale-assets", 1650, 14, 3, 10, tokens, crosses, prices, new_tokens=tuple(NEW_TOKENS))
+    overlays = {
+        "scale-x10": (140, 6, 2, 3, BASE_TOKENS, base_crosses),
+        "scale-x100": (1650, 14, 3, 10, BASE_TOKENS, base_crosses),
+        "scale-assets": (1650, 14, 3, 10, tokens, crosses),
+    }
+    for name, args in overlays.items():
+        if not only or name in only:
+            overlay(name, *args, prices, new_tokens=tuple(NEW_TOKENS) if name == "scale-assets" else ())
+    if only and "scale-assets" not in only:
+        return
     config = [{"mainnetPubkey": MAINNET[t], "mintAuthority": "KEYPAIR_TOKEN_MINT_AUTHORITY",
                "freezeAuthority": "KEYPAIR_TOKEN_FREEZE_AUTHORITY", "metadataAuthority": "KEYPAIR_TOKEN_METADATA_AUTHORITY",
                "mint": f"KEYPAIR_TOKEN_{t}_MINT"} for t in tokens]
