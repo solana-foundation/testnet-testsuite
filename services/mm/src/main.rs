@@ -13,6 +13,7 @@
 mod arb;
 mod clmm;
 mod clob;
+mod hedge;
 mod maker;
 
 use std::net::SocketAddr;
@@ -23,6 +24,7 @@ use anyhow::Result;
 use clap::Parser;
 use mtm_chain::ChainClient;
 use mtm_common::config::RpcConfig;
+use mtm_dex_harness::cli::signer_from_environment;
 use mtm_scenario::{Scenario, ScenarioConfig};
 use serde::Deserialize;
 use tracing::info;
@@ -48,6 +50,13 @@ struct AppConfig {
 #[derive(Debug, Deserialize)]
 struct MmConfig {
     metrics_addr: Option<SocketAddr>,
+    /// Test-token mint authority, for hedging (`[scenario.hedge]`).
+    #[serde(default = "default_mint_authority")]
+    mint_authority_keypair_env: String,
+}
+
+fn default_mint_authority() -> String {
+    "KEYPAIR_TOKEN_MINT_AUTHORITY".to_owned()
 }
 
 #[tokio::main]
@@ -60,6 +69,23 @@ async fn main() -> Result<()> {
     let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
     let scenario = Arc::new(Scenario::resolve(cfg.scenario, &chain).await?);
     std::fs::create_dir_all(&cli.state_dir)?;
+    let hedger = match &scenario.config.hedge {
+        Some(config) => match signer_from_environment(&cfg.mm.mint_authority_keypair_env) {
+            Ok(authority) => {
+                info!(
+                    threshold_bps = config.threshold_bps,
+                    cost_bps = config.cost_bps,
+                    "makers hedge at the oracle"
+                );
+                Some((config.clone(), authority))
+            }
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "hedging configured but the mint authority is unset: makers will not hedge");
+                None
+            }
+        },
+        None => None,
+    };
 
     // Venue futures hold `&dyn Signer` across awaits (not `Send`), so the
     // makers share one thread; they are I/O-bound.
@@ -75,6 +101,7 @@ async fn main() -> Result<()> {
             Arc::clone(&scenario),
             maker.clone(),
             cli.state_dir.clone(),
+            hedger.clone(),
         )
         .await?;
         info!(maker = %maker.name, wallet = %ctx.wallet_pubkey(), venue = maker.venue.as_str(), "maker starting");

@@ -10,7 +10,7 @@ use mtm_chain::ChainClient;
 use mtm_scenario::funding::token_balance;
 use mtm_scenario::pricing::PriceBook;
 use mtm_scenario::venue::to_ui;
-use mtm_scenario::{MakerConfig, Scenario, Strategy, Token};
+use mtm_scenario::{HedgeConfig, MakerConfig, Scenario, Strategy, Token};
 use oracle_client::OracleClient;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -31,6 +31,8 @@ pub struct Ctx {
     pub pool: Pubkey,
     pub oracle: OracleClient,
     pub state_dir: PathBuf,
+    /// Hedging settings and the test-token mint authority, when on.
+    pub hedger: Option<(HedgeConfig, Arc<dyn Signer + Send + Sync>)>,
 }
 
 impl Ctx {
@@ -39,6 +41,7 @@ impl Ctx {
         scenario: Arc<Scenario>,
         maker: MakerConfig,
         state_dir: PathBuf,
+        hedger: Option<(HedgeConfig, Arc<dyn Signer + Send + Sync>)>,
     ) -> Result<Self> {
         let pool = scenario
             .pool_address(&chain, maker.venue, &maker.base, &maker.quote)
@@ -62,6 +65,7 @@ impl Ctx {
             scenario,
             maker,
             state_dir,
+            hedger,
         })
     }
 
@@ -129,9 +133,9 @@ impl Ctx {
     /// report would miss each maker's first action of every kind.
     pub fn register_actions(&self) {
         let actions: &[&'static str] = match self.maker.strategy {
-            Strategy::ClobLadder { .. } => &["requote", "pull"],
-            Strategy::ClmmRange { .. } => &["open", "close"],
-            Strategy::PoolArb { .. } => &["arb_buy", "arb_sell"],
+            Strategy::ClobLadder { .. } => &["requote", "pull", "hedge"],
+            Strategy::ClmmRange { .. } => &["open", "close", "hedge"],
+            Strategy::PoolArb { .. } => &["arb_buy", "arb_sell", "hedge"],
         };
         for action in actions {
             counter!("mm_actions_total", "maker" => self.name(), "venue" => self.maker.venue.as_str(), "action" => *action)

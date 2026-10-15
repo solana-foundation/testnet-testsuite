@@ -386,8 +386,12 @@ impl Clmm {
             self.save()?;
         }
 
-        // Balances after any close: the withdrawn tokens are back in the
-        // wallet and size the new position.
+        // Between positions everything is in the wallet: hedge it back to
+        // the target mix, so a one-sided close does not leave a position
+        // that can only be opened at a fraction of its size.
+        crate::hedge::wallet(ctx, &prices).await?;
+        // Balances after any close (and hedge): the withdrawn tokens are
+        // back in the wallet and size the new position.
         let base_atoms = ctx.wallet_balance(&ctx.base).await?;
         let quote_atoms = ctx.wallet_balance(&ctx.quote).await?;
         ctx.record_inventory(&prices, base_atoms, quote_atoms);

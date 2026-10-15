@@ -71,6 +71,12 @@ nl(8)
 ts("Maker errors / min", [("sum by (maker, stage) (rate(mm_errors_total[5m])) * 60", "{{maker}} {{stage}}")], x=0)
 ts("Maker tick latency (p95)", [('mm_tick_seconds{quantile="0.95"}', "{{maker}}")], unit="s", x=12)
 nl(8)
+ts("Hedged at the oracle (USD / 5m)", [
+    ("sum by (maker, side) (increase(mm_hedge_micro_usd_total[5m])) / 1e6", "{{maker}} {{side}}")], unit="currencyUSD", x=0,
+   desc="inventory laid off at the oracle price (CEX-hedge model): sell_base = maker was long base")
+ts("Hedge cost (USD / 5m)", [
+    ("sum by (maker) (increase(mm_hedge_cost_micro_usd_total[5m])) / 1e6", "{{maker}}")], unit="currencyUSD", x=12)
+nl(8)
 row("Uninformed flow + router")
 ts("Routed swaps / min", [("sum by (pair, status, size) (rate(flow_swaps_total[5m])) * 60", "{{pair}} {{status}} {{size}}")], x=0)
 ts("Swap outcomes / min", [("sum by (outcome) (rate(flow_swaps_total[5m])) * 60", "{{outcome}}")], x=12,
