@@ -1800,16 +1800,34 @@ impl SwapSnapshot {
                 MAX_SWAP_TICK_ARRAYS
             )));
         }
-        let used_keys: Vec<Pubkey> = used_starts
-            .iter()
-            .map(|start| tick_array_address_for(self.program_id, bundle.key, *start))
-            .collect();
-        if used_keys.is_empty() || !used_keys.iter().all(|key| array_keys.contains(key)) {
+        let tick_array = |start: &i32| tick_array_address_for(self.program_id, bundle.key, *start);
+        if used_starts.is_empty()
+            || !used_starts
+                .iter()
+                .map(tick_array)
+                .all(|key| array_keys.contains(&key))
+        {
             return Err(RaydiumClmmError::MalformedAccount {
                 address: bundle.key,
                 reason: "quote selected an unfetched tick array".to_owned(),
             });
         }
+        let next_initialized = |start, direction| {
+            bundle
+                .pool
+                .next_initialized_tick_array_start_index(&Some(bundle.bitmap), start, direction)
+                .ok()
+                .flatten()
+        };
+        let tick_arrays = pad_tick_arrays(
+            &used_starts,
+            MAX_SWAP_TICK_ARRAYS,
+            next_initialized,
+            zero_for_one,
+        )
+        .iter()
+        .map(tick_array)
+        .collect();
         let (other_amount_threshold, expected_input_raw, expected_output_raw) = if exact_in {
             // The program checks the threshold against the output account's
             // balance change, which is net of the output mint's transfer fee.
@@ -1849,7 +1867,7 @@ impl SwapSnapshot {
             expected_input_raw,
             expected_output_raw,
             other_amount_threshold,
-            tick_arrays: used_keys,
+            tick_arrays,
         })
     }
 
@@ -1933,6 +1951,36 @@ impl SwapSnapshot {
             },
         ])
     }
+}
+
+/// The traversed tick-array starts, padded with the nearest initialized
+/// array on each side while `cap` allows. The program skips leading arrays
+/// until it reaches the one holding the pool's tick, but cannot step back:
+/// when the price crosses an array boundary between quote and landing, the
+/// array behind (price moved against the swap) or the one ahead (price moved
+/// with it) must already be in the list. `next(start, zero_for_one)` is the
+/// next initialized start from `start` in that direction.
+fn pad_tick_arrays(
+    traversed: &[i32],
+    cap: usize,
+    next: impl Fn(i32, bool) -> Option<i32>,
+    zero_for_one: bool,
+) -> Vec<i32> {
+    let mut starts = traversed.to_vec();
+    let (Some(&first), Some(&last)) = (traversed.first(), traversed.last()) else {
+        return starts;
+    };
+    if starts.len() < cap
+        && let Some(behind) = next(first, !zero_for_one)
+    {
+        starts.insert(0, behind);
+    }
+    if starts.len() < cap
+        && let Some(ahead) = next(last, zero_for_one)
+    {
+        starts.push(ahead);
+    }
+    starts
 }
 
 fn tick_array_address_for(program_id: Pubkey, pool: Pubkey, start: i32) -> Pubkey {
@@ -2139,6 +2187,8 @@ pub struct SwapQuote {
     pub expected_input_raw: u64,
     pub expected_output_raw: u64,
     pub other_amount_threshold: u64,
+    /// The arrays the quote traverses, padded with an initialized neighbour
+    /// on each side so a boundary crossing before landing still swaps.
     pub tick_arrays: Vec<Pubkey>,
 }
 
@@ -2498,6 +2548,39 @@ mod tests {
             ..Account::default()
         };
         assert!(clock_epoch(&short).is_err());
+    }
+
+    /// Initialized arrays every 600 ticks from -1800 to 1800.
+    fn every_600(start: i32, zero_for_one: bool) -> Option<i32> {
+        let next = if zero_for_one {
+            start - 600
+        } else {
+            start + 600
+        };
+        (-1800..=1800).contains(&next).then_some(next)
+    }
+
+    #[test]
+    fn swap_tick_arrays_are_padded_on_both_sides() {
+        // Price down (zero_for_one): traversal walks toward lower starts.
+        assert_eq!(pad_tick_arrays(&[0], 6, every_600, true), [600, 0, -600]);
+        assert_eq!(pad_tick_arrays(&[0], 6, every_600, false), [-600, 0, 600]);
+        assert_eq!(
+            pad_tick_arrays(&[0, 600], 6, every_600, false),
+            [-600, 0, 600, 1200]
+        );
+    }
+
+    #[test]
+    fn swap_tick_array_padding_respects_the_cap_and_the_edges() {
+        assert_eq!(pad_tick_arrays(&[0], 2, every_600, false), [-600, 0]);
+        assert_eq!(pad_tick_arrays(&[0], 1, every_600, false), [0]);
+        assert_eq!(pad_tick_arrays(&[1800], 6, every_600, false), [1200, 1800]);
+        assert_eq!(
+            pad_tick_arrays(&[-1800], 6, every_600, false),
+            [-1800, -1200]
+        );
+        assert!(pad_tick_arrays(&[], 6, every_600, false).is_empty());
     }
 
     #[test]
