@@ -352,7 +352,11 @@ mod tests {
         struct Profile {
             scenario: ScenarioConfig,
         }
-        for (name, dev_seed) in [("scenario-local", true), ("scenario-testnet", false)] {
+        for (name, dev_seed) in [
+            ("scenario-local", true),
+            ("scenario-devnet", false),
+            ("scenario-testnet", false),
+        ] {
             let path = format!("{}/../../config/{name}.toml", env!("CARGO_MANIFEST_DIR"));
             let text = std::fs::read_to_string(&path).expect("profile exists");
             let profile: Profile = toml::from_str(&text).expect("parses");
