@@ -323,3 +323,54 @@ Operations:
   is above ~1.4k TPS sustained (2.2k in 5-second samples) and unknown.
 - All runs were 10-minute windows, one sample per configuration, so expect
   run-to-run variation of roughly ±10%.
+
+## Long runs: 30 min, 1 h, 2 h (2026-10-15)
+
+Base scenario (17 participants) on solana-test-validator, each run on a
+fresh chain: deploy → bootstrap → `measure` → janitor teardown with the
+programs closed. Raw outputs: `.scenario/runs/long-*`.
+
+|                                             | 30 min            | 1 h               | 2 h               |
+| ------------------------------------------- | ----------------- | ----------------- | ----------------- |
+| transactions landed / failed                | 976 / 7           | 2 325 / 17        | 4 361 / 34        |
+| landed TPS mean / peak                      | 0.54 / 1.7        | 0.65 / 3.2        | 0.61 / 2.9        |
+| flow swaps landed / failed (of which large) | 546 / 10 (9)      | 1 067 / 28 (26)   | 2 192 / 75 (70)   |
+| taker PnL excluding refills                 | −$2 278           | −$3 056           | −$8 790           |
+| refills minted inside the window            | $18 182           | $84 577           | $111 803          |
+| transaction fees, whole lifecycle           | 0.0384 SOL        | 0.0454 SOL        | 0.0560 SOL        |
+| rent locked after teardown                  | 0.0547 SOL        | 0.0547 SOL        | 0.0547 SOL        |
+| mm / router RSS, first → last sample        | 24→31 / 19→27 MiB | 24→37 / 18→28 MiB | 26→41 / 20→28 MiB |
+
+What the length showed that short runs do not:
+
+- **Liquidity drifts one-sided.** Takers keep selling base into the makers,
+  and refills keep minting them more of it ($112 k in 2 h). Nothing
+  rebalances the makers: after 2 h both CLOB makers and all five oracle
+  arbitrageurs held ~$0 of USDC, and two LPs (`lp-orca-jup`,
+  `lp-raydium-jup`) had ~$0.1–0.5 k left in their venues (one-sided
+  wallets cap the next position). Large-trade quote failures tripled
+  (~5 → 16–19 per 30 min). Runs longer than ~1 h need maker rebalancing
+  (or inventory-neutral flow) to measure a steady state.
+- **The ledger needs sizing for the window, not the load.** At ~1 user TPS
+  the test validator writes ~6.5 GB/h (votes and ticks dominate): a
+  2M-shred cap pruned the start of a 30-minute window, and the report
+  correctly refused to count from missing blocks. 12M shreds on disk held
+  2 h (13 GB).
+- **Refills distort PnL.** One refill reads as tens of thousands of dollars
+  of taker "profit"; the report now warns reliably (the refill counter is
+  registered at zero), but long runs should either disable refills or
+  subtract them.
+- **SOL is spent by Raydium LPs, not by trading.** Re-centres pay tick-array
+  and position rent (up to ~0.22 SOL/h for one LP); every other participant
+  spent < 0.005 SOL/h in fees. The janitor recovers that rent at teardown.
+- **Fees are small and linear:** ~0.03 SOL fixed (deploys, bootstrap,
+  teardown) plus ~0.012 SOL per hour of running.
+- **Teardown is boring, as it should be:** every run ended with 14 vaults and
+  32–36 program accounts closed by the janitor, every wallet at 0 lamports,
+  and exactly the 0.0547 SOL floor locked (mints, metadata, program stubs).
+- **Memory is flat enough:** mm grows ~7 MiB/h and slowing, the router
+  levels at ~28 MiB, the validator at ~1.1 GB; no leak at this horizon.
+- **Transient on-chain races, all retried:** Orca `AmountOutBelowMinimum`
+  (the pool-arb floor) and `TickArraySequenceInvalidIndex` (a swap crossing
+  past its tick arrays), and a Manifest `Custom(10)` (a stale cancel index
+  hint, the open Manifest item).
