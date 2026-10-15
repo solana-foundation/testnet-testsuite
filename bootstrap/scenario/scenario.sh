@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Run the market-making scenario: oracle → bootstrap → router → makers → flow + arb.
 #
-#   scenario.sh deploy [local|testnet]  deploy the three DEX fork artifacts
-#   scenario.sh up [local|testnet]      build, start every service, bootstrap
-#   scenario.sh bootstrap [local|testnet]   tokens + pools + wallet top-ups only
-#   scenario.sh status [local|testnet]  pools, wallets, processes
+#   scenario.sh deploy [local|devnet|testnet]  deploy the three DEX fork artifacts
+#   scenario.sh up [local|devnet|testnet]      build, start every service, bootstrap
+#   scenario.sh bootstrap [local|devnet|testnet]   tokens + pools + wallet top-ups only
+#   scenario.sh status [local|devnet|testnet]  pools, wallets, processes
 #   scenario.sh observe                 Prometheus :9190 + Grafana :3100 (dashboard
 #                                       "mtm — market-making scenario")
-#   scenario.sh snapshot FILE [local|testnet]   participant holdings at oracle prices
-#   scenario.sh report START END [local|testnet] PnL, transactions, trades between snapshots
-#   scenario.sh measure NAME SECONDS [local|testnet] snapshot → sample load → snapshot → report
+#   scenario.sh snapshot FILE [local|devnet|testnet]   participant holdings at oracle prices
+#   scenario.sh report START END [local|devnet|testnet] PnL, transactions, trades between snapshots
+#   scenario.sh measure NAME SECONDS [local|devnet|testnet] snapshot → sample load → snapshot → report
 #                                       into .scenario/runs/NAME-{t0,t1,load,report}.json
 #
 # SCENARIO_SCALE=x10|x100|assets|x200|x500|x750|x1000|x2000 layers config/scale-<scale>.toml (generated
@@ -19,7 +19,7 @@
 # asset scale uses bootstrap/scenario/tokens-assets.json).
 #   scenario.sh down                    stop every service started by `up`/`observe`
 #                                       (TERM, then KILL after 30 s)
-#   scenario.sh teardown [local|testnet]  stop the scenario services, unwind every
+#   scenario.sh teardown [local|devnet|testnet]  stop the scenario services, unwind every
 #                                       participant, sweep all SOL to the faucet, and
 #                                       write .scenario/{teardown,leftovers}.json
 #                                       (rent still locked in pools, markets, …).
@@ -40,9 +40,9 @@
 # topped up to their targets.
 set -euo pipefail
 
-usage() { echo "usage: $0 {deploy|up|bootstrap|observe|status|down} [local|testnet]" \
+usage() { echo "usage: $0 {deploy|up|bootstrap|observe|status|down} [local|devnet|testnet]" \
   "| snapshot FILE [target] | report START END [target] | measure NAME SECONDS [target]" >&2; exit 2; }
-is_target() { [[ "$1" == local || "$1" == testnet ]]; }
+is_target() { [[ "$1" == local || "$1" == devnet || "$1" == testnet ]]; }
 
 # Positional arguments, checked strictly: a forgotten operand must not shift
 # the target into its place (e.g. `measure x10 testnet` running locally).
@@ -73,11 +73,16 @@ case "$target" in
     export MTM_PROFILE=scenario-local
     rpc="${SCENARIO_RPC_URL:-http://127.0.0.1:8899}"
     ;;
+  devnet)
+    # A rehearsal of the testnet run: same profile shape, devnet endpoints.
+    export MTM_PROFILE=scenario-devnet
+    rpc="${SCENARIO_RPC_URL:-https://api.devnet.solana.com}"
+    ;;
   testnet)
     export MTM_PROFILE=scenario-testnet
     rpc="${SCENARIO_RPC_URL:-https://api.testnet.solana.com}"
     ;;
-  *) echo "unknown target: $target (local|testnet)" >&2; exit 2 ;;
+  *) echo "unknown target: $target (local|devnet|testnet)" >&2; exit 2 ;;
 esac
 # The scale `up` started at, so later commands resolve the same participants
 # (a snapshot or report at another scale reads a different wallet set). Unset,

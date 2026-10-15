@@ -141,6 +141,14 @@ scenario-teardown-testnet: (scenario-with "prd" "testnet" "teardown")
 scenario-testnet: (scenario-with "prd" "testnet" "up")
 scenario-status-testnet: (scenario-with "prd" "testnet" "status")
 
+# Devnet rehearsal of the testnet run, under the Doppler config DEVNET_CONFIG
+# (`devnet` unless overridden: `just DEVNET_CONFIG=stg scenario-devnet`).
+DEVNET_CONFIG := env_var_or_default("DEVNET_CONFIG", "devnet")
+scenario-deploy-devnet: (scenario-with DEVNET_CONFIG "devnet" "deploy")
+scenario-devnet: (scenario-with DEVNET_CONFIG "devnet" "up")
+scenario-status-devnet: (scenario-with DEVNET_CONFIG "devnet" "status")
+scenario-teardown-devnet: (scenario-with DEVNET_CONFIG "devnet" "teardown")
+
 # Deploy the forks, bootstrap and run every service, then start observability.
 scenario-dev: scenario-deploy-dev scenario-up-dev scenario-observe
 
