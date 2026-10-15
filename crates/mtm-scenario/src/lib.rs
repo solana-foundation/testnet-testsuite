@@ -187,6 +187,9 @@ impl Scenario {
                 );
             }
         }
+        if let Some(hedge) = &self.config.hedge {
+            hedge.validate()?;
+        }
         if let Some(arb) = &self.config.arb {
             arb.validate()?;
             for bot in &arb.bots {
