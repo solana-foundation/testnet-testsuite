@@ -12,7 +12,9 @@
 //! Every trade ends in one [`Outcome`], exported as the `outcome` label of
 //! `flow_swaps_total` next to the coarse `status` (landed/failed), so market
 //! effects (unaffordable, preflight slippage, landed-failed) can be told
-//! apart from infrastructure faults (expired, ambiguous RPC).
+//! apart from infrastructure faults (expired, ambiguous RPC). Once the router
+//! has quoted a route, `flow_venue_swaps_total` also counts the send's
+//! outcome once per venue the route touches, for per-venue failure rates.
 //!
 //! Each landed swap is a `debug` line; `info` gets one summary a minute
 //! (outcome counts), so a long run at thousands of swaps per second doesn't
@@ -39,7 +41,7 @@ use oracle_client::OracleClient;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Exp, LogNormal, Uniform};
-use router_client::{Execution, QuoteRequest, RouterClient, SwapMode};
+use router_client::{Execution, QuoteRequest, RouteLeg, RouterClient, SwapMode};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
@@ -103,6 +105,20 @@ async fn main() -> Result<()> {
                 counter!("flow_swaps_total", "pair" => format!("{a}/{b}"), "status" => outcome.status(), "outcome" => outcome.as_str(), "size" => size)
                     .absolute(0);
             }
+        }
+    }
+    let mut venues: Vec<&str> = scenario
+        .config
+        .pools
+        .iter()
+        .map(|pool| pool.venue.as_str())
+        .collect();
+    venues.sort_unstable();
+    venues.dedup();
+    for venue in venues {
+        for outcome in Outcome::SENT {
+            counter!("flow_venue_swaps_total", "venue" => venue, "status" => outcome.status(), "outcome" => outcome.as_str())
+                .absolute(0);
         }
     }
     let takers: Vec<Keypair> = (0..flow.takers).map(|i| scenario.taker_wallet(i)).collect();
@@ -245,6 +261,16 @@ enum Outcome {
 }
 
 impl Outcome {
+    /// The outcomes of a quoted swap once it is sent.
+    const SENT: [Self; 6] = [
+        Self::Landed,
+        Self::PreflightRejected,
+        Self::SendFailed,
+        Self::LandedFailed,
+        Self::Expired,
+        Self::RpcAmbiguous,
+    ];
+
     const ALL: [Self; 10] = [
         Self::Landed,
         Self::Unaffordable,
@@ -307,6 +333,17 @@ impl<T> OutcomeContext<T> for Option<T> {
             error: anyhow::anyhow!("missing value"),
         })
     }
+}
+
+/// Each venue a route touches, once, in route order.
+fn route_venues(route: &[RouteLeg]) -> Vec<&str> {
+    let mut venues: Vec<&str> = Vec::with_capacity(route.len());
+    for leg in route {
+        if !venues.contains(&leg.venue.as_str()) {
+            venues.push(&leg.venue);
+        }
+    }
+    venues
 }
 
 fn fail<T>(outcome: Outcome, error: anyhow::Error) -> std::result::Result<T, TradeError> {
@@ -493,7 +530,15 @@ impl Flow<'_> {
             wincode::deserialize(&bytes).outcome(Outcome::Error)?;
         let signed =
             VersionedTransaction::try_new(unsigned.message, &[taker]).outcome(Outcome::Error)?;
-        let (signature, slot) = self.send_and_confirm(&signed).await?;
+        let sent = self.send_and_confirm(&signed).await;
+        let outcome = sent
+            .as_ref()
+            .map_or_else(|error| error.outcome, |_| Outcome::Landed);
+        for venue in route_venues(&quote.route) {
+            counter!("flow_venue_swaps_total", "venue" => venue.to_owned(), "status" => outcome.status(), "outcome" => outcome.as_str())
+                .increment(1);
+        }
+        let (signature, slot) = sent?;
 
         // Pinned to the confirmation slot: a lagging node cannot hand back
         // the pre-swap balances and record a phantom 100% slippage.
@@ -640,6 +685,27 @@ mod tests {
     }
 
     use super::*;
+
+    fn leg(venue: &str) -> RouteLeg {
+        RouteLeg {
+            venue: venue.to_owned(),
+            pool: String::new(),
+            input_mint: String::new(),
+            output_mint: String::new(),
+            in_amount: 0,
+            out_amount: 0,
+            fee_amount: 0,
+            price_impact_bps: 0,
+            cu_estimate: 0,
+        }
+    }
+
+    #[test]
+    fn route_venues_counts_each_venue_once() {
+        let route = [leg("manifest"), leg("raydium-clmm"), leg("manifest")];
+        assert_eq!(route_venues(&route), ["manifest", "raydium-clmm"]);
+        assert!(route_venues(&[]).is_empty());
+    }
 
     #[test]
     fn slippage_is_normalised_by_the_quote() {
