@@ -140,6 +140,10 @@ scenario-teardown-dev: (scenario-with "dev" "local" "teardown")
 scenario-teardown-testnet: (scenario-with "prd" "testnet" "teardown")
 scenario-testnet: (scenario-with "prd" "testnet" "up")
 scenario-status-testnet: (scenario-with "prd" "testnet" "status")
+# chain-watch alone (`up` starts it too): slots, blocks, versions, feature gates
+# into .scenario/runs/<run id>/run.db; API :8183, metrics :9185.
+scenario-watch-dev: (scenario-with "dev" "local" "watch")
+scenario-watch-testnet: (scenario-with "prd" "testnet" "watch")
 
 # Devnet rehearsal of the testnet run, under the Doppler config DEVNET_CONFIG
 # (`devnet` unless overridden: `just DEVNET_CONFIG=stg scenario-devnet`).

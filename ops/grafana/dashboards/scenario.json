@@ -10,6 +10,52 @@
     "from": "now-30m",
     "to": "now"
   },
+  "annotations": {
+    "list": [
+      {
+        "name": "Epoch boundary",
+        "enable": true,
+        "iconColor": "blue",
+        "expr": "changes(chain_epoch[1m]) > 0",
+        "step": "30s",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "titleFormat": "Epoch boundary",
+        "tagKeys": "",
+        "useValueForTime": false
+      },
+      {
+        "name": "Feature activated",
+        "enable": true,
+        "iconColor": "red",
+        "expr": "changes(chain_feature_active[2m]) > 0",
+        "step": "30s",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "titleFormat": "Feature activated",
+        "tagKeys": "feature,description",
+        "useValueForTime": false
+      },
+      {
+        "name": "Feature pending",
+        "enable": true,
+        "iconColor": "orange",
+        "expr": "changes(chain_features{state=\"pending\"}[2m]) > 0",
+        "step": "30s",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "titleFormat": "Pending feature gates changed",
+        "tagKeys": "",
+        "useValueForTime": false
+      }
+    ]
+  },
   "panels": [
     {
       "type": "row",
@@ -218,7 +264,7 @@
     },
     {
       "type": "row",
-      "title": "Oracle",
+      "title": "Cluster (chain-watch)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -228,6 +274,1223 @@
       },
       "panels": [],
       "id": 8
+    },
+    {
+      "type": "stat",
+      "title": "Non-vote TPS (blocks, 1m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(chain_block_transactions_total{kind=\"non_vote\"}[1m]))"
+        }
+      ],
+      "id": 9
+    },
+    {
+      "type": "stat",
+      "title": "Our TPS (on chain, 1m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(chain_ours_transactions_total[1m])) or vector(0)"
+        }
+      ],
+      "id": 10
+    },
+    {
+      "type": "stat",
+      "title": "Our success on chain (5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(chain_ours_transactions_total{status=\"ok\"}[5m])) / sum(increase(chain_ours_transactions_total[5m]))"
+        }
+      ],
+      "id": 11
+    },
+    {
+      "type": "stat",
+      "title": "Skip rate (5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(increase(chain_slots_total{status=\"skipped\"}[5m])) or vector(0)) / sum(increase(chain_slots_total[5m]))"
+        }
+      ],
+      "id": 12
+    },
+    {
+      "type": "stat",
+      "title": "Slot time p50 (ws)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_slot_interval_seconds{quantile=\"0.5\"}"
+        }
+      ],
+      "id": 13
+    },
+    {
+      "type": "stat",
+      "title": "Epoch progress",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_epoch_progress"
+        }
+      ],
+      "id": 14
+    },
+    {
+      "type": "stat",
+      "title": "Pending feature gates",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_features{state=\"pending\"}"
+        }
+      ],
+      "id": 15
+    },
+    {
+      "type": "stat",
+      "title": "Block pipeline lag (slots)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_block_lag_slots"
+        }
+      ],
+      "id": 16
+    },
+    {
+      "type": "timeseries",
+      "title": "Transactions / s",
+      "description": "counted from every confirmed block; perf samples are the node's own 60 s windows (cross-check, and the only source in accounts mode)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(chain_block_transactions_total[1m]))",
+          "legendFormat": "{{kind}} (blocks)"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(chain_ours_transactions_total[1m]))",
+          "legendFormat": "ours (blocks)"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(chain_block_failed_transactions_total[1m]))",
+          "legendFormat": "failed (blocks)"
+        },
+        {
+          "refId": "D",
+          "expr": "chain_perf_tps",
+          "legendFormat": "{{kind}} (perf samples, 60 s)"
+        }
+      ],
+      "id": 17
+    },
+    {
+      "type": "timeseries",
+      "title": "Slots / s by leader client",
+      "description": "produced vs skipped per producing client (clientId from getClusterNodes)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (leader_client, status) (rate(chain_slots_total[1m]))",
+          "legendFormat": "{{leader_client}} {{status}}"
+        }
+      ],
+      "id": 18
+    },
+    {
+      "type": "timeseries",
+      "title": "Slot interval (ws) and pacing",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_slot_interval_seconds{quantile=\"0.5\"}",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "chain_slot_interval_seconds{quantile=\"0.99\"}",
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "C",
+          "expr": "chain_perf_slot_seconds",
+          "legendFormat": "perf sample avg"
+        }
+      ],
+      "id": 19
+    },
+    {
+      "type": "timeseries",
+      "title": "Commitment gaps (slots)",
+      "description": "consensus lag: how far confirmation and finality trail the tip",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_slot{commitment=\"processed\"} - ignoring(commitment) chain_slot{commitment=\"confirmed\"}",
+          "legendFormat": "processed - confirmed"
+        },
+        {
+          "refId": "B",
+          "expr": "chain_slot{commitment=\"confirmed\"} - ignoring(commitment) chain_slot{commitment=\"finalized\"}",
+          "legendFormat": "confirmed - finalized"
+        }
+      ],
+      "id": 20
+    },
+    {
+      "type": "timeseries",
+      "title": "Block compute (per block)",
+      "description": "cost units are what the block limit counts; set chain_watch.block_cost_limit for the fill ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 34
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_block_cu{quantile=\"0.5\"}",
+          "legendFormat": "CU p50"
+        },
+        {
+          "refId": "B",
+          "expr": "chain_block_cu{quantile=\"0.99\"}",
+          "legendFormat": "CU p99"
+        },
+        {
+          "refId": "C",
+          "expr": "chain_block_cost_units{quantile=\"0.5\"}",
+          "legendFormat": "cost p50"
+        },
+        {
+          "refId": "D",
+          "expr": "chain_block_cost_units{quantile=\"0.99\"}",
+          "legendFormat": "cost p99"
+        }
+      ],
+      "id": 21
+    },
+    {
+      "type": "timeseries",
+      "title": "Priority price (micro-lamports / CU)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_prio_price_micro_lamports{quantile=\"0.5\"}",
+          "legendFormat": "p50 {{scope}}"
+        },
+        {
+          "refId": "B",
+          "expr": "chain_prio_price_micro_lamports{quantile=\"0.9\"}",
+          "legendFormat": "p90 {{scope}}"
+        }
+      ],
+      "id": 22
+    },
+    {
+      "type": "timeseries",
+      "title": "Stake by client",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_stake_ratio",
+          "legendFormat": "{{client}}"
+        },
+        {
+          "refId": "B",
+          "expr": "chain_delinquent_stake_ratio",
+          "legendFormat": "delinquent"
+        }
+      ],
+      "id": 23
+    },
+    {
+      "type": "timeseries",
+      "title": "Stake by version",
+      "description": "a majority change is a timeline event (majority_version) in chain-watch's run store",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_stake_by_version_ratio > 0",
+          "legendFormat": "{{version}}"
+        }
+      ],
+      "id": 24
+    },
+    {
+      "type": "table",
+      "title": "Feature gates (on chain)",
+      "description": "every Feature-program account: Value #A = activation slot; pending ones (Value #B = 0) activate at the next epoch boundary. Full history with times: chain-watch GET /features",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 50
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value #A",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "merge"
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "instance": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_feature_activation_slot",
+          "legendFormat": "activated",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "expr": "chain_feature_active == 0",
+          "legendFormat": "pending",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "id": 25
+    },
+    {
+      "type": "timeseries",
+      "title": "RPC latency p95 (chain-watch)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 60
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_rpc_seconds{quantile=\"0.95\"}",
+          "legendFormat": "{{method}}"
+        }
+      ],
+      "id": 26
+    },
+    {
+      "type": "timeseries",
+      "title": "RPC errors / min (chain-watch)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 60
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (method, kind) (rate(chain_rpc_errors_total[5m])) * 60",
+          "legendFormat": "{{method}} {{kind}}"
+        }
+      ],
+      "id": 27
+    },
+    {
+      "type": "row",
+      "title": "Our transactions",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 68
+      },
+      "panels": [],
+      "id": 28
+    },
+    {
+      "type": "timeseries",
+      "title": "Outcomes / s (client view)",
+      "description": "landed / failed (on chain) / simulation_failed / rejected / expired / ambiguous / client, from ChainClient in every service",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 69
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(chain_tx_outcome_total[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "id": 29
+    },
+    {
+      "type": "timeseries",
+      "title": "Landing rate by actor (5m)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 69
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (actor) (rate(chain_tx_outcome_total{outcome=\"landed\"}[5m])) / sum by (actor) (rate(chain_tx_outcome_total[5m]))",
+          "legendFormat": "{{actor}}"
+        }
+      ],
+      "id": 30
+    },
+    {
+      "type": "timeseries",
+      "title": "Failure kinds / min",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome, error) (rate(chain_tx_outcome_total{outcome!=\"landed\"}[5m])) * 60",
+          "legendFormat": "{{outcome}} {{error}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (error, error_program) (rate(chain_ours_transactions_total{status=\"failed\"}[5m])) * 60",
+          "legendFormat": "on chain {{error_program}} {{error}}"
+        }
+      ],
+      "id": 31
+    },
+    {
+      "type": "timeseries",
+      "title": "Settle latency (send \u2192 commitment)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_tx_settle_seconds{quantile=\"0.5\",outcome=\"landed\"}",
+          "legendFormat": "p50 {{action}}"
+        },
+        {
+          "refId": "B",
+          "expr": "chain_tx_settle_seconds{quantile=\"0.95\",outcome=\"landed\"}",
+          "legendFormat": "p95 {{action}}"
+        }
+      ],
+      "id": 32
+    },
+    {
+      "type": "timeseries",
+      "title": "CU per transaction by program",
+      "description": "consumed on chain; a step change after a feature activation is a repricing",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 85
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_ours_cu{quantile=\"0.5\"}",
+          "legendFormat": "p50 {{program}}"
+        },
+        {
+          "refId": "B",
+          "expr": "chain_ours_cu{quantile=\"0.95\"}",
+          "legendFormat": "p95 {{program}}"
+        }
+      ],
+      "id": 33
+    },
+    {
+      "type": "timeseries",
+      "title": "CU limit used",
+      "description": "consumed / requested; low values waste block space and priority fees",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 85
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "chain_ours_cu_limit_used_ratio{quantile=\"0.5\"}",
+          "legendFormat": "p50 {{program}}"
+        },
+        {
+          "refId": "B",
+          "expr": "chain_ours_cu_limit_used_ratio{quantile=\"0.95\"}",
+          "legendFormat": "p95 {{program}}"
+        }
+      ],
+      "id": 34
+    },
+    {
+      "type": "timeseries",
+      "title": "Our transactions by leader client",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 93
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (leader_client, status) (rate(chain_ours_by_leader_client_total[5m]))",
+          "legendFormat": "{{leader_client}} {{status}}"
+        }
+      ],
+      "id": 35
+    },
+    {
+      "type": "timeseries",
+      "title": "Fees (SOL / min) by actor kind",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 93
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (actor_kind) (rate(chain_ours_fees_lamports_total[5m])) * 60 / 1e9",
+          "legendFormat": "{{actor_kind}}"
+        }
+      ],
+      "id": 36
+    },
+    {
+      "type": "row",
+      "title": "Host",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 101
+      },
+      "panels": [],
+      "id": 37
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU busy",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 102
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m]))",
+          "legendFormat": "all cores"
+        }
+      ],
+      "id": 38
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory available and TCP sockets",
+      "description": "ephemeral-port exhaustion (EADDRNOTAVAIL) ended the x2000 run; sockets scaled by ~30k ports",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 102
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes",
+          "legendFormat": "memory available"
+        },
+        {
+          "refId": "B",
+          "expr": "node_sockstat_TCP_inuse / 30000",
+          "legendFormat": "TCP in use / 30k"
+        },
+        {
+          "refId": "C",
+          "expr": "node_sockstat_TCP_tw / 30000",
+          "legendFormat": "TIME_WAIT / 30k"
+        }
+      ],
+      "id": 39
+    },
+    {
+      "type": "row",
+      "title": "Oracle",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 110
+      },
+      "panels": [],
+      "id": 40
     },
     {
       "type": "timeseries",
@@ -241,7 +1504,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 10
+        "y": 111
       },
       "fieldConfig": {
         "defaults": {
@@ -266,7 +1529,7 @@
           "legendFormat": "{{pair}}"
         }
       ],
-      "id": 9
+      "id": 41
     },
     {
       "type": "timeseries",
@@ -280,7 +1543,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 10
+        "y": 111
       },
       "fieldConfig": {
         "defaults": {
@@ -305,7 +1568,7 @@
           "legendFormat": "{{symbol}}"
         }
       ],
-      "id": 10
+      "id": 42
     },
     {
       "type": "row",
@@ -315,10 +1578,10 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 119
       },
       "panels": [],
-      "id": 11
+      "id": 43
     },
     {
       "type": "timeseries",
@@ -332,7 +1595,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 19
+        "y": 120
       },
       "fieldConfig": {
         "defaults": {
@@ -357,7 +1620,7 @@
           "legendFormat": "{{maker}} ({{venue}})"
         }
       ],
-      "id": 12
+      "id": 44
     },
     {
       "type": "timeseries",
@@ -371,7 +1634,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 19
+        "y": 120
       },
       "fieldConfig": {
         "defaults": {
@@ -396,7 +1659,7 @@
           "legendFormat": "{{maker}}"
         }
       ],
-      "id": 13
+      "id": 45
     },
     {
       "type": "timeseries",
@@ -410,7 +1673,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 128
       },
       "fieldConfig": {
         "defaults": {
@@ -440,7 +1703,7 @@
           "legendFormat": "{{venue}} routed legs"
         }
       ],
-      "id": 14
+      "id": 46
     },
     {
       "type": "timeseries",
@@ -454,7 +1717,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 27
+        "y": 128
       },
       "fieldConfig": {
         "defaults": {
@@ -489,7 +1752,7 @@
           "legendFormat": "manifest"
         }
       ],
-      "id": 15
+      "id": 47
     },
     {
       "type": "row",
@@ -499,10 +1762,10 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 136
       },
       "panels": [],
-      "id": 16
+      "id": 48
     },
     {
       "type": "timeseries",
@@ -516,7 +1779,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 36
+        "y": 137
       },
       "fieldConfig": {
         "defaults": {
@@ -541,7 +1804,7 @@
           "legendFormat": "{{maker}}"
         }
       ],
-      "id": 17
+      "id": 49
     },
     {
       "type": "timeseries",
@@ -555,7 +1818,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 36
+        "y": 137
       },
       "fieldConfig": {
         "defaults": {
@@ -580,7 +1843,7 @@
           "legendFormat": "{{maker}} {{action}}"
         }
       ],
-      "id": 18
+      "id": 50
     },
     {
       "type": "timeseries",
@@ -594,7 +1857,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 44
+        "y": 145
       },
       "fieldConfig": {
         "defaults": {
@@ -619,7 +1882,7 @@
           "legendFormat": "{{maker}} {{token}}"
         }
       ],
-      "id": 19
+      "id": 51
     },
     {
       "type": "timeseries",
@@ -633,7 +1896,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 44
+        "y": 145
       },
       "fieldConfig": {
         "defaults": {
@@ -663,7 +1926,7 @@
           "legendFormat": "arb {{maker}}"
         }
       ],
-      "id": 20
+      "id": 52
     },
     {
       "type": "timeseries",
@@ -677,7 +1940,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 52
+        "y": 153
       },
       "fieldConfig": {
         "defaults": {
@@ -702,7 +1965,7 @@
           "legendFormat": "{{maker}} {{stage}}"
         }
       ],
-      "id": 21
+      "id": 53
     },
     {
       "type": "timeseries",
@@ -716,7 +1979,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 52
+        "y": 153
       },
       "fieldConfig": {
         "defaults": {
@@ -741,7 +2004,7 @@
           "legendFormat": "{{maker}}"
         }
       ],
-      "id": 22
+      "id": 54
     },
     {
       "type": "timeseries",
@@ -755,7 +2018,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 60
+        "y": 161
       },
       "fieldConfig": {
         "defaults": {
@@ -780,7 +2043,7 @@
           "legendFormat": "{{maker}} {{side}}"
         }
       ],
-      "id": 23
+      "id": 55
     },
     {
       "type": "timeseries",
@@ -794,7 +2057,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 60
+        "y": 161
       },
       "fieldConfig": {
         "defaults": {
@@ -819,7 +2082,7 @@
           "legendFormat": "{{maker}}"
         }
       ],
-      "id": 24
+      "id": 56
     },
     {
       "type": "row",
@@ -829,10 +2092,10 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 169
       },
       "panels": [],
-      "id": 25
+      "id": 57
     },
     {
       "type": "timeseries",
@@ -846,7 +2109,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 69
+        "y": 170
       },
       "fieldConfig": {
         "defaults": {
@@ -871,7 +2134,7 @@
           "legendFormat": "{{pair}} {{status}} {{size}}"
         }
       ],
-      "id": 26
+      "id": 58
     },
     {
       "type": "timeseries",
@@ -885,7 +2148,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 69
+        "y": 170
       },
       "fieldConfig": {
         "defaults": {
@@ -910,7 +2173,7 @@
           "legendFormat": "{{outcome}}"
         }
       ],
-      "id": 27
+      "id": 59
     },
     {
       "type": "timeseries",
@@ -924,7 +2187,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 77
+        "y": 178
       },
       "fieldConfig": {
         "defaults": {
@@ -954,7 +2217,7 @@
           "legendFormat": "p95 {{pair}}"
         }
       ],
-      "id": 28
+      "id": 60
     },
     {
       "type": "timeseries",
@@ -968,7 +2231,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 77
+        "y": 178
       },
       "fieldConfig": {
         "defaults": {
@@ -998,7 +2261,7 @@
           "legendFormat": "p50 {{pair}}"
         }
       ],
-      "id": 29
+      "id": 61
     },
     {
       "type": "timeseries",
@@ -1012,7 +2275,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 85
+        "y": 186
       },
       "fieldConfig": {
         "defaults": {
@@ -1037,7 +2300,7 @@
           "legendFormat": "{{venue}}"
         }
       ],
-      "id": 30
+      "id": 62
     },
     {
       "type": "timeseries",
@@ -1051,7 +2314,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 85
+        "y": 186
       },
       "fieldConfig": {
         "defaults": {
@@ -1081,7 +2344,7 @@
           "legendFormat": "p95 {{execution}}"
         }
       ],
-      "id": 31
+      "id": 63
     },
     {
       "type": "timeseries",
@@ -1095,7 +2358,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 93
+        "y": 194
       },
       "fieldConfig": {
         "defaults": {
@@ -1125,7 +2388,7 @@
           "legendFormat": "errors {{status}}"
         }
       ],
-      "id": 32
+      "id": 64
     },
     {
       "type": "row",
@@ -1135,10 +2398,10 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 101
+        "y": 202
       },
       "panels": [],
-      "id": 33
+      "id": 65
     },
     {
       "type": "timeseries",
@@ -1152,7 +2415,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 102
+        "y": 203
       },
       "fieldConfig": {
         "defaults": {
@@ -1182,7 +2445,7 @@
           "legendFormat": "opportunities {{bot}} {{legs}}-leg"
         }
       ],
-      "id": 34
+      "id": 66
     },
     {
       "type": "timeseries",
@@ -1196,7 +2459,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 102
+        "y": 203
       },
       "fieldConfig": {
         "defaults": {
@@ -1231,7 +2494,7 @@
           "legendFormat": "last trade {{bot}}"
         }
       ],
-      "id": 35
+      "id": 67
     },
     {
       "type": "timeseries",
@@ -1245,7 +2508,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 110
+        "y": 211
       },
       "fieldConfig": {
         "defaults": {
@@ -1280,7 +2543,7 @@
           "legendFormat": "errors"
         }
       ],
-      "id": 36
+      "id": 68
     },
     {
       "type": "timeseries",
@@ -1294,7 +2557,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 110
+        "y": 211
       },
       "fieldConfig": {
         "defaults": {
@@ -1324,7 +2587,7 @@
           "legendFormat": "p95"
         }
       ],
-      "id": 37
+      "id": 69
     },
     {
       "type": "timeseries",
@@ -1338,7 +2601,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 118
+        "y": 219
       },
       "fieldConfig": {
         "defaults": {
@@ -1368,7 +2631,7 @@
           "legendFormat": "in flight"
         }
       ],
-      "id": 38
+      "id": 70
     }
   ]
 }

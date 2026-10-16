@@ -163,3 +163,19 @@ probe_amount = 1000
 # (MTM_ROUTER__JUPITER__PROGRAM_ID). Unset: such requests are rejected.
 [router.jupiter]
 overhead_cu = 60000
+
+# --- chain-watch: read-only cluster observer (docs/dashboard-plan.md) ---------
+# Ports sit beside the scenario's (8180-8181, 9180-9184). RPC defaults to
+# [rpc]; scenario.sh points it at CHAIN_WATCH_RPC_URL / CHAIN_WATCH_WS_URL
+# when Doppler sets them (else SCENARIO_RPC_URL). A block per slot at 5
+# slots/s needs a dedicated provider: on public endpoints chain-watch records
+# slots and leaders only (block_details = "slots", 6 requests/s budget)
+# unless allow_public_block_fetch = true.
+[chain_watch]
+listen_addr = "127.0.0.1:8183"
+metrics_addr = "127.0.0.1:9185"
+block_details = "full"   # full | accounts | slots
+raw_blocks = "failed"    # off | failed | ours | all (zstd JSON beside run.db)
+run_dir = ".scenario/runs"
+# block_cost_limit = 100000000  # enables the block fill-ratio metric
+
