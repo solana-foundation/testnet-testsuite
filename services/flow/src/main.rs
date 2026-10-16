@@ -14,6 +14,10 @@
 //! effects (unaffordable, preflight slippage, landed-failed) can be told
 //! apart from infrastructure faults (expired, ambiguous RPC).
 //!
+//! Each landed swap is a `debug` line; `info` gets one summary a minute
+//! (outcome counts), so a long run at thousands of swaps per second doesn't
+//! write gigabytes of logs (a 2 h x1000 run wrote 6 GB at one line per swap).
+//!
 //! Notionals are sampled in `f64` (the distributions are float-only) and
 //! rounded to micro-USD `Decimal` straight away; nothing downstream sees the
 //! float.
@@ -110,6 +114,8 @@ async fn main() -> Result<()> {
         rate_per_min = flow.rate_per_min,
         "flow started"
     );
+    let tally = std::sync::Arc::new(Tally::default());
+    tokio::spawn(summarize(std::sync::Arc::clone(&tally)));
     let rpc = &cfg.rpc;
     let (scenario, flow, takers) = (&scenario, &flow, &takers);
     tokio::task::block_in_place(|| {
@@ -117,6 +123,7 @@ async fn main() -> Result<()> {
             let handles: Vec<_> = (0..shards)
                 .map(|shard| {
                     let refill = refill.clone();
+                    let tally = std::sync::Arc::clone(&tally);
                     scope.spawn(move || -> Result<()> {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -129,6 +136,7 @@ async fn main() -> Result<()> {
                                 scenario,
                                 flow,
                                 refill,
+                                tally,
                             };
                             engine.run(takers, shard, shards).await
                         })
@@ -155,6 +163,43 @@ struct Flow<'a> {
         std::sync::Arc<dyn Signer + Send + Sync>,
         std::sync::Arc<dyn Signer + Send + Sync>,
     )>,
+    tally: std::sync::Arc<Tally>,
+}
+
+/// Trade outcomes since the last summary, shared by every shard.
+#[derive(Default)]
+struct Tally(std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>);
+
+impl Tally {
+    fn add(&self, outcome: &'static str) {
+        if let Ok(mut counts) = self.0.lock() {
+            *counts.entry(outcome).or_default() += 1;
+        }
+    }
+
+    fn take(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        self.0
+            .lock()
+            .map(|mut c| std::mem::take(&mut *c))
+            .unwrap_or_default()
+    }
+}
+
+/// One `info` line a minute: every trade outcome since the last one.
+async fn summarize(tally: std::sync::Arc<Tally>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let counts = tally.take();
+        let trades: u64 = counts.values().sum();
+        let outcomes = counts
+            .iter()
+            .map(|(outcome, n)| format!("{outcome}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        info!(trades, %outcomes, "flow, last 60 s");
+    }
 }
 
 struct Trade<'t> {
@@ -330,6 +375,7 @@ impl Flow<'_> {
                     ("failed", outcome)
                 }
             };
+            self.tally.add(outcome.as_str());
             counter!(
                 "flow_swaps_total",
                 "pair" => label,
@@ -468,7 +514,7 @@ impl Flow<'_> {
         for leg in &quote.route {
             counter!("flow_route_legs_total", "venue" => leg.venue.clone()).increment(1);
         }
-        info!(
+        debug!(
             taker = trade.taker, %pair, mode = ?mode, %spent_usd, %received_usd, %cost_bps, slippage_bps,
             fee_lamports, legs = quote.route.len(), %signature, slot, "routed swap landed"
         );
@@ -629,6 +675,18 @@ fn ratio_bps(expected: u64, actual: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tally_counts_outcomes_and_resets_on_take() {
+        let tally = Tally::default();
+        tally.add(Outcome::Landed.as_str());
+        tally.add(Outcome::Landed.as_str());
+        tally.add(Outcome::NoPrice.as_str());
+        let counts = tally.take();
+        assert_eq!(counts.get("landed"), Some(&2));
+        assert_eq!(counts.get("no_price"), Some(&1));
+        assert!(tally.take().is_empty());
+    }
+
     use super::*;
 
     #[test]
