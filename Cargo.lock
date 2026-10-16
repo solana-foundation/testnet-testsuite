@@ -2644,6 +2644,7 @@ name = "mtm-chain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "metrics",
  "solana-commitment-config",
  "solana-compute-budget-interface",
  "solana-instruction 3.5.1",

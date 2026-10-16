@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use metrics::{counter, gauge, histogram};
 use mtm_chain::ChainClient;
+use mtm_chain::tag::TxTag;
 use mtm_scenario::funding::token_balance;
 use mtm_scenario::pricing::PriceBook;
 use mtm_scenario::venue::to_ui;
@@ -168,14 +169,26 @@ enum State {
 /// cut between its transactions.
 pub async fn run(ctx: Ctx, mut stop: tokio::sync::watch::Receiver<bool>) {
     ctx.register_actions();
+    // Every transaction this maker sends is labelled in `chain_tx_*`.
+    let tag = |action| TxTag::new(ctx.maker.name.clone(), action, ctx.maker.venue.as_str());
+    let tick_action = match ctx.maker.strategy {
+        Strategy::ClobLadder { .. } => "requote",
+        Strategy::ClmmRange { .. } => "rebalance",
+        Strategy::PoolArb { .. } => "arb",
+    };
     let mut state = loop {
-        let built = match &ctx.maker.strategy {
-            Strategy::ClobLadder { .. } => clob::Clob::start(&ctx)
-                .await
-                .map(|s| State::Clob(Box::new(s))),
-            Strategy::ClmmRange { .. } => clmm::Clmm::start(&ctx).map(|s| State::Clmm(Box::new(s))),
-            Strategy::PoolArb { .. } => Ok(State::Arb(arb::Arb)),
-        };
+        let built = mtm_chain::tag::scope(tag("setup"), async {
+            match &ctx.maker.strategy {
+                Strategy::ClobLadder { .. } => clob::Clob::start(&ctx)
+                    .await
+                    .map(|s| State::Clob(Box::new(s))),
+                Strategy::ClmmRange { .. } => {
+                    clmm::Clmm::start(&ctx).map(|s| State::Clmm(Box::new(s)))
+                }
+                Strategy::PoolArb { .. } => Ok(State::Arb(arb::Arb)),
+            }
+        })
+        .await;
         match built {
             Ok(state) => break state,
             Err(error) => {
@@ -200,13 +213,13 @@ pub async fn run(ctx: Ctx, mut stop: tokio::sync::watch::Receiver<bool>) {
         }
         let started = Instant::now();
         // A panic in venue code must not end this maker: count it and retry.
-        let tick = async {
+        let tick = mtm_chain::tag::scope(tag(tick_action), async {
             match &mut state {
                 State::Clob(clob) => clob.tick(&ctx).await,
                 State::Clmm(clmm) => clmm.tick(&ctx).await,
                 State::Arb(arb) => arb.tick(&ctx).await,
             }
-        };
+        });
         let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tick))
             .await
             .unwrap_or_else(|_| {

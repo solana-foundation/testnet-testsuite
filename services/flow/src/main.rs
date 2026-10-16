@@ -30,6 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use metrics::{counter, gauge, histogram};
+use mtm_chain::tag::TxTag;
 use mtm_chain::{ChainClient, SubmissionError, VersionedSendConfig};
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::signer_from_environment;
@@ -596,11 +597,10 @@ impl Flow<'_> {
         &self,
         transaction: &VersionedTransaction,
     ) -> std::result::Result<(Signature, u64), TradeError> {
-        match self
+        let send = self
             .chain
-            .send_versioned(transaction, VersionedSendConfig::default())
-            .await
-        {
+            .send_versioned(transaction, VersionedSendConfig::default());
+        match mtm_chain::tag::scope(TxTag::new("taker", "swap", "router"), send).await {
             Ok(outcome) => Ok((outcome.signature, outcome.confirmation_slot)),
             Err(error) => {
                 let outcome = match &error {
