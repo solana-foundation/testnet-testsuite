@@ -127,8 +127,14 @@ plus uncollected fees). The report gives, per participant:
 
 It also sums PnL per participant kind (`byKind`) and reports network-wide
 landed/failed transactions and TPS for the window (`network`, with
-`slotsSkipped`). RPC errors fail the snapshot or report rather than reading
-as "no positions" or "empty block"; the Prometheus parts are best-effort and
+`slotsSkipped`). `byVenue` splits the window's transactions by the DEX
+programs they call (`other`: none): landed, failed, failure rate and the
+top error codes from every block, and compute (mean, p95, share of all
+non-vote compute) from every 10th slot's full block (`--compute-sample-every`;
+0 turns it off). A multi-venue route counts for each venue it touches.
+
+RPC errors fail the snapshot or report rather than reading as "no
+positions" or "empty block"; the Prometheus parts are best-effort and
 anything missing is listed in `warnings`.
 
 Taker refills mint tokens and would show up as PnL (the report warns when
@@ -154,6 +160,7 @@ any happened in the window); for a clean window run flow with
 | `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                               | maker, stage / venue        | failures (ticks retry)                                                                                         |
 | `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                              | maker                       | skew, arbitrage volume (µUSD), tick latency                                                                    |
 | `flow_swaps_total`                                                                             | pair, status, outcome, size | routed swaps landed/failed, why, normal/large                                                                  |
+| `flow_venue_swaps_total`                                                                       | venue, status, outcome      | quoted swaps' send outcomes, once per venue the route touches                                                  |
 | `flow_fee_lamports_total`, `flow_fill_read_errors_total`                                       | —                           | fees paid by takers; landed swaps with unread fills                                                            |
 | `flow_takers_alive`, `flow_taker_restarts_total`                                               | —                           | taker loops running / restarted after an error                                                                 |
 | `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                                 | pair                        | cost to uninformed flow vs oracle; landed vs quoted                                                            |

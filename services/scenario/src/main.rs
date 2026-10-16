@@ -72,6 +72,9 @@ enum Command {
         /// Prometheus scraping the scenario services (for trade counts).
         #[arg(long)]
         prometheus: Option<String>,
+        /// Sample per-venue compute from every n-th slot's full block (0: off).
+        #[arg(long, default_value_t = 10)]
+        compute_sample_every: u64,
     },
 }
 
@@ -127,13 +130,22 @@ async fn main() -> Result<()> {
             start,
             end,
             prometheus,
+            compute_sample_every,
         } => {
             let read = |path: &PathBuf| -> Result<pnl::Snapshot> {
                 Ok(serde_json::from_slice(
                     &std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
                 )?)
             };
-            pnl::report(&rpc, &read(&start)?, &read(&end)?, prometheus.as_deref()).await?
+            pnl::report(
+                &rpc,
+                &read(&start)?,
+                &read(&end)?,
+                prometheus.as_deref(),
+                &pnl::VenuePrograms::of(&scenario),
+                compute_sample_every,
+            )
+            .await?
         }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
