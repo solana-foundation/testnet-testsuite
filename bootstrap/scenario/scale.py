@@ -11,13 +11,14 @@
 | scale-assets  | 1650   | 14       | 3 (1 on new)     | 11     |
 | scale-x200    | 3300   | 20       | 3                | 3      |
 | scale-x500    | 8250   | 30       | 3                | 3      |
+| scale-x750    | 12375  | 35       | 3                | 3      |
 | scale-x1000   | 16500  | 40       | 3                | 3      |
 | scale-x2000   | 33000  | 50       | 3                | 3      |
 
 * per Manifest book: that many ladders; per AMM pool: that many LP ranges
   and that many oracle pool-arbs, each with different parameters. Makers
   grow slowly on purpose; participants grow by an order of magnitude.
-  Maker capital grows instead (×3 at x10, ×10 at x100, ×20 at x200, ×50 at x500, ×100 at x1000, ×200 at x2000) so the
+  Maker capital grows instead (×3 at x10, ×10 at x100, ×20 at x200, ×50 at x500, ×75 at x750, ×100 at x1000, ×200 at x2000) so the
   books and pools can absorb the larger flow. x200 is past Surfpool's
   ceiling; it is meant for solana-test-validator.
 
@@ -215,6 +216,7 @@ def main():
         "scale-assets": (1650, 14, 3, 10, tokens, crosses),
         "scale-x200": (3300, 20, 3, 20, BASE_TOKENS, base_crosses),
         "scale-x500": (8250, 30, 3, 50, BASE_TOKENS, base_crosses),
+        "scale-x750": (12375, 35, 3, 75, BASE_TOKENS, base_crosses),
         "scale-x1000": (16500, 40, 3, 100, BASE_TOKENS, base_crosses),
         "scale-x2000": (33000, 50, 3, 200, BASE_TOKENS, base_crosses),
     }
