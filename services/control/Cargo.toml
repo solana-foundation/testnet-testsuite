@@ -1,0 +1,27 @@
+[package]
+name = "control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+chain-watch-client = { workspace = true }
+control-client = { workspace = true }
+mtm-common = { workspace = true }
+mtm-telemetry = { workspace = true }
+
+anyhow = { workspace = true }
+axum = { workspace = true }
+dotenvy = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "fs"] }
+tower-http = { workspace = true, features = ["fs"] }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

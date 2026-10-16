@@ -1,3 +1,6 @@
+packages:
+  - "."
+  - "apps/*"
 allowBuilds:
   bigint-buffer: false
   bufferutil: false
