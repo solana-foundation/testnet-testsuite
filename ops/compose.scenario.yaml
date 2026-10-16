@@ -1,7 +1,8 @@
 # Observability for the market-making scenario. The services run on the host
 # (bootstrap/scenario/scenario.sh), so Prometheus and Grafana use host
-# networking to scrape them on 127.0.0.1:9180-9184. Ports (Prometheus 9190,
-# Grafana 3100) avoid the default stack in ops/compose.yaml.
+# networking to scrape them on 127.0.0.1:9180-9185 (node-exporter: 9186).
+# Ports (Prometheus 9190, Grafana 3100) avoid the default stack in
+# ops/compose.yaml.
 #   bootstrap/scenario/scenario.sh observe  → Grafana http://127.0.0.1:3100
 #   (user admin, password $GRAFANA_PASSWORD, default admin; loopback only)
 name: mtm-scenario
@@ -14,9 +15,22 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --web.listen-address=127.0.0.1:9190
+      # aggregates for Grafana; per-slot detail lives in .scenario/runs/*/run.db
+      - --storage.tsdb.retention.time=90d
     volumes:
       - ./prometheus.scenario.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - --web.listen-address=127.0.0.1:9186
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
 
   grafana:
     image: grafana/grafana:11.6.0

@@ -1,0 +1,40 @@
+[package]
+name = "chain-watch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+chain-watch-client = { workspace = true }
+mtm-chain = { workspace = true }
+mtm-common = { workspace = true }
+mtm-scenario = { workspace = true }
+mtm-telemetry = { workspace = true }
+
+agave-feature-set = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+dotenvy = { workspace = true }
+futures = { workspace = true }
+metrics = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+figment = { workspace = true }
+# paused clock for the request-budget test
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
