@@ -2648,6 +2648,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "http",
+ "metrics",
  "reqwest-middleware",
  "serde_json",
  "solana-commitment-config",

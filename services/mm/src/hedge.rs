@@ -153,16 +153,17 @@ pub async fn execute(ctx: &Ctx, plan: &Plan) -> Result<Option<u64>> {
         compute_unit_limit: 60_000,
         ..SubmissionConfig::default()
     };
-    let submitted = ctx
-        .chain
-        .submit(
+    let submitted = mtm_chain::tag::action(
+        "hedge",
+        ctx.chain.submit(
             instructions,
             ctx.wallet.as_ref(),
             &[authority.as_ref()],
             config,
-        )
-        .await
-        .context("hedging")?;
+        ),
+    )
+    .await
+    .context("hedging")?;
     let micro = |usd: Decimal| {
         (usd * Decimal::from(1_000_000))
             .round()
