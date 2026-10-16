@@ -79,7 +79,7 @@ esac
 # the recorded scale applies; a different one is refused.
 if [[ "$cmd" == up ]]; then
   printf %s "${SCENARIO_SCALE:-}" >"$state/scale"
-elif [[ "$cmd" =~ ^(bootstrap|status|snapshot|report|measure)$ && -f "$state/scale" ]]; then
+elif [[ "$cmd" =~ ^(bootstrap|status|snapshot|report|measure|teardown)$ && -f "$state/scale" ]]; then
   recorded="$(cat "$state/scale")"
   if [[ -z "${SCENARIO_SCALE+set}" ]]; then
     SCENARIO_SCALE="$recorded"
@@ -348,6 +348,18 @@ case "$cmd" in
     echo "wrote $runs/$name-{t0,t1,load,report}.json"
     ;;
   teardown)
+    # Everything the unwind needs, checked before anything is stopped: a
+    # missing secret must not leave the run half torn down.
+    missing=()
+    [[ -n "${KEYPAIR_FAUCET:-}" ]] || missing+=(KEYPAIR_FAUCET)
+    if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" == 1 ]]; then
+      [[ -n "${KEYPAIR_PROGRAM_AUTHORITY:-}" ]] || missing+=(KEYPAIR_PROGRAM_AUTHORITY)
+    fi
+    if (( ${#missing[@]} )); then
+      echo "teardown: missing ${missing[*]}; nothing was stopped" >&2; exit 1
+    fi
+    # Seed, program ids and mints, resolved exactly as the unwind will.
+    "$bin/scenario" check >/dev/null || { echo "teardown: scenario check failed; nothing was stopped" >&2; exit 1; }
     # Wait for every participant to exit: the unwind must not race a maker
     # that is still re-centring.
     for name in arb flow mm router oracle; do

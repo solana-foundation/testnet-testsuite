@@ -289,7 +289,11 @@ transactions failed). The limits, in order:
 ## Teardown
 
 `scenario.sh teardown` (`just scenario-teardown-dev` / `-testnet`) recovers
-the scenario's SOL into the faucet:
+the scenario's SOL into the faucet. Before stopping anything it checks the
+faucet key, the program authority (with `SCENARIO_CLOSE_PROGRAMS`) and
+`scenario check` (seed, program ids and mints resolve), so a missing secret
+cannot leave the run half torn down; like `snapshot` and `report` it runs at
+the scale `up` recorded unless `SCENARIO_SCALE` names it:
 
 1. stops oracle, router, makers, flow, and arb (Prometheus/Grafana stay);
 2. unwinds every maker: CLMM positions are emptied, their fees collected,

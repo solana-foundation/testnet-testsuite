@@ -60,6 +60,9 @@ enum Command {
     },
     /// Print every scenario pool and wallet with its balances.
     Status,
+    /// Resolve the scenario (seed, program ids, mints) and change nothing:
+    /// the preflight for commands that must not fail halfway.
+    Check,
     /// Wait until the oracle has a fresh price for every scenario token
     /// (pools are created at oracle prices).
     WaitPrices {
@@ -166,6 +169,11 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
+        Command::Check => json!({
+            "ok": true,
+            "participants": scenario.participants().len(),
+            "tokens": scenario.tokens.len(),
+        }),
         Command::WaitPrices { timeout_s } => wait_prices(&scenario, timeout_s).await?,
         Command::Snapshot { out } => {
             let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
