@@ -98,9 +98,16 @@ impl Default for CoinGeckoConfig {
 pub struct BinanceConfig {
     pub ws_url: String,
     pub flush_interval_ms: u64,
-    /// Reconnect when any subscribed stream has been silent this long: a
-    /// stalled connection can stay open for minutes before TCP gives up.
+    /// Reconnect when the connection has shown no sign of life (no frame,
+    /// no pong to our pings) for this long: a stalled connection can stay
+    /// open for minutes before TCP gives up.
     pub idle_timeout_ms: u64,
+    /// Client ping cadence: proves a quiet connection is alive.
+    pub ping_interval_ms: u64,
+    /// While the connection is alive, re-publish each symbol's unchanged book
+    /// this often: bookTicker only sends changes, so a thin book would
+    /// otherwise age past consumers' staleness limits while still current.
+    pub confirm_interval_ms: u64,
 }
 
 impl Default for BinanceConfig {
@@ -109,6 +116,8 @@ impl Default for BinanceConfig {
             ws_url: "wss://stream.binance.com:9443".to_string(),
             flush_interval_ms: 250,
             idle_timeout_ms: 15_000,
+            ping_interval_ms: 5_000,
+            confirm_interval_ms: 1_000,
         }
     }
 }
