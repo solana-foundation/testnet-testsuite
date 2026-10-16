@@ -32,7 +32,7 @@ use solana_rpc_client_api::filter::{Memcmp, RpcFilterType};
 use solana_signature::Signature;
 use solana_signer::Signer;
 use thiserror::Error;
-use tracing::{Instrument, error, info, info_span};
+use tracing::{Instrument, error, info, info_span, warn};
 
 /// Canonical mainnet Manifest program, for reference only; testnet uses a fork.
 pub const CANONICAL_PROGRAM_ID: Pubkey = manifest_sdk::programs::MANIFEST_ID;
@@ -623,7 +623,33 @@ impl ManifestClient {
             .await
     }
 
+    /// A batch that cancels is rebuilt from a fresh book and retried once
+    /// when one of its cancels went stale (see [`ManifestError::is_stale_cancel`]).
     async fn batch(
+        &self,
+        market: Pubkey,
+        orders: &[OrderSpec],
+        cancel_existing: bool,
+    ) -> Result<OrdersOutcome> {
+        let mut attempt = 1;
+        loop {
+            match self.batch_once(market, orders, cancel_existing).await {
+                Err(error)
+                    if cancel_existing
+                        && error.is_stale_cancel()
+                        && attempt < STALE_CANCEL_ATTEMPTS =>
+                {
+                    counter!("manifest_stale_cancel_retries_total", "action" => "replace_orders")
+                        .increment(1);
+                    warn!(%market, error = %error, "a cancelled order was filled first; retrying on a fresh book");
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn batch_once(
         &self,
         market: Pubkey,
         orders: &[OrderSpec],
@@ -686,6 +712,24 @@ impl ManifestClient {
     /// Cancel every resting order owned by the payer's seat.
     pub async fn cancel_all_orders(&self, market: Pubkey) -> Result<OrdersOutcome> {
         self.run("cancel_all_orders", market, async move {
+            let mut attempt = 1;
+            loop {
+                match self.cancel_all_once(market).await {
+                    Err(error) if error.is_stale_cancel() && attempt < STALE_CANCEL_ATTEMPTS => {
+                        counter!("manifest_stale_cancel_retries_total", "action" => "cancel_all_orders")
+                            .increment(1);
+                        warn!(%market, error = %error, "a cancelled order was filled first; retrying on a fresh book");
+                        attempt += 1;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+    }
+
+    async fn cancel_all_once(&self, market: Pubkey) -> Result<OrdersOutcome> {
+        {
             let snapshot = self.load_market(market).await?;
             let seat = snapshot
                 .book
@@ -715,8 +759,7 @@ impl ManifestClient {
                 transaction: Some(transaction),
                 resting: after.book.orders_of(seat.index).copied().collect(),
             })
-        })
-        .await
+        }
     }
 
     pub async fn swap_exact_in(&self, params: SwapExactInParams) -> Result<SwapOutcome> {
@@ -1128,6 +1171,22 @@ pub struct SwapOutcome {
     pub accounts: SwapAccounts,
 }
 
+/// Attempts for a batch that cancels resting orders. A taker can fill one
+/// between the snapshot and landing; the program then rejects the whole
+/// batch (`WrongIndexHintParams` with an index hint, `InvalidCancel`
+/// without), so one rebuild from a fresh book is worth it: at x1000 this
+/// was 13% of all maker transactions.
+const STALE_CANCEL_ATTEMPTS: usize = 2;
+
+/// `Custom(n)` codes of the program's stale-cancel errors.
+fn stale_cancel_codes() -> [String; 2] {
+    use manifest_sdk::errors::ManifestError as Program;
+    [
+        format!("Custom({}))", Program::WrongIndexHintParams as u32),
+        format!("Custom({}))", Program::InvalidCancel as u32),
+    ]
+}
+
 #[derive(Debug, Error)]
 pub enum ManifestError {
     #[error("invalid input: {0}")]
@@ -1164,6 +1223,20 @@ pub enum ManifestError {
         signature: Signature,
         reason: String,
     },
+}
+
+impl ManifestError {
+    /// The batch failed because a cancel named an order that was no longer
+    /// resting (filled since the snapshot), on chain or in preflight.
+    pub fn is_stale_cancel(&self) -> bool {
+        let error = match self {
+            Self::ExecutionFailure { error, .. } | Self::SimulationFailure { error, .. } => error,
+            _ => return false,
+        };
+        stale_cancel_codes()
+            .iter()
+            .any(|code| error.contains(code.as_str()))
+    }
 }
 
 struct SeatLeg {
@@ -1325,6 +1398,25 @@ fn apply_slippage(amount: u64, bps: u16, increase: bool) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stale_cancels_are_recognised() {
+        let failed = |error: &str| ManifestError::ExecutionFailure {
+            signature: Signature::default(),
+            slot: 1,
+            error: error.to_owned(),
+        };
+        assert!(failed("InstructionError(2, Custom(10))").is_stale_cancel());
+        assert!(failed("InstructionError(0, Custom(3))").is_stale_cancel());
+        assert!(!failed("InstructionError(2, Custom(30))").is_stale_cancel());
+        assert!(!failed("InstructionError(2, Custom(1))").is_stale_cancel());
+        let simulated = ManifestError::SimulationFailure {
+            error: "InstructionError(2, Custom(10))".to_owned(),
+            logs: vec![],
+        };
+        assert!(simulated.is_stale_cancel());
+        assert!(!ManifestError::Rpc("Custom(10))".to_owned()).is_stale_cancel());
+    }
+
     use super::*;
 
     #[test]
