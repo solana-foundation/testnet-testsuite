@@ -1953,13 +1953,20 @@ impl SwapSnapshot {
     }
 }
 
-/// The traversed tick-array starts, padded with the nearest initialized
-/// array on each side while `cap` allows. The program skips leading arrays
-/// until it reaches the one holding the pool's tick, but cannot step back:
-/// when the price crosses an array boundary between quote and landing, the
-/// array behind (price moved against the swap) or the one ahead (price moved
-/// with it) must already be in the list. `next(start, zero_for_one)` is the
-/// next initialized start from `start` in that direction.
+/// Initialized arrays added on each side of the traversal, cap permitting.
+/// One was not enough under load: at ~1,260 swaps/s (x1000) the price moved
+/// more than an array between quote and landing in 85 of ~5.7M swaps.
+const SWAP_TICK_ARRAY_PADDING: usize = 2;
+
+/// The traversed tick-array starts, padded with up to
+/// [`SWAP_TICK_ARRAY_PADDING`] initialized arrays on each side while `cap`
+/// allows (behind first, then ahead, one pair at a time, so a tight cap
+/// still gets one of each). The program skips leading arrays until it
+/// reaches the one holding the pool's tick, but cannot step back: when the
+/// price crosses an array boundary between quote and landing, the arrays
+/// behind (price moved against the swap) or ahead (price moved with it) must
+/// already be in the list. `next(start, zero_for_one)` is the next
+/// initialized start from `start` in that direction.
 fn pad_tick_arrays(
     traversed: &[i32],
     cap: usize,
@@ -1970,15 +1977,20 @@ fn pad_tick_arrays(
     let (Some(&first), Some(&last)) = (traversed.first(), traversed.last()) else {
         return starts;
     };
-    if starts.len() < cap
-        && let Some(behind) = next(first, !zero_for_one)
-    {
-        starts.insert(0, behind);
-    }
-    if starts.len() < cap
-        && let Some(ahead) = next(last, zero_for_one)
-    {
-        starts.push(ahead);
+    let (mut behind, mut ahead) = (first, last);
+    for _ in 0..SWAP_TICK_ARRAY_PADDING {
+        if starts.len() < cap
+            && let Some(start) = next(behind, !zero_for_one)
+        {
+            starts.insert(0, start);
+            behind = start;
+        }
+        if starts.len() < cap
+            && let Some(start) = next(ahead, zero_for_one)
+        {
+            starts.push(start);
+            ahead = start;
+        }
     }
     starts
 }
@@ -2187,8 +2199,8 @@ pub struct SwapQuote {
     pub expected_input_raw: u64,
     pub expected_output_raw: u64,
     pub other_amount_threshold: u64,
-    /// The arrays the quote traverses, padded with an initialized neighbour
-    /// on each side so a boundary crossing before landing still swaps.
+    /// The arrays the quote traverses, padded with up to two initialized
+    /// arrays on each side so boundary crossings before landing still swap.
     pub tick_arrays: Vec<Pubkey>,
 }
 
@@ -2563,10 +2575,21 @@ mod tests {
     #[test]
     fn swap_tick_arrays_are_padded_on_both_sides() {
         // Price down (zero_for_one): traversal walks toward lower starts.
-        assert_eq!(pad_tick_arrays(&[0], 6, every_600, true), [600, 0, -600]);
-        assert_eq!(pad_tick_arrays(&[0], 6, every_600, false), [-600, 0, 600]);
         assert_eq!(
-            pad_tick_arrays(&[0, 600], 6, every_600, false),
+            pad_tick_arrays(&[0], 6, every_600, true),
+            [1200, 600, 0, -600, -1200]
+        );
+        assert_eq!(
+            pad_tick_arrays(&[0], 6, every_600, false),
+            [-1200, -600, 0, 600, 1200]
+        );
+        // The cap stops padding, one of each side first.
+        assert_eq!(
+            pad_tick_arrays(&[0, 600], 5, every_600, false),
+            [-1200, -600, 0, 600, 1200]
+        );
+        assert_eq!(
+            pad_tick_arrays(&[0, 600], 4, every_600, false),
             [-600, 0, 600, 1200]
         );
     }
@@ -2575,10 +2598,14 @@ mod tests {
     fn swap_tick_array_padding_respects_the_cap_and_the_edges() {
         assert_eq!(pad_tick_arrays(&[0], 2, every_600, false), [-600, 0]);
         assert_eq!(pad_tick_arrays(&[0], 1, every_600, false), [0]);
-        assert_eq!(pad_tick_arrays(&[1800], 6, every_600, false), [1200, 1800]);
+        // Nothing past the last initialized array; the open side gets two.
+        assert_eq!(
+            pad_tick_arrays(&[1800], 6, every_600, false),
+            [600, 1200, 1800]
+        );
         assert_eq!(
             pad_tick_arrays(&[-1800], 6, every_600, false),
-            [-1800, -1200]
+            [-1800, -1200, -600]
         );
         assert!(pad_tick_arrays(&[], 6, every_600, false).is_empty());
     }
