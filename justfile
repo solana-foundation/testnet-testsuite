@@ -140,6 +140,28 @@ scenario-teardown-dev: (scenario-with "dev" "local" "teardown")
 scenario-teardown-testnet: (scenario-with "prd" "testnet" "teardown")
 scenario-testnet: (scenario-with "prd" "testnet" "up")
 scenario-status-testnet: (scenario-with "prd" "testnet" "status")
+# Dashboard (docs/dashboard-plan.md): control serves the built UI on
+# http://127.0.0.1:8182 and runs scenario.sh jobs against the target that
+# matches its Doppler config. Build the UI first (or use dashboard-dev).
+dashboard-build:
+    pnpm --filter dashboard run build
+
+# Vite dev server on :5173, proxying /api to a running control.
+dashboard-dev:
+    pnpm --filter dashboard run dev
+
+control-dev:
+    doppler run --project testnet-testsuite --config dev -- \
+        env MTM_CONTROL__TARGET=local cargo run --release -p control
+
+control-testnet:
+    doppler run --project testnet-testsuite --config prd -- \
+        env MTM_CONTROL__TARGET=testnet cargo run --release -p control
+
+control-devnet:
+    doppler run --project testnet-testsuite --config "{{DEVNET_CONFIG}}" -- \
+        env MTM_CONTROL__TARGET=devnet cargo run --release -p control
+
 # chain-watch alone (`up` starts it too): slots, blocks, versions, feature gates
 # into .scenario/runs/<run id>/run.db; API :8183, metrics :9185.
 scenario-watch-dev: (scenario-with "dev" "local" "watch")

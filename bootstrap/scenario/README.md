@@ -122,6 +122,35 @@ The testnet profile slows every maker 5× and flow to 4 trades/min for the
 public RPC; set `SCENARIO_RPC_URL` (and `SCENARIO_WS_URL`) to a dedicated
 endpoint for sustained runs. `SCENARIO_SEED` is mandatory there.
 
+### The dashboard (control)
+
+```sh
+just dashboard-build          # once (and after UI changes)
+NO_DNA=1 just control-dev     # or control-testnet / control-devnet
+# → http://127.0.0.1:8182
+```
+
+`services/control` serves `apps/dashboard` and runs `scenario.sh` against the
+target that matches its Doppler config (one job at a time; `down`, `deploy`
+and `teardown` ask for the command name again). Overview: live slot strip,
+event timeline (feature gates, epochs, versions, jobs), charts, failure
+tables; Feature gates; Control: commands, processes and their logs, job
+output. It needs chain-watch (started by `up` or `watch`) and Prometheus
+(`observe`) for the charts. Loopback only: there is no auth yet.
+`just dashboard-dev` runs the UI with hot reload on :5173 against a running
+control.
+
+To reach it from your other devices, publish it on your tailnet (HTTPS,
+tailnet members only; control itself stays on loopback):
+
+```sh
+tailscale serve --bg --https=8443 http://127.0.0.1:8182   # https://<host>.<tailnet>.ts.net:8443
+tailscale serve --https=8443 off                          # stop publishing
+```
+
+Everyone on the tailnet can then use the Control tab (run and cancel jobs):
+publish only on a tailnet you alone use until the API has auth.
+
 ### Watching the cluster (chain-watch)
 
 `up` starts `services/chain-watch` before the bootstrap, and `scenario.sh

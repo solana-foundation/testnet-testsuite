@@ -179,3 +179,16 @@ raw_blocks = "failed"    # off | failed | ours | all (zstd JSON beside run.db)
 run_dir = ".scenario/runs"
 # block_cost_limit = 100000000  # enables the block fill-ratio metric
 
+# --- control: the dashboard backend (docs/dashboard-plan.md) -------------------
+# Runs scenario.sh jobs against `target`, which must match the Doppler config
+# it runs under (`just control-dev` = dev/local, `just control-testnet` =
+# prd/testnet). Loopback only: no auth yet.
+[control]
+listen_addr = "127.0.0.1:8182"
+target = "local"
+chain_watch_url = "http://127.0.0.1:8183"
+prometheus_url = "http://127.0.0.1:9190"
+ui_dir = "apps/dashboard/dist"
+state_dir = ".scenario"
+script = "bootstrap/scenario/scenario.sh"
+config_dir = "config"

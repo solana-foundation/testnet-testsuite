@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "services/arb",
     "services/chain-watch",
+    "services/control",
+    "crates/control-client",
     "crates/chain-watch-client",
     "crates/janitor-interface",
     "crates/mtm-chain",
@@ -41,6 +43,7 @@ publish = false
 
 [workspace.dependencies]
 chain-watch-client = { path = "crates/chain-watch-client" }
+control-client = { path = "crates/control-client" }
 janitor-interface = { path = "crates/janitor-interface" }
 mtm-chain = { path = "crates/mtm-chain" }
 mtm-common = { path = "crates/mtm-common" }
