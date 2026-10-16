@@ -232,6 +232,7 @@ janitor() (
   # next: left as the janitor, a later `deploy` would skip them as
   # "already deployed" and the scenario would run against the janitor.
   so="${SCENARIO_JANITOR_SO:?set SCENARIO_JANITOR_SO to the janitor .so (just build-janitor)}"
+  require_agave_cli
   umask 077
   dir=""
   trap '[[ -n "$dir" ]] && rm -rf "$dir"' EXIT
@@ -411,8 +412,11 @@ case "$cmd" in
     # missing secret must not leave the run half torn down.
     missing=()
     [[ -n "${KEYPAIR_FAUCET:-}" ]] || missing+=(KEYPAIR_FAUCET)
-    if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" == 1 ]]; then
+    if [[ "${SCENARIO_JANITOR:-0}" == 1 || "${SCENARIO_CLOSE_PROGRAMS:-0}" == 1 ]]; then
       [[ -n "${KEYPAIR_PROGRAM_AUTHORITY:-}" ]] || missing+=(KEYPAIR_PROGRAM_AUTHORITY)
+    fi
+    if [[ "${SCENARIO_JANITOR:-0}" == 1 && ! -f "${SCENARIO_JANITOR_SO:-}" ]]; then
+      missing+=("SCENARIO_JANITOR_SO (the janitor .so: just build-janitor)")
     fi
     if (( ${#missing[@]} )); then
       echo "teardown: missing ${missing[*]}; nothing was stopped" >&2; exit 1

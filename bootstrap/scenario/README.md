@@ -304,7 +304,8 @@ transactions failed). The limits, in order:
 
 `scenario.sh teardown` (`just scenario-teardown-dev` / `-testnet`) recovers
 the scenario's SOL into the faucet. Before stopping anything it checks the
-faucet key, the program authority (with `SCENARIO_CLOSE_PROGRAMS`) and
+faucet key, the program authority (with `SCENARIO_JANITOR` or
+`SCENARIO_CLOSE_PROGRAMS`), the janitor `.so` (with `SCENARIO_JANITOR`) and
 `scenario check` (seed, program ids and mints resolve), so a missing secret
 cannot leave the run half torn down; like `snapshot` and `report` it runs at
 the scale `up` recorded unless `SCENARIO_SCALE` names it:
