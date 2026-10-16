@@ -85,9 +85,28 @@ stop() { # name: TERM, wait up to 30 s, then KILL; the pid file goes only once i
   echo "killed $name (no exit 30 s after TERM)"
 }
 
-wait_http() { # url, label
-  for _ in $(seq 1 120); do curl -sf "$1" >/dev/null && return; sleep 1; done
+wait_http() { # url, name (as given to start)
+  for _ in $(seq 1 120); do
+    curl -sf "$1" >/dev/null && return
+    # A process that already exited will never answer: say why, now.
+    if ! running "$2"; then
+      echo "$2 exited before becoming healthy at $1; last log lines:" >&2
+      tail -n 5 "$state/logs/$2.log" >&2 2>/dev/null || true
+      exit 1
+    fi
+    sleep 1
+  done
   echo "$2 did not become healthy at $1" >&2; exit 1
+}
+
+require_agave_cli() { # deploys need an Agave >= 4.x CLI (Manifest is SBPF v3)
+  local version
+  version="$(solana --version 2>/dev/null | awk '{print $2}')"
+  if [[ -z "$version" || "${version%%.*}" -lt 4 ]]; then
+    echo "need the Agave 4.x solana CLI on PATH (found: ${version:-none}): Manifest is SBPF v3;" \
+      "install it with \`agave-install init <4.x version>\`" >&2
+    exit 1
+  fi
 }
 
 build() {
@@ -133,6 +152,7 @@ deploy() (
   # Manifest is SBPF v3: use an Agave >= 4.x `solana` CLI.
   # A subshell, so umask and traps stay local; the key directory is removed
   # on any exit, Ctrl-C and SIGTERM included.
+  require_agave_cli
   umask 077
   dir=""
   trap '[[ -n "$dir" ]] && rm -rf "$dir"' EXIT
