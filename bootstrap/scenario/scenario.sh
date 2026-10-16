@@ -13,8 +13,10 @@
 #                                       into .scenario/runs/NAME-{t0,t1,load,report}.json
 #
 # SCENARIO_SCALE=x10|x100|assets layers config/scale-<scale>.toml (generated
-# by scale.py) over the profile; SCENARIO_TOKENS_CONFIG picks the token
-# bootstrap config (the asset scale uses bootstrap/scenario/tokens-assets.json).
+# by scale.py) over the profile; `up` records it in .scenario/scale, and later
+# commands use that unless SCENARIO_SCALE names it (a different one is
+# refused). SCENARIO_TOKENS_CONFIG picks the token bootstrap config (the
+# asset scale uses bootstrap/scenario/tokens-assets.json).
 #   scenario.sh down                    stop every service started by `up`/`observe`
 #                                       (TERM, then KILL after 30 s)
 #
@@ -64,6 +66,21 @@ case "$target" in
     ;;
   *) echo "unknown target: $target (local|testnet)" >&2; exit 2 ;;
 esac
+# The scale `up` started at, so later commands resolve the same participants
+# (a snapshot or report at another scale reads a different wallet set). Unset,
+# the recorded scale applies; a different one is refused.
+if [[ "$cmd" == up ]]; then
+  printf %s "${SCENARIO_SCALE:-}" >"$state/scale"
+elif [[ "$cmd" =~ ^(bootstrap|status|snapshot|report|measure)$ && -f "$state/scale" ]]; then
+  recorded="$(cat "$state/scale")"
+  if [[ -z "${SCENARIO_SCALE+set}" ]]; then
+    SCENARIO_SCALE="$recorded"
+    [[ -n "$recorded" ]] && echo "using the running scenario's scale: $recorded (.scenario/scale)" >&2
+  elif [[ "$SCENARIO_SCALE" != "$recorded" ]]; then
+    echo "$cmd: the scenario was started at scale '${recorded:-base}', not '${SCENARIO_SCALE:-base}' (.scenario/scale)" >&2
+    exit 2
+  fi
+fi
 [[ -n "${SCENARIO_SCALE:-}" ]] && export MTM_PROFILE="$MTM_PROFILE,scale-$SCENARIO_SCALE"
 export MTM_RPC__HTTP_URL="$rpc"
 if [[ -n "${SCENARIO_WS_URL:-}" ]]; then
