@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use metrics::counter;
 use mtm_dex_harness::spl;
 use mtm_scenario::venue::{spot_price, to_atoms, to_ui};
 use mtm_scenario::{Strategy, Venue};
@@ -16,7 +17,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::maker::{Ctx, deviation_bps};
 
@@ -53,7 +54,10 @@ impl Lp {
         mint: Pubkey,
         amount: Decimal,
     ) -> std::result::Result<Pubkey, OpenError> {
-        match self.open_inner(pool, lower, upper, mint, amount).await {
+        let opened = self
+            .retry_on_slippage("open", || self.open_inner(pool, lower, upper, mint, amount))
+            .await;
+        match opened {
             Ok(position) => Ok(position),
             Err(error) => {
                 let short = match error.downcast_ref::<orca_whirlpool_client::OrcaWhirlpoolError>()
@@ -147,6 +151,37 @@ impl Lp {
         })
     }
 
+    /// The venue's codes for a liquidity change whose amounts moved past
+    /// their bounds between the read and landing: Raydium
+    /// `PriceSlippageCheck` (6017, both directions); Orca `TokenMaxExceeded`
+    /// (6017, adding) and `TokenMinSubceeded` (6018, removing).
+    fn slippage_codes(&self) -> &'static [u32] {
+        match self {
+            Lp::Orca(_) => &[6017, 6018],
+            Lp::Raydium(_) => &[6017],
+        }
+    }
+
+    /// Run `call`, and once more if it failed on liquidity slippage: the
+    /// clients re-read the pool on every call, so the retry prices the move
+    /// that broke the first attempt. At x1000 (~1,260 swaps/s) 23 of 31
+    /// Raydium re-centre transactions failed this way with the default
+    /// 100 bps, each pushing the re-centre back a full tick.
+    async fn retry_on_slippage<T, F, Fut>(&self, action: &'static str, mut call: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        match call().await {
+            Err(error) if is_slippage(&error, self.slippage_codes()) => {
+                counter!("mm_lp_slippage_retries_total", "action" => action).increment(1);
+                warn!(action, error = %format!("{error:#}"), "liquidity moved past its bounds; retrying on a fresh read");
+                call().await
+            }
+            result => result,
+        }
+    }
+
     /// Withdraw everything, collect fees, and close the position NFT. Each
     /// step runs only if still needed (`decrease` refuses a position with no
     /// liquidity), so a close that failed or timed out after any of its
@@ -155,24 +190,30 @@ impl Lp {
         match self {
             Lp::Orca(client) => {
                 if liquidity > 0 {
-                    client
-                        .decrease_liquidity(orca_whirlpool_client::DecreaseLiquidityParams {
-                            position_mint: position,
-                            amount: None,
-                        })
-                        .await?;
+                    self.retry_on_slippage("decrease", || async {
+                        Ok(client
+                            .decrease_liquidity(orca_whirlpool_client::DecreaseLiquidityParams {
+                                position_mint: position,
+                                amount: None,
+                            })
+                            .await?)
+                    })
+                    .await?;
                 }
                 client.collect_position(position).await?;
                 client.close_position(position).await?;
             }
             Lp::Raydium(client) => {
                 if liquidity > 0 {
-                    client
-                        .decrease_liquidity(raydium_clmm_client::DecreaseLiquidityParams {
-                            position_mint: position,
-                            amount: None,
-                        })
-                        .await?;
+                    self.retry_on_slippage("decrease", || async {
+                        Ok(client
+                            .decrease_liquidity(raydium_clmm_client::DecreaseLiquidityParams {
+                                position_mint: position,
+                                amount: None,
+                            })
+                            .await?)
+                    })
+                    .await?;
                 }
                 client.collect_position(position).await?;
                 client.close_position(position).await?;
@@ -180,6 +221,14 @@ impl Lp {
         }
         Ok(())
     }
+}
+
+/// Whether a failed transaction's error is one of `codes` (`Custom(n)`).
+fn is_slippage(error: &anyhow::Error, codes: &[u32]) -> bool {
+    let text = format!("{error:#}");
+    codes
+        .iter()
+        .any(|code| text.contains(&format!("Custom({code}))")))
 }
 
 /// Whether `owner` still holds the position NFT `mint` (in its classic or
@@ -457,6 +506,18 @@ fn open_size(s: OpenSizing) -> Decimal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recognises_liquidity_slippage_by_code() {
+        let failed = |code: u32| {
+            anyhow::anyhow!("transaction x failed in slot 1: InstructionError(4, Custom({code}))")
+        };
+        assert!(is_slippage(&failed(6017), &[6017]));
+        assert!(is_slippage(&failed(6018), &[6017, 6018]));
+        assert!(!is_slippage(&failed(6018), &[6017]));
+        assert!(!is_slippage(&failed(60170), &[6017]));
+        assert!(!is_slippage(&anyhow::anyhow!("rpc timeout"), &[6017]));
+    }
+
     use super::*;
 
     fn d(s: &str) -> Decimal {
