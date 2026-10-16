@@ -6,10 +6,12 @@
 //! by design; consumers fall back to `received_at_us`. Updates fire per BBO
 //! change (can be hundreds/sec), so the task coalesces to at most one tick
 //! per symbol per flush interval. Binance drops connections every 24h and
-//! pings every ~3min — the task pongs and reconnects with backoff.
+//! pings every ~3min — the task pongs and reconnects with backoff. A stream
+//! can also stall with the socket open (minutes until the TCP reset), so any
+//! stream silent for `idle_timeout_ms` forces a reconnect.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use oracle_client::{Price, PriceData, PricePoint, PriceSource, Symbol};
@@ -85,6 +87,15 @@ pub async fn run(
         let mut latest: HashMap<Symbol, PricePoint> = HashMap::new();
         let mut flush = tokio::time::interval(Duration::from_millis(cfg.flush_interval_ms));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // last message per stream; every stream gets a full timeout from connect
+        let idle_timeout = Duration::from_millis(cfg.idle_timeout_ms);
+        let connected_at = Instant::now();
+        let mut last_seen: HashMap<Symbol, Instant> = symbol_by_stream
+            .values()
+            .map(|symbol| (symbol.clone(), connected_at))
+            .collect();
+        let mut watchdog = tokio::time::interval(Duration::from_secs(1));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -101,6 +112,7 @@ pub async fn run(
                             continue;
                         };
                         metrics::counter!("oracle_binance_updates_total").increment(1);
+                        last_seen.insert(symbol.clone(), Instant::now());
                         latest.insert(symbol.clone(), PricePoint {
                             symbol: symbol.clone(),
                             data,
@@ -125,6 +137,15 @@ pub async fn run(
                         break;
                     }
                 },
+                _ = watchdog.tick() => {
+                    if let Some((symbol, silent)) = most_silent(&last_seen, Instant::now())
+                        && silent >= idle_timeout
+                    {
+                        metrics::counter!("oracle_binance_idle_reconnects_total").increment(1);
+                        warn!(%symbol, silent_s = silent.as_secs(), "binance stream silent, reconnecting");
+                        break;
+                    }
+                }
                 _ = flush.tick() => {
                     for (_, point) in latest.drain() {
                         debug!(symbol = %point.symbol, "underlying tick");
@@ -141,9 +162,33 @@ pub async fn run(
     }
 }
 
+/// The stream silent the longest, and for how long.
+fn most_silent(last_seen: &HashMap<Symbol, Instant>, now: Instant) -> Option<(&Symbol, Duration)> {
+    last_seen
+        .iter()
+        .map(|(symbol, seen)| (symbol, now.saturating_duration_since(*seen)))
+        .max_by_key(|(_, silent)| *silent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn most_silent_picks_the_stalest_stream() {
+        let now = Instant::now();
+        let jup = Symbol::new("JUP/USD");
+        let ray = Symbol::new("RAY/USD");
+        let last_seen = HashMap::from([
+            (jup.clone(), now - Duration::from_secs(20)),
+            (ray, now - Duration::from_secs(2)),
+        ]);
+        assert_eq!(
+            most_silent(&last_seen, now),
+            Some((&jup, Duration::from_secs(20)))
+        );
+        assert_eq!(most_silent(&HashMap::new(), now), None);
+    }
 
     #[test]
     fn parses_book_ticker_envelope() {

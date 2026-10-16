@@ -25,9 +25,11 @@ poll_interval_ms = 1000
 poll_interval_ms = 300000
 
 # Binance: real-time top-of-book websocket — keyless, no monthly caps.
-# Book updates coalesce to one tick per symbol per flush interval.
+# Book updates coalesce to one tick per symbol per flush interval. A stream
+# silent for idle_timeout_ms forces a reconnect (stalls outlive TCP resets).
 [oracle.binance]
 flush_interval_ms = 250
+idle_timeout_ms = 15000
 
 [oracle.pusher]
 enabled = false # parked until a testnet oracle program exists

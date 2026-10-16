@@ -98,6 +98,9 @@ impl Default for CoinGeckoConfig {
 pub struct BinanceConfig {
     pub ws_url: String,
     pub flush_interval_ms: u64,
+    /// Reconnect when any subscribed stream has been silent this long: a
+    /// stalled connection can stay open for minutes before TCP gives up.
+    pub idle_timeout_ms: u64,
 }
 
 impl Default for BinanceConfig {
@@ -105,6 +108,7 @@ impl Default for BinanceConfig {
         Self {
             ws_url: "wss://stream.binance.com:9443".to_string(),
             flush_interval_ms: 250,
+            idle_timeout_ms: 15_000,
         }
     }
 }
