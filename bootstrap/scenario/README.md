@@ -231,6 +231,13 @@ Differences from Surfpool that matter when reading the numbers:
   snapshot via `--account-dir` (`metaplex-snapshot.py --account-dir`, which
   zeroes the ProgramData deployment slot: a testnet slot is in a fresh
   chain's future and keeps the program from loading).
+- **Slot time.** The SIMD-0525 features (slot time 400 → 200 ms, active on
+  every public cluster) are on at genesis, but the validator only applies
+  them at an epoch boundary. The recipe uses 1024-slot epochs
+  (`SCENARIO_TV_SLOTS_PER_EPOCH`), so slots drop from ~420 ms to ~210 ms
+  about 7 minutes in. Runs before 2026-10-17, including every number
+  below, used the default 432k-slot epoch and ran at ~420 ms slots
+  throughout.
 
 Measured 2026-10-13 on a 16-core / 125 GB machine, 10-minute windows,
 Surfpool 1.5.0 (`--ci`, offline) vs solana-test-validator 4.3.0 (tmpfs

@@ -95,6 +95,9 @@ scenario-surfpool-offline:
 # Local Agave validator (real banking stage) to compare against Surfpool; ledger on tmpfs.
 # The ledger lives in RAM when /dev/shm is writable: the default 5M-shred cap is
 # ~20 GB (~40 min at x2000); SCENARIO_TV_SHREDS lowers or raises it.
+# Short epochs: the SIMD-0525 slot-time features are active at genesis but only
+# apply from the first epoch boundary (default 432k slots, ~2 days at 400 ms).
+# 1024 slots puts the chain on 200 ms slots ~7 min in, before bootstrap ends.
 scenario-test-validator:
     test -f .scenario/metaplex.json || python3 -I bootstrap/scenario/metaplex-snapshot.py .scenario/metaplex.json
     python3 -I bootstrap/scenario/metaplex-snapshot.py --account-dir .scenario/metaplex-accounts .scenario/metaplex.json
@@ -103,6 +106,7 @@ scenario-test-validator:
         solana-test-validator --ledger "$ledger" --reset --quiet --mint "$PUBKEY_FAUCET" \
             --account-dir .scenario/metaplex-accounts \
             --account-index program-id spl-token-owner spl-token-mint --limit-blockstore-size "${SCENARIO_TV_SHREDS:-5000000}" \
+            --slots-per-epoch "${SCENARIO_TV_SLOTS_PER_EPOCH:-1024}" \
             --deactivate-feature B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g'
 
 # Fund the program authority on a fresh test validator (Surfpool airdrops it instead).
