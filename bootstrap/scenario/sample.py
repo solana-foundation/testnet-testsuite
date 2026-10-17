@@ -9,6 +9,8 @@ validator: landed transactions (getTransactionCount delta → TPS), slot
 rate, and RPC latency (getLatestBlockhash round trip). A real validator
 (solana-test-validator) also lands one consensus vote per slot, which
 Surfpool does not: TPS excludes them (getTransactionCount counts them).
+Under Alpenglow (e.g. a test validator with testnet's cloned feature set)
+votes are not transactions, so nothing is subtracted.
 The output keeps
 every sample plus a summary (mean / p95 / max).
 
@@ -17,11 +19,12 @@ scenario's own traffic; against a shared cluster (testnet) it counts every
 user's transactions and votes, so the summary labels it `tpsScope` and the
 participant-level counts in the report are the ones to use.
 """
-import argparse, json, os, statistics, time, urllib.parse, urllib.request
+import argparse, base64, json, os, statistics, time, urllib.parse, urllib.request
 
 SERVICES = ["oracle", "router", "mm", "flow", "arb", "prometheus", "grafana"]
 VALIDATORS = {"surfpool", "solana-test-validator"}
 TICK = os.sysconf("SC_CLK_TCK")
+ALPENGLOW = "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS"
 PID_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".scenario", "pids")
 
 
@@ -84,6 +87,15 @@ def summarize(values):
     }
 
 
+def feature_active(url, feature):
+    """A feature account exists once activation is scheduled; byte 0 is the Some tag of activated_at."""
+    try:
+        value = rpc(url, "getAccountInfo", [feature, {"encoding": "base64"}])[0]["value"]
+    except Exception:  # noqa: BLE001 - unknown means assume legacy voting
+        return False
+    return bool(value) and base64.b64decode(value["data"][0])[:1] == b"\x01"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=float, default=600)
@@ -92,6 +104,7 @@ def main():
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
+    tower_votes = not feature_active(args.rpc, ALPENGLOW)
     samples = []
     previous = None
     deadline = time.monotonic() + args.seconds
@@ -107,7 +120,7 @@ def main():
         except Exception as error:  # noqa: BLE001 - a stalled validator is a data point
             tx_count = slot = latency = None
             print("rpc sample failed:", error)
-        votes_per_slot = 1 if "solana-test-validator" in pids else 0
+        votes_per_slot = 1 if tower_votes and "solana-test-validator" in pids else 0
         current = {"t": now, "proc": per_proc, "total": total, "idle": idle, "tx": tx_count, "slot": slot}
         if previous:
             dt = now - previous["t"]
