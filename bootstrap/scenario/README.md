@@ -238,6 +238,13 @@ Differences from Surfpool that matter when reading the numbers:
   about 7 minutes in. Runs before 2026-10-17, including every number
   below, used the default 432k-slot epoch and ran at ~420 ms slots
   throughout.
+- **Feature set.** By default the validator uses its own genesis features
+  minus SIMD-0500. `SCENARIO_TV_CLONE_FEATURES=https://api.testnet.solana.com`
+  copies testnet's set instead; run it with the matching Agave (4.4.0-beta.1
+  on 2026-10-17). That enables Alpenglow: there are no vote transactions
+  (`sample.py` detects this), and slots run at ~186 ms. At x1500 that run
+  landed the same swaps/s, with half the transactions per block, ~4× fewer
+  maker errors and faster router quotes.
 
 Measured 2026-10-13 on a 16-core / 125 GB machine, 10-minute windows,
 Surfpool 1.5.0 (`--ci`, offline) vs solana-test-validator 4.3.0 (tmpfs

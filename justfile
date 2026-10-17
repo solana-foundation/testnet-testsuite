@@ -98,6 +98,9 @@ scenario-surfpool-offline:
 # Short epochs: the SIMD-0525 slot-time features are active at genesis but only
 # apply from the first epoch boundary (default 432k slots, ~2 days at 400 ms).
 # 1024 slots puts the chain on 200 ms slots ~7 min in, before bootstrap ends.
+# SCENARIO_TV_CLONE_FEATURES=<rpc url> copies that cluster's feature set into genesis
+# instead, e.g. https://api.testnet.solana.com (Alpenglow on, so no vote transactions;
+# SIMD-0500 already off there). Match the cluster's Agave version (testnet: 4.4).
 scenario-test-validator:
     test -f .scenario/metaplex.json || python3 -I bootstrap/scenario/metaplex-snapshot.py .scenario/metaplex.json
     python3 -I bootstrap/scenario/metaplex-snapshot.py --account-dir .scenario/metaplex-accounts .scenario/metaplex.json
@@ -107,7 +110,9 @@ scenario-test-validator:
             --account-dir .scenario/metaplex-accounts \
             --account-index program-id spl-token-owner spl-token-mint --limit-blockstore-size "${SCENARIO_TV_SHREDS:-5000000}" \
             --slots-per-epoch "${SCENARIO_TV_SLOTS_PER_EPOCH:-1024}" \
-            --deactivate-feature B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g'
+            $([[ -n "${SCENARIO_TV_CLONE_FEATURES:-}" ]] \
+                && echo --clone-feature-set --url "$SCENARIO_TV_CLONE_FEATURES" \
+                || echo --deactivate-feature B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g)'
 
 # Fund the program authority on a fresh test validator (Surfpool airdrops it instead).
 scenario-test-validator-fund:
