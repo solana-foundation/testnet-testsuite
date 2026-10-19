@@ -348,9 +348,9 @@ pub fn estimate(spec: &Spec, chain: &Chain, cal: &Calibration) -> Estimate {
             limit: Limit::Host,
             utilisation: cu_per_s / host,
             detail: format!(
-                "{:.0}M of ~{:.0}M CU/s this host's validator executes",
-                cu_per_s / 1e6,
-                host / 1e6
+                "{} of ~{} CU/s this host's validator executes",
+                cu(cu_per_s),
+                cu(host)
             ),
         });
     }
@@ -358,9 +358,9 @@ pub fn estimate(spec: &Spec, chain: &Chain, cal: &Calibration) -> Estimate {
         limit: Limit::Block,
         utilisation: cu_per_block / chain.block_cu_limit,
         detail: format!(
-            "{:.1}M of {:.0}M CU per block",
-            cu_per_block / 1e6,
-            chain.block_cu_limit / 1e6
+            "{} of {} CU per block",
+            cu(cu_per_block),
+            cu(chain.block_cu_limit)
         ),
     });
     if let Some(hot) = hottest.first() {
@@ -368,10 +368,10 @@ pub fn estimate(spec: &Spec, chain: &Chain, cal: &Calibration) -> Estimate {
             limit: Limit::Account,
             utilisation: hot.cu_per_block / chain.account_cu_limit,
             detail: format!(
-                "{}: {:.1}M of {:.0}M CU per block",
+                "{}: {} of {} CU per block",
                 hot.pool,
-                hot.cu_per_block / 1e6,
-                chain.account_cu_limit / 1e6
+                cu(hot.cu_per_block),
+                cu(chain.account_cu_limit)
             ),
         });
     }
@@ -472,6 +472,17 @@ pub fn estimate(spec: &Spec, chain: &Chain, cal: &Calibration) -> Estimate {
         bootstrap,
         sol,
         warnings,
+    }
+}
+
+/// Compute in K / M with sensible precision.
+fn cu(value: f64) -> String {
+    if value >= 10e6 {
+        format!("{:.0}M", value / 1e6)
+    } else if value >= 1e6 {
+        format!("{:.1}M", value / 1e6)
+    } else {
+        format!("{:.0}K", value / 1e3)
     }
 }
 

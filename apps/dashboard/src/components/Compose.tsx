@@ -33,6 +33,11 @@ const LIMIT_LABEL = {
   account: "busiest pool",
 } as const;
 
+/** Whole numbers with separators: rates here span 1 to 10,000s. */
+function whole(value: number) {
+  return Math.round(value).toLocaleString();
+}
+
 function meterColor(utilisation: number) {
   if (utilisation >= 1) return "var(--critical)";
   if (utilisation >= 0.7) return "var(--warning)";
@@ -521,16 +526,16 @@ function EstimateView({ result }: { result: EstimateResponse }) {
       <div className="kpis" style={{ marginTop: 0 }}>
         <div className="tile">
           <div className="label">expected tx/s</div>
-          <div className="value">{compact(e.tps_capped, 0)}</div>
+          <div className="value">{whole(e.tps_capped)}</div>
           <div className="note">
             {e.tps_capped < e.tps
-              ? `${compact(e.tps, 0)} offered, capped by ${LIMIT_LABEL[e.bottleneck ?? "host"]}`
-              : `${compact(e.taker_tx_per_s, 0)} takers + ${e.maker_tx_per_s.toFixed(1)} makers + ${e.arb_tx_per_s.toFixed(2)} arb`}
+              ? `${whole(e.tps)} offered, capped by ${LIMIT_LABEL[e.bottleneck ?? "host"]}`
+              : `${whole(e.taker_tx_per_s)} takers + ${e.maker_tx_per_s.toFixed(1)} makers + ${e.arb_tx_per_s.toFixed(2)} arb`}
           </div>
         </div>
         <div className="tile">
           <div className="label">participants</div>
-          <div className="value">{compact(e.participants)}</div>
+          <div className="value">{whole(e.participants)}</div>
           <div className="note">
             {e.takers.toLocaleString()} takers · {e.makers} makers · {e.bots}{" "}
             bots · {e.pools} pools
@@ -545,9 +550,9 @@ function EstimateView({ result }: { result: EstimateResponse }) {
         </div>
       </div>
       <p className="hint" style={{ marginTop: 8 }}>
-        takers offer {compact(e.offered_swaps_per_s, 0)} swaps/s on schedule;
-        each waits {seconds(e.trade_seconds)} for its trade to settle before the
-        next, which takes it to {compact(e.taker_tx_per_s, 0)}
+        takers offer {whole(e.offered_swaps_per_s)} swaps/s on schedule; each
+        waits {seconds(e.trade_seconds)} for its trade to settle before the
+        next, which takes it to {whole(e.taker_tx_per_s)}
       </p>
       <table style={{ marginTop: 8 }}>
         <tbody>
@@ -582,7 +587,7 @@ function EstimateView({ result }: { result: EstimateResponse }) {
           {e.venues.map((v) => (
             <tr key={v.venue}>
               <td>{VENUE_LABEL[v.venue]}</td>
-              <td className="num">{compact(v.legs_per_s, 0)}</td>
+              <td className="num">{whole(v.legs_per_s)}</td>
               <td className="num">{percent(v.share, 0)}</td>
             </tr>
           ))}
@@ -591,13 +596,12 @@ function EstimateView({ result }: { result: EstimateResponse }) {
       <p className="hint">
         Venue shares follow the router&apos;s best price (calibrated from the
         x1500 runs); busiest pool: {e.hottest[0]?.pool ?? "–"} at{" "}
-        {compact(e.hottest[0]?.legs_per_s ?? 0, 0)} swaps/s.
+        {whole(e.hottest[0]?.legs_per_s ?? 0)} swaps/s.
       </p>
       <p className="hint">
-        bootstrap ~{compact(e.bootstrap.transactions, 0)} transactions, ~
+        bootstrap ~{whole(e.bootstrap.transactions)} transactions, ~
         {seconds(e.bootstrap.seconds)} · SOL {e.sol.fees_per_hour.toFixed(1)}/h
-        fees, {e.sol.rent.toFixed(1)} rent, {compact(e.sol.float, 0)} wallet
-        float
+        fees, {e.sol.rent.toFixed(1)} rent, {whole(e.sol.float)} wallet float
       </p>
       {e.warnings.map((w) => (
         <p key={w} className="warn">
