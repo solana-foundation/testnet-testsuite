@@ -39,7 +39,7 @@ and what they mean for testnet.
   - Surfpool 1.5.0: `--ci`, `--offline`, Metaplex from a snapshot.
   - `solana-test-validator` 4.3.0: tmpfs ledger, SIMD-0500 deactivated,
     Metaplex via `--account-dir`, token-owner/mint account indexes.
-- **Scales** (`bootstrap/scenario/scale.py`): takers grow by orders of
+- **Scales** (presets in `crates/scenario-spec`, formerly `bootstrap/scenario/scale.py`): takers grow by orders of
   magnitude while makers stay roughly fixed (12 to 36; 92 on the asset scale).
   Maker capital grows instead.
 

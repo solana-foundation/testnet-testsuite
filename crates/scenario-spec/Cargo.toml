@@ -1,0 +1,26 @@
+[package]
+name = "scenario-spec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Check rendered overlays against the services' own config types.
+validate = ["dep:mtm-scenario", "dep:toml", "dep:anyhow"]
+# Fetch prices from Binance.
+fetch = ["dep:reqwest", "dep:anyhow"]
+
+[dependencies]
+rust_decimal = { workspace = true, features = ["serde-str"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+anyhow = { workspace = true, optional = true }
+mtm-scenario = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[lints]
+workspace = true

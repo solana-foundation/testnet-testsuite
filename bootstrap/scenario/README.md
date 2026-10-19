@@ -275,9 +275,14 @@ any happened in the window); for a clean window run flow with
 
 ## Scaling
 
-`bootstrap/scenario/scale.py` generates overlays layered over the profile
+A scenario is a **spec** (crates/scenario-spec): which tokens and venues,
+makers per pool by kind (ladders, LP ranges, pool-arbs, 0–3 each), maker
+capital, takers and their trade rate and sizes, arb bots. `scenario overlay`
+renders one into `config/scale-<name>.toml`, layered over the profile
 (`MTM_PROFILE=scenario-local,scale-<name>`; `scenario.sh` does this from
-`SCENARIO_SCALE`):
+`SCENARIO_SCALE`). The overlay's second line holds the spec it came from.
+
+The named scales are presets:
 
 | `SCENARIO_SCALE` | participants | takers | arb bots | makers | assets / pools | maker capital |
 | ---------------- | ------------ | ------ | -------- | ------ | -------------- | ------------- |
@@ -287,16 +292,40 @@ any happened in the window); for a clean window run flow with
 | `assets`         | 1756         | 1650   | 14       | 92     | 11 / 39        | ×10           |
 | `x200`           | 3356         | 3300   | 20       | 36     | 3 / 7          | ×20           |
 
+(and `x500`, `x750`, `x1000`, `x1500`, `x2000`: takers ×2.5 … ×20 of x100,
+bots 30–50, capital ×50 … ×200).
+
 Takers keep the base 5 trades/min each, so offered load scales with them.
 The asset scale adds BONK, WIF, PYTH, JTO, ORCA, RENDER, W, TNSR (Binance
 feeds; mainnet metadata via `bootstrap/scenario/tokens-assets.json`), each
 on all three venues against USDC plus an Orca pool against JUP; it needs
-`KEYPAIR_TOKEN_<NAME>_MINT` / `PUBKEY_TOKEN_<NAME>_MINT` and
-`SCENARIO_TOKENS_CONFIG=bootstrap/scenario/tokens-assets.json`.
+`KEYPAIR_TOKEN_<NAME>_MINT` / `PUBKEY_TOKEN_<NAME>_MINT`. Any overlay that
+lists its own tokens makes `scenario.sh` default
+`SCENARIO_TOKENS_CONFIG` to that file. Those 11 tokens are the catalog: a
+token outside it needs Doppler mint keys first.
 
-`scale.py scale-x10` regenerates only the named overlays. Prices come from
-Binance at generation time; where it is unreachable or geo-blocked, pass
-them in: `SCALE_PRICES='{"JUP": "0.32", "RAY": "1.84"}'`.
+```sh
+just scenario-overlays                               # every preset
+cargo run -q -p scenario -- overlay --spec my.json   # → config/scale-c-<hash>.toml
+cargo run -q -p scenario -- estimate --preset x1500 [--chain local|local-400ms|testnet] [--target-tps 3000]
+```
+
+Rendering checks the overlay against the services' own config types and
+range checks. Prices come from Binance at generation time; where it is
+unreachable or geo-blocked, pass them in:
+`SCALE_PRICES='{"JUP": "0.32", "RAY": "1.84"}'`. The dashboard's Compose
+panel does the same through control.
+
+`estimate` models takers as closed loops (each waits for its trade to settle
+before scheduling the next), so expected swaps/s = takers × λ / (1 + λ·d)
+less the unaffordable share, with d the time per trade. Makers and bots add
+a few transactions a second. It reports compute per block, the busiest
+pool, and three limits: this host's validator execution rate (~147M CU/s,
+the p99 block rate in both 2026-10-17 x1500 runs), the 100M block limit and
+the 40M per-account limit. The calibration is fitted to those runs: x1500
+estimates 1,949 tx/s at 420 ms slots (measured 1,946) and 1,958 at 200 ms
+(measured 1,970). Venue shares are emergent (the router takes the best price)
+and calibrated too.
 
 Measure a scale (10 minutes; writes `.scenario/runs/<name>-{t0,t1,load,report}.json`):
 

@@ -114,6 +114,15 @@ scenario-test-validator:
                 && echo --clone-feature-set --url "$SCENARIO_TV_CLONE_FEATURES" \
                 || echo --deactivate-feature B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g)'
 
+# Regenerate every preset overlay (config/scale-*.toml) at current prices
+# (SCALE_PRICES='{"JUP": "0.32", ...}' where Binance is unreachable).
+scenario-overlays:
+    cargo run -q -p scenario -- overlay
+
+# Estimate a preset's load: just scenario-estimate x1500 [--chain local-400ms] [--target-tps 3000]
+scenario-estimate PRESET *ARGS:
+    cargo run -q -p scenario -- estimate --preset "{{PRESET}}" {{ARGS}}
+
 # Fund the program authority on a fresh test validator (Surfpool airdrops it instead).
 scenario-test-validator-fund:
     doppler run --project testnet-testsuite --config dev -- bash -c ' \
