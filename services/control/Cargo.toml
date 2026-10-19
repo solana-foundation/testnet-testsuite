@@ -10,6 +10,7 @@ chain-watch-client = { workspace = true }
 control-client = { workspace = true }
 mtm-common = { workspace = true }
 mtm-telemetry = { workspace = true }
+scenario-spec = { workspace = true, features = ["validate", "fetch"] }
 
 anyhow = { workspace = true }
 axum = { workspace = true }

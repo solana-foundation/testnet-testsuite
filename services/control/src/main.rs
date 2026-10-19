@@ -7,6 +7,7 @@
 //! only: there is no auth yet.
 
 mod api;
+mod compose;
 mod config;
 mod jobs;
 mod live;

@@ -1135,6 +1135,7 @@ dependencies = [
  "reqwest 0.13.1",
  "rusqlite",
  "rustls",
+ "scenario-spec",
  "serde",
  "serde_json",
  "tokio",
@@ -1147,6 +1148,7 @@ name = "control-client"
 version = "0.1.0"
 dependencies = [
  "chain-watch-client",
+ "scenario-spec",
  "serde",
  "serde_json",
 ]
