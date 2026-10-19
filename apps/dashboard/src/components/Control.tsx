@@ -17,6 +17,7 @@ import {
   type Status,
 } from "../api";
 import { dateTime, seconds } from "../format";
+import { Compose } from "./Compose";
 import { usePoll } from "../hooks";
 import type { LiveState } from "../live";
 import { StatusLabel } from "./Tooltip";
@@ -56,6 +57,7 @@ export function Control({ live }: { live: LiveState }) {
   const status = live.status;
   return (
     <>
+      <Compose status={status} />
       <div className="grid2">
         <JobForm status={status} />
         <Processes status={status} />

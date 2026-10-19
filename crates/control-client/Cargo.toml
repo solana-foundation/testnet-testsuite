@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 chain-watch-client = { workspace = true }
+scenario-spec = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
