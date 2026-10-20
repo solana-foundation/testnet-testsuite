@@ -13,3 +13,4 @@ dist/
 .orca-whirlpool-recovery/
 .manifest-recovery/
 .scenario/
+__pycache__/

@@ -44,7 +44,7 @@ else
   export MTM_RPC__WS_URL="${rpc/https/wss}"
 fi
 
-bin="$root/target/${SCENARIO_BUILD:-release}"
+bin="${CARGO_TARGET_DIR:-$root/target}/${SCENARIO_BUILD:-release}"
 build_flag=$([[ "${SCENARIO_BUILD:-release}" == release ]] && echo --release || true)
 
 pubkey_of() { # env var holding a keypair or pubkey → pubkey
@@ -66,8 +66,16 @@ start() { # name, command...
     echo "$name already running (pid $(cat "$state/pids/$name"))"; return
   fi
   nohup "$@" >>"$state/logs/$name.log" 2>&1 &
-  echo $! >"$state/pids/$name"
-  echo "started $name (pid $!, log .scenario/logs/$name.log)"
+  local pid=$!
+  echo "$pid" >"$state/pids/$name"
+  # Until the fork execs, its cmdline is still this script's, and `running`
+  # would report the service as already gone.
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- "$name" && break
+    sleep 0.1
+  done
+  echo "started $name (pid $pid, log .scenario/logs/$name.log)"
 }
 
 stop() { # name: TERM, wait up to 30 s, then KILL; the pid file goes only once it is gone
