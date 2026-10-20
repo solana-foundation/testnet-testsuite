@@ -2649,7 +2649,6 @@ dependencies = [
  "figment",
  "futures",
  "metrics",
- "mtm-chain",
  "mtm-common",
  "mtm-telemetry",
  "oracle-client",
