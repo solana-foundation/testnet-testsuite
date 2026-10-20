@@ -20,6 +20,10 @@ use tracing::info;
 /// Some upstream CDNs (e.g. CoinGecko) 403 requests without a User-Agent.
 pub const USER_AGENT: &str = concat!("mtm-oracle/", env!("CARGO_PKG_VERSION"));
 
+/// Upstream price APIs: a stuck request fails and the next poll retries.
+pub const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
     let underlying_symbols: Vec<_> = cfg
         .oracle

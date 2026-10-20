@@ -91,6 +91,8 @@ impl HermesClient {
         Self {
             http: reqwest::Client::builder()
                 .user_agent(crate::USER_AGENT)
+                .timeout(crate::HTTP_TIMEOUT)
+                .connect_timeout(crate::HTTP_CONNECT_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
