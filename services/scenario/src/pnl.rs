@@ -792,7 +792,11 @@ async fn trade_counts(
     end_s: f64,
     warnings: &mut Vec<String>,
 ) -> BTreeMap<String, Value> {
-    let client = reqwest::Client::new();
+    // A stuck Prometheus costs a warning, not a hung report.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut trades: BTreeMap<String, Value> = BTreeMap::new();
     let queries = [
         (
