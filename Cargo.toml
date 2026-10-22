@@ -6,7 +6,10 @@ members = [
     "crates/mtm-math",
     "crates/mtm-telemetry",
     "crates/oracle-client",
+    "crates/raydium-clmm-client",
+    "crates/raydium-clmm-orchestrator",
     "services/oracle",
+    "services/raydium-clmm-orchestrator",
 ]
 
 [workspace.package]
@@ -21,6 +24,8 @@ mtm-common = { path = "crates/mtm-common" }
 mtm-math = { path = "crates/mtm-math" }
 mtm-telemetry = { path = "crates/mtm-telemetry" }
 oracle-client = { path = "crates/oracle-client" }
+raydium-clmm-client = { path = "crates/raydium-clmm-client" }
+raydium-clmm-orchestrator = { path = "crates/raydium-clmm-orchestrator" }
 
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net"] }
 futures = "0.3"
@@ -47,6 +52,13 @@ solana-pubkey = "4"
 solana-signature = "3"
 solana-signer = "3"
 solana-transaction = "4"
+solana-account = "4.3"
+solana-rpc-client-api = "4.2.1"
+anchor-lang = "0.32.1"
+spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }
+spl-memo = "6"
+spl-token = { version = "7", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "7", features = ["no-entrypoint"] }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -55,6 +67,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 figment = { version = "0.10", features = ["toml", "env"] }
 dotenvy = "0.15"
+clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

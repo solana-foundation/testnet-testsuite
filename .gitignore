@@ -9,3 +9,4 @@ dist/
 /test-ledger
 /keys/*.json
 .pnpm-store/
+.raydium-clmm-recovery/

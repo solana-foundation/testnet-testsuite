@@ -39,6 +39,7 @@ interface SourceMetadata {
 }
 
 interface LoadedKeypairs {
+  readonly payer: Keypair;
   readonly mint: Keypair;
   readonly mintAuthority: Keypair;
   readonly freezeAuthority: Keypair;
@@ -50,6 +51,7 @@ interface Options {
   readonly configPath: string;
   readonly mainnetRpc: string;
   readonly testnetRpc: string;
+  readonly payerKeypairEnv: string;
 }
 
 /** Parses and validates command-line options without performing network I/O. */
@@ -58,6 +60,7 @@ export function parseOptions(args: readonly string[]): Options {
   let configPath = "bootstrap/tokens/config.json";
   let mainnetRpc = DEFAULT_MAINNET_RPC;
   let testnetRpc = DEFAULT_TESTNET_RPC;
+  let payerKeypairEnv = "KEYPAIR_FAUCET";
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--apply") {
@@ -69,10 +72,17 @@ export function parseOptions(args: readonly string[]): Options {
     if (argument === "--config") configPath = value;
     else if (argument === "--mainnet-rpc") mainnetRpc = value;
     else if (argument === "--testnet-rpc") testnetRpc = value;
+    else if (argument === "--payer-keypair-env") payerKeypairEnv = value;
     else throw new Error(`Unknown argument: ${argument}`);
     index += 1;
   }
-  return { apply, configPath, mainnetRpc, testnetRpc };
+  return {
+    apply,
+    configPath,
+    mainnetRpc,
+    testnetRpc,
+    payerKeypairEnv,
+  };
 }
 
 /** Validates untrusted JSON configuration into a strongly typed token list. */
@@ -140,7 +150,10 @@ function keypairFromEnvironment(variableName: string): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(parsed));
 }
 
-function loadKeypairs(config: TokenConfig): LoadedKeypairs {
+function loadKeypairs(
+  config: TokenConfig,
+  payerKeypairEnv: string,
+): LoadedKeypairs {
   const names = [
     config.mint,
     config.mintAuthority,
@@ -152,7 +165,21 @@ function loadKeypairs(config: TokenConfig): LoadedKeypairs {
   if (!mint || !mintAuthority || !freezeAuthority || !metadataAuthority) {
     throw new Error("Unable to load all configured Doppler keypairs.");
   }
-  return { mint, mintAuthority, freezeAuthority, metadataAuthority };
+  return {
+    payer: keypairFromEnvironment(payerKeypairEnv),
+    mint,
+    mintAuthority,
+    freezeAuthority,
+    metadataAuthority,
+  };
+}
+
+function uniqueSigners(signers: readonly Keypair[]): Keypair[] {
+  return [
+    ...new Map(
+      signers.map((signer) => [signer.publicKey.toBase58(), signer]),
+    ).values(),
+  ];
 }
 
 function metadataAddress(mint: PublicKey): PublicKey {
@@ -279,7 +306,7 @@ async function deployToken(
       `No Metaplex metadata account exists for mainnet mint ${sourceMint.toBase58()}.`,
     );
   const sourceMetadata = decodeMetadata(sourceMetadataAccount.data);
-  const keypairs = loadKeypairs(config);
+  const keypairs = loadKeypairs(config, options.payerKeypairEnv);
   if (await testnet.getAccountInfo(keypairs.mint.publicKey, "confirmed"))
     throw new Error(
       `Testnet mint ${keypairs.mint.publicKey.toBase58()} already exists; refusing to overwrite it.`,
@@ -304,7 +331,7 @@ async function deployToken(
           mintAuthority: keypairs.mintAuthority.publicKey.toBase58(),
           freezeAuthority: keypairs.freezeAuthority.publicKey.toBase58(),
           metadataAuthority: keypairs.metadataAuthority.publicKey.toBase58(),
-          payer: keypairs.mintAuthority.publicKey.toBase58(),
+          payer: keypairs.payer.publicKey.toBase58(),
           minimumRentLamports: rent,
           zeroSupply: true,
         },
@@ -316,7 +343,7 @@ async function deployToken(
   if (!options.apply) return;
   const transaction = new Transaction().add(
     SystemProgram.createAccount({
-      fromPubkey: keypairs.mintAuthority.publicKey,
+      fromPubkey: keypairs.payer.publicKey,
       newAccountPubkey: keypairs.mint.publicKey,
       lamports: rent,
       space: MINT_SIZE,
@@ -330,17 +357,19 @@ async function deployToken(
     ),
     createMetadataInstruction(
       keypairs.mint.publicKey,
-      keypairs.mintAuthority.publicKey,
+      keypairs.payer.publicKey,
       keypairs.mintAuthority.publicKey,
       keypairs.metadataAuthority.publicKey,
       sourceMetadata,
     ),
   );
-  const simulation = await testnet.simulateTransaction(transaction, [
+  const signers = uniqueSigners([
+    keypairs.payer,
     keypairs.mintAuthority,
     keypairs.mint,
     keypairs.metadataAuthority,
   ]);
+  const simulation = await testnet.simulateTransaction(transaction, signers);
   if (simulation.value.err)
     throw new Error(
       `Testnet simulation failed: ${JSON.stringify(simulation.value.err)} ${simulation.value.logs?.join(" ") ?? ""}`,
@@ -348,7 +377,7 @@ async function deployToken(
   const signature = await sendAndConfirmTransaction(
     testnet,
     transaction,
-    [keypairs.mintAuthority, keypairs.mint, keypairs.metadataAuthority],
+    signers,
     { commitment: "confirmed" },
   );
   console.log(
