@@ -97,7 +97,7 @@ configure-raydium-clmm-prd *ARGS:
 
 # Deploy a program using a Doppler-injected keypair.
 # PROGRAM_KEYPAIR_VAR is the *name* of the Doppler secret, not its value.
-deploy-program CONFIG PROGRAM_KEYPAIR_VAR SO_PATH URL="localhost":
+deploy-program CONFIG PROGRAM_KEYPAIR_VAR SO_PATH URL="localhost" FLAGS="":
     doppler run --project testnet-testsuite --config "{{CONFIG}}" -- \
         bash -c ' \
             set -euo pipefail; \
@@ -119,11 +119,13 @@ deploy-program CONFIG PROGRAM_KEYPAIR_VAR SO_PATH URL="localhost":
                 --program-id "$d/program.json" \
                 --upgrade-authority "$d/authority.json" \
                 --fee-payer "$d/faucet.json" \
+                $4 \
                 "$2" \
-        ' _ "{{PROGRAM_KEYPAIR_VAR}}" "{{SO_PATH}}" "{{URL}}"
+        ' _ "{{PROGRAM_KEYPAIR_VAR}}" "{{SO_PATH}}" "{{URL}}" "{{FLAGS}}"
 
 deploy-program-testnet PROGRAM_KEYPAIR_VAR SO_PATH: (deploy-program "prd" PROGRAM_KEYPAIR_VAR SO_PATH "testnet")
-deploy-program-dev PROGRAM_KEYPAIR_VAR SO_PATH: (deploy-program "dev" PROGRAM_KEYPAIR_VAR SO_PATH "localhost")
+# Surfpool does not serve TPU/QUIC; send buffer writes over RPC.
+deploy-program-dev PROGRAM_KEYPAIR_VAR SO_PATH: (deploy-program "dev" PROGRAM_KEYPAIR_VAR SO_PATH "localhost" "--use-rpc")
 
 
 # --- containerized stack (oracle + prometheus + grafana) -------------------------
