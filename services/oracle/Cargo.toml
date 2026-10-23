@@ -6,7 +6,6 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-mtm-chain = { workspace = true }
 mtm-common = { workspace = true }
 mtm-telemetry = { workspace = true }
 oracle-client = { workspace = true }
