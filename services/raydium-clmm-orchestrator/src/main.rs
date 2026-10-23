@@ -285,12 +285,16 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
         .into_iter()
         .map(|pool| (pool, Arc::new(Keypair::new())))
         .collect();
-    let mut funded_users: Vec<(UserPool, Arc<dyn Signer + Send + Sync>, TransactionOutcome)> =
-        Vec::with_capacity(users.len());
+    let mut funded_users: Vec<(
+        UserPool,
+        Arc<dyn Signer + Send + Sync>,
+        PathBuf,
+        TransactionOutcome,
+    )> = Vec::with_capacity(users.len());
     for (pool, user) in users {
         let user_pubkey = user.pubkey();
         let recovery_path = args.recovery_dir.join(format!("{user_pubkey}.json"));
-        let bytes = serde_json::to_vec(&user.to_bytes())?;
+        let bytes = serde_json::to_vec(user.to_bytes().as_slice())?;
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -313,7 +317,7 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
         let startup_funding = match startup_funding {
             Ok(outcome) => outcome,
             Err(error) => {
-                for (funded_pool, funded_user, _) in funded_users {
+                for (funded_pool, funded_user, _, _) in funded_users {
                     let _ = reclaim_user_funds(
                         &chain,
                         faucet.as_ref(),
@@ -326,10 +330,10 @@ async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
                 return Err(error).context("fund ephemeral user from KEYPAIR_FAUCET");
             }
         };
-        funded_users.push((pool, user, startup_funding));
+        funded_users.push((pool, user, recovery_path, startup_funding));
     }
     let mut runs = Vec::new();
-    for (pool, user, startup_funding) in funded_users {
+    for (pool, user, recovery_path, startup_funding) in funded_users {
         let user_pubkey = user.pubkey();
         let orchestrator = RaydiumClmmOrchestrator::new(
             chain.clone(),
