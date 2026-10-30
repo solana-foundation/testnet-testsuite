@@ -1,0 +1,989 @@
+{
+  "uid": "mtm-scenario",
+  "title": "mtm \u2014 market-making scenario",
+  "tags": ["mtm"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Scenario health",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": [],
+      "id": 1
+    },
+    {
+      "type": "stat",
+      "title": "Routed swaps landed (5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(flow_swaps_total{status=\"landed\"}[5m])) or vector(0)"
+        }
+      ],
+      "id": 2
+    },
+    {
+      "type": "stat",
+      "title": "Routed swaps failed (5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(flow_swaps_total{status=\"failed\"}[5m])) or vector(0)"
+        }
+      ],
+      "id": 3
+    },
+    {
+      "type": "stat",
+      "title": "Maker errors (5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(increase(mm_errors_total[5m])) or vector(0)) + (sum(increase(mm_panics_total[5m])) or vector(0))"
+        }
+      ],
+      "id": 4
+    },
+    {
+      "type": "stat",
+      "title": "Flow notional (USD/min)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(flow_notional_micro_usd_total[5m])) * 60 / 1e6"
+        }
+      ],
+      "id": 5
+    },
+    {
+      "type": "row",
+      "title": "Oracle",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "panels": [],
+      "id": 6
+    },
+    {
+      "type": "timeseries",
+      "title": "Oracle pair prices",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mm_oracle_price",
+          "legendFormat": "{{pair}}"
+        }
+      ],
+      "id": 7
+    },
+    {
+      "type": "timeseries",
+      "title": "Oracle updates / s",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (symbol) (rate(oracle_price_updates_total[1m]))",
+          "legendFormat": "{{symbol}}"
+        }
+      ],
+      "id": 8
+    },
+    {
+      "type": "row",
+      "title": "Venues vs oracle",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "panels": [],
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "Venue price deviation from oracle",
+      "description": "(venue price - oracle) / oracle in bps; arbitrageurs pull AMMs back inside their threshold",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mm_deviation_bps",
+          "legendFormat": "{{maker}} ({{venue}})"
+        }
+      ],
+      "id": 10
+    },
+    {
+      "type": "timeseries",
+      "title": "Venue prices",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mm_venue_price",
+          "legendFormat": "{{maker}}"
+        }
+      ],
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "Maker transactions by venue / min",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (venue, action) (rate(mm_actions_total[5m])) * 60",
+          "legendFormat": "{{venue}} {{action}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (venue) (rate(flow_route_legs_total[5m])) * 60",
+          "legendFormat": "{{venue}} routed legs"
+        }
+      ],
+      "id": 12
+    },
+    {
+      "type": "timeseries",
+      "title": "Simulated CU per venue tx (p95)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "orca_whirlpool_simulated_compute_units{quantile=\"0.95\"}",
+          "legendFormat": "orca"
+        },
+        {
+          "refId": "B",
+          "expr": "raydium_clmm_simulated_compute_units{quantile=\"0.95\"}",
+          "legendFormat": "raydium"
+        },
+        {
+          "refId": "C",
+          "expr": "manifest_simulated_compute_units{quantile=\"0.95\"}",
+          "legendFormat": "manifest"
+        }
+      ],
+      "id": 13
+    },
+    {
+      "type": "row",
+      "title": "Market makers",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "panels": [],
+      "id": 14
+    },
+    {
+      "type": "timeseries",
+      "title": "Inventory value (USD)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mm_inventory_value_usd",
+          "legendFormat": "{{maker}}"
+        }
+      ],
+      "id": 15
+    },
+    {
+      "type": "timeseries",
+      "title": "Maker actions / min",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (maker, action) (rate(mm_actions_total[5m])) * 60",
+          "legendFormat": "{{maker}} {{action}}"
+        }
+      ],
+      "id": 16
+    },
+    {
+      "type": "timeseries",
+      "title": "Inventory by token",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mm_inventory",
+          "legendFormat": "{{maker}} {{token}}"
+        }
+      ],
+      "id": 17
+    },
+    {
+      "type": "timeseries",
+      "title": "Quote skew (bps) and arb volume (USD/min)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mm_skew_bps",
+          "legendFormat": "skew {{maker}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (maker) (rate(mm_arb_volume_micro_usd_total[5m])) * 60 / 1e6",
+          "legendFormat": "arb {{maker}}"
+        }
+      ],
+      "id": 18
+    },
+    {
+      "type": "timeseries",
+      "title": "Maker errors / min",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (maker, stage) (rate(mm_errors_total[5m])) * 60",
+          "legendFormat": "{{maker}} {{stage}}"
+        }
+      ],
+      "id": 19
+    },
+    {
+      "type": "timeseries",
+      "title": "Maker tick latency (p95)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mm_tick_seconds{quantile=\"0.95\"}",
+          "legendFormat": "{{maker}}"
+        }
+      ],
+      "id": 20
+    },
+    {
+      "type": "row",
+      "title": "Uninformed flow + router",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 56
+      },
+      "panels": [],
+      "id": 21
+    },
+    {
+      "type": "timeseries",
+      "title": "Routed swaps / min",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 57
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pair, status, size) (rate(flow_swaps_total[5m])) * 60",
+          "legendFormat": "{{pair}} {{status}} {{size}}"
+        }
+      ],
+      "id": 22
+    },
+    {
+      "type": "timeseries",
+      "title": "Swap outcomes / min",
+      "description": "landed, or why not: unaffordable / no_price / quote_failed / preflight_rejected / send_failed / landed_failed / expired / rpc_ambiguous / error",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 57
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(flow_swaps_total[5m])) * 60",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "id": 23
+    },
+    {
+      "type": "timeseries",
+      "title": "Cost vs oracle (bps)",
+      "description": "value given up versus the oracle: spread + fees + impact paid by uninformed flow",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "flow_cost_vs_oracle_bps{quantile=\"0.5\"}",
+          "legendFormat": "p50 {{pair}}"
+        },
+        {
+          "refId": "B",
+          "expr": "flow_cost_vs_oracle_bps{quantile=\"0.95\"}",
+          "legendFormat": "p95 {{pair}}"
+        }
+      ],
+      "id": 24
+    },
+    {
+      "type": "timeseries",
+      "title": "Landed vs quoted slippage (bps)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "flow_slippage_bps{quantile=\"0.95\"}",
+          "legendFormat": "p95 {{pair}}"
+        },
+        {
+          "refId": "B",
+          "expr": "flow_slippage_bps{quantile=\"0.5\"}",
+          "legendFormat": "p50 {{pair}}"
+        }
+      ],
+      "id": 25
+    },
+    {
+      "type": "timeseries",
+      "title": "Route legs by venue / min",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 73
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (venue) (rate(flow_route_legs_total[5m])) * 60",
+          "legendFormat": "{{venue}}"
+        }
+      ],
+      "id": 26
+    },
+    {
+      "type": "timeseries",
+      "title": "Router quote latency",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 73
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "router_quote_seconds{quantile=\"0.5\"}",
+          "legendFormat": "p50 {{execution}}"
+        },
+        {
+          "refId": "B",
+          "expr": "router_quote_seconds{quantile=\"0.95\"}",
+          "legendFormat": "p95 {{execution}}"
+        }
+      ],
+      "id": 27
+    },
+    {
+      "type": "timeseries",
+      "title": "Router quotes and errors / min",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 81
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (execution) (rate(router_quotes_total[5m])) * 60",
+          "legendFormat": "quotes {{execution}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (status) (rate(router_quote_errors_total[5m])) * 60",
+          "legendFormat": "errors {{status}}"
+        }
+      ],
+      "id": 28
+    }
+  ]
+}

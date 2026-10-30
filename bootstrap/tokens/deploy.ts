@@ -10,14 +10,17 @@ import {
 } from "@solana/web3.js";
 import {
   createInitializeMintInstruction,
-  getMint,
   MINT_SIZE,
+  TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
+  unpackMint,
 } from "@solana/spl-token";
 
 const TOKEN_METADATA_PROGRAM_ID = new PublicKey(
   "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
 );
+/** Metaplex `Key::MetadataV1`, the first byte of a metadata account. */
+const METADATA_V1_KEY = 4;
 const DEFAULT_MAINNET_RPC = "https://api.mainnet-beta.solana.com";
 const DEFAULT_TESTNET_RPC = "https://api.testnet.solana.com";
 
@@ -52,6 +55,7 @@ interface Options {
   readonly mainnetRpc: string;
   readonly testnetRpc: string;
   readonly payerKeypairEnv: string;
+  readonly skipExisting: boolean;
 }
 
 /** Parses and validates command-line options without performing network I/O. */
@@ -61,14 +65,21 @@ export function parseOptions(args: readonly string[]): Options {
   let mainnetRpc = DEFAULT_MAINNET_RPC;
   let testnetRpc = DEFAULT_TESTNET_RPC;
   let payerKeypairEnv = "KEYPAIR_FAUCET";
+  let skipExisting = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--apply") {
       apply = true;
       continue;
     }
+    if (argument === "--skip-existing") {
+      skipExisting = true;
+      continue;
+    }
     const value = args[index + 1];
-    if (!value) throw new Error(`Missing value for ${argument ?? "argument"}.`);
+    // `--config --apply` must not read "--apply" as the config path.
+    if (!value || value.startsWith("--"))
+      throw new Error(`Missing value for ${argument ?? "argument"}.`);
     if (argument === "--config") configPath = value;
     else if (argument === "--mainnet-rpc") mainnetRpc = value;
     else if (argument === "--testnet-rpc") testnetRpc = value;
@@ -82,6 +93,7 @@ export function parseOptions(args: readonly string[]): Options {
     mainnetRpc,
     testnetRpc,
     payerKeypairEnv,
+    skipExisting,
   };
 }
 
@@ -231,7 +243,11 @@ class Reader {
 /** Decodes name, symbol, URI, seller fee, and mutability from Metaplex account data. */
 export function decodeMetadata(data: Buffer): SourceMetadata {
   const reader = new Reader(data);
-  reader.u8();
+  const key = reader.u8();
+  if (key !== METADATA_V1_KEY)
+    throw new Error(
+      `Not a MetadataV1 account (key byte ${key}, expected ${METADATA_V1_KEY}).`,
+    );
   reader.bytes(32); // update authority
   reader.bytes(32); // mint
   const name = reader.string();
@@ -287,17 +303,87 @@ function createMetadataInstruction(
   };
 }
 
+/**
+ * Checks that an existing testnet mint is the one this config would have
+ * created: a legacy Token mint with the configured authorities. Decimals
+ * are not compared, as that would need the mainnet read `--skip-existing`
+ * exists to avoid.
+ */
+export function verifyExistingMint(
+  address: PublicKey,
+  account: Parameters<typeof unpackMint>[1],
+  keypairs: Pick<LoadedKeypairs, "mintAuthority" | "freezeAuthority">,
+): void {
+  if (!account || !account.owner.equals(TOKEN_PROGRAM_ID))
+    throw new Error(
+      `Testnet account ${address.toBase58()} exists but is not a Token program mint.`,
+    );
+  const mint = unpackMint(address, account, TOKEN_PROGRAM_ID);
+  const checks: readonly [string, PublicKey | null, PublicKey][] = [
+    ["mint authority", mint.mintAuthority, keypairs.mintAuthority.publicKey],
+    [
+      "freeze authority",
+      mint.freezeAuthority,
+      keypairs.freezeAuthority.publicKey,
+    ],
+  ];
+  const mismatches = checks
+    .filter(([, actual, expected]) => !actual?.equals(expected))
+    .map(
+      ([label, actual, expected]) =>
+        `${label} is ${actual?.toBase58() ?? "none"}, expected ${expected.toBase58()}`,
+    );
+  if (mismatches.length > 0)
+    throw new Error(
+      `Testnet mint ${address.toBase58()} does not match the config: ${mismatches.join("; ")}.`,
+    );
+}
+
 async function deployToken(
   config: TokenConfig,
   options: Options,
 ): Promise<void> {
-  const mainnet = new Connection(options.mainnetRpc, "confirmed");
   const testnet = new Connection(options.testnetRpc, "confirmed");
+  const keypairs = loadKeypairs(config, options.payerKeypairEnv);
+  // Testnet first: with every mint already present, `--skip-existing`
+  // finishes without touching mainnet (offline and rate-limited loops).
+  const existing = await testnet.getAccountInfo(
+    keypairs.mint.publicKey,
+    "confirmed",
+  );
+  if (existing) {
+    if (options.skipExisting) {
+      verifyExistingMint(keypairs.mint.publicKey, existing, keypairs);
+      console.log(
+        JSON.stringify({
+          action: "skip-existing",
+          mint: keypairs.mint.publicKey.toBase58(),
+        }),
+      );
+      return;
+    }
+    throw new Error(
+      `Testnet mint ${keypairs.mint.publicKey.toBase58()} already exists; refusing to overwrite it (pass --skip-existing to leave it).`,
+    );
+  }
+  const mainnet = new Connection(options.mainnetRpc, "confirmed");
   const sourceMint = new PublicKey(config.mainnetPubkey);
-  const [sourceMintInfo, sourceMetadataAccount] = await Promise.all([
-    getMint(mainnet, sourceMint, "confirmed", TOKEN_PROGRAM_ID),
-    mainnet.getAccountInfo(metadataAddress(sourceMint), "confirmed"),
-  ]);
+  const [sourceMintAccount, sourceMetadataAccount] =
+    await mainnet.getMultipleAccountsInfo(
+      [sourceMint, metadataAddress(sourceMint)],
+      "confirmed",
+    );
+  if (!sourceMintAccount)
+    throw new Error(`Mainnet mint ${sourceMint.toBase58()} does not exist.`);
+  if (sourceMintAccount.owner.equals(TOKEN_2022_PROGRAM_ID))
+    throw new Error(
+      `Mainnet mint ${sourceMint.toBase58()} is a Token-2022 mint; only legacy Token mints are mirrored.`,
+    );
+  const sourceMintInfo = unpackMint(
+    sourceMint,
+    sourceMintAccount,
+    TOKEN_PROGRAM_ID,
+  );
   if (
     !sourceMetadataAccount ||
     !sourceMetadataAccount.owner.equals(TOKEN_METADATA_PROGRAM_ID)
@@ -306,11 +392,6 @@ async function deployToken(
       `No Metaplex metadata account exists for mainnet mint ${sourceMint.toBase58()}.`,
     );
   const sourceMetadata = decodeMetadata(sourceMetadataAccount.data);
-  const keypairs = loadKeypairs(config, options.payerKeypairEnv);
-  if (await testnet.getAccountInfo(keypairs.mint.publicKey, "confirmed"))
-    throw new Error(
-      `Testnet mint ${keypairs.mint.publicKey.toBase58()} already exists; refusing to overwrite it.`,
-    );
   const rent = await testnet.getMinimumBalanceForRentExemption(
     MINT_SIZE,
     "confirmed",
