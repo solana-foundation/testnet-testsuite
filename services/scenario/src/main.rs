@@ -136,6 +136,10 @@ fn operator_keys(envs: &[String]) -> Vec<(String, solana_keypair::Keypair)> {
         .collect()
 }
 
+/// SOL the program authority is topped up to before it creates the venue
+/// configs (a few accounts' rent plus fees).
+const ADMIN_SOL: Decimal = Decimal::from_parts(5, 0, 0, false, 1);
+
 /// role, wallet, SOL target, token targets, funding mode
 type FundingTarget<'s> = (String, Pubkey, Decimal, Vec<(&'s Token, Decimal)>, Funding);
 
@@ -270,6 +274,20 @@ async fn bootstrap(
     let faucet = signer_from_environment(faucet_env)?;
     let mint_authority = signer_from_environment(mint_authority_env)?;
     let admin = signer_from_environment(admin_env)?;
+    // The admin (program authority) pays for the venue configs. Nothing
+    // else funds it on a real cluster, and a teardown sweeps it on local:
+    // top it up from the faucet first.
+    top_up(
+        chain,
+        faucet.as_ref(),
+        mint_authority.as_ref(),
+        &admin.pubkey(),
+        ADMIN_SOL,
+        &[],
+        Funding::TopUp,
+    )
+    .await
+    .context("funding the program authority for the venue configs")?;
     let confirmed = CommitmentConfig::confirmed();
     let programs = scenario.programs;
 

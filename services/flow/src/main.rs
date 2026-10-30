@@ -97,8 +97,10 @@ async fn main() -> Result<()> {
             None
         }
     };
-    // Every swap series at zero: `increase()` misses the first increment
-    // of a series that appears mid-window.
+    // Every swap series (and the refill counter, which the report warns
+    // on) at zero: `increase()` misses the first increment of a series
+    // that appears mid-window.
+    counter!("flow_refills_total").absolute(0);
     for (a, b) in &flow.pairs {
         for size in ["normal", "large"] {
             for outcome in Outcome::ALL {

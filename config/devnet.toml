@@ -1,0 +1,6 @@
+# Profile: devnet — a rehearsal cluster before testnet runs.
+# Public endpoints are rate-limited; swap in a dedicated RPC when generating real traffic.
+
+[rpc]
+http_url = "https://api.devnet.solana.com"
+ws_url = "wss://api.devnet.solana.com"
