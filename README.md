@@ -23,6 +23,7 @@ the point is generating realistic traffic against it.
 | `crates/raydium-clmm-orchestrator`     | Reusable funding and full CLMM lifecycle sequencing                                                |
 | `services/oracle`                      | Polls Hermes → serves `/v1/prices` + `/v1/ws` → pushes on-chain (WIP)                              |
 | `services/manifest-dex-orchestrator`   | CLI with `create-markets` and `user-flow` commands for the Manifest fork                           |
+| `services/router`                      | Quote + transaction API routing across Raydium CLMM, Orca, and Manifest (direct or Jupiter fork)   |
 | `services/orca-whirlpool-orchestrator` | CLI with `admin`, `create-pools`, and `user-flow` commands for the Whirlpool fork                  |
 | `services/raydium-clmm-orchestrator`   | CLI with `admin` setup and complete `flow` lifecycle commands                                      |
 | `programs/`                            | On-chain programs (empty for now — Anchor workspace lands here later)                              |
@@ -393,6 +394,41 @@ NO_DNA=1 just manifest-user-flow-dev
 
 See [docs/dex-forks.md](docs/dex-forks.md) for the fork, its SBPF v3 build,
 and why no GPL code is linked here.
+
+## Router
+
+`services/router` quotes and builds swaps across the three deployed venues
+(design and current status: [docs/router-architecture.md](docs/router-architecture.md)).
+It discovers pools from each fork's program, vets them with a two-way probe
+quote, snapshots candidate pools per request, and plans ExactIn routes with
+same-pair splits and 2-hop bridges (`[router] bridge_mints`) or single-hop
+ExactOut routes.
+
+```sh
+NO_DNA=1 just router-dev         # program IDs from Doppler, bridge via USDC
+curl -s localhost:8081/v1/pools
+curl -s localhost:8081/v1/quote -H 'content-type: application/json' -d '{
+  "input_mint": "<mint>", "output_mint": "<mint>", "amount": 1000000,
+  "mode": "exact_in", "slippage_bps": 50, "execution": "direct",
+  "user": "<pubkey>"
+}'
+```
+
+With `user`, the response carries an unsigned v1 transaction (wincode wire
+format, base64; compute budget in the message config); `/v1/instructions`
+returns the raw instructions instead. Every quote reports `cu_estimate`
+(per leg and for the route); with `user`, `compute_unit_limit` is the limit
+written into the transaction (estimate + `cu_margin`) — `/v1/instructions`
+callers should put it in their own transaction's v1 config. `execution: "direct"` uses each venue's
+own top-level swap instruction; `execution: "jupiter"` emits one `route_v2` of
+the Jupiter fork configured by `PUBKEY_JUPITER_FORK` (see the placeholders in
+the design doc). Routes are fitted to the v1 limits (4,096 bytes, 64
+addresses, 64 instructions): splits narrow and wide legs drop until it fits.
+
+On a fresh Surfpool, `NO_DNA=1 just router-seed-dev` opens faucet-funded
+positions and resting orders on every pool so routes have liquidity, and
+`cargo run -p router --example swap_via_router` signs and submits a routed
+swap and prints quoted versus landed amounts.
 
 ## Conventions
 
