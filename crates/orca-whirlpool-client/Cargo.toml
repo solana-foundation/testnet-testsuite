@@ -1,0 +1,38 @@
+[package]
+name = "orca-whirlpool-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+mtm-math = { workspace = true }
+metrics = { workspace = true }
+mtm-chain = { workspace = true }
+mtm-dex-harness = { workspace = true }
+# Pinned to the last Apache-2.0 releases (2025-02-21). Later releases are under
+# the non-standard Orca License; see docs/dex-forks.md before bumping.
+orca_whirlpools_client = { version = "=2.0.2", default-features = false, features = ["core-types"] }
+orca_whirlpools_core = { version = "=1.0.4", default-features = false }
+# Not used directly: pins the proc-macro crate orca_whirlpools_core pulls in
+# with a caret requirement. 1.0.5+ is published under the Orca License
+# (relicensed 2025-02-27); 1.0.4 is the last Apache-2.0 release.
+orca_whirlpools_macros = { version = "=1.0.4", default-features = false }
+rust_decimal = { workspace = true, features = ["maths"] }
+sha2 = { workspace = true }
+solana-account = { workspace = true }
+solana-commitment-config = { workspace = true }
+solana-instruction = { workspace = true }
+solana-keypair = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-signature = { workspace = true }
+solana-signer = { workspace = true }
+# The Orca client is built on Solana 2.x types; conversions live in adapter.rs.
+solana-instruction-v2 = { package = "solana-instruction", version = "2.3" }
+solana-pubkey-v2 = { package = "solana-pubkey", version = "2.4" }
+spl-token-2022 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -8,6 +8,7 @@ Ensure you have doppler installed and logged in with access to the `testnet-test
 Clone the following repos in a sibling directory to this project:
 
 - https://github.com/solana-foundation/raydium-clmm
+- https://github.com/solana-foundation/whirlpools (branch `testnet`; see [docs/dex-forks.md](./docs/dex-forks.md))
 
 ### Env Vars
 
@@ -84,4 +85,29 @@ just configure-raydium-clmm-prd
 
 ```sh
 just raydium-clmm-create-pools-testnet --amm-config <config-pubkey-from-last-command>
+```
+
+#### Orca Whirlpool
+
+Build the `testnet` branch of the `whirlpools` fork with the program ID of
+`KEYPAIR_ORCA_WHIRLPOOL` (see [docs/dex-forks.md](./docs/dex-forks.md)):
+
+```sh
+cargo build-sbf --tools-version v1.37 --manifest-path ../whirlpools/programs/whirlpool/Cargo.toml
+```
+
+For surfnet deployment, run:
+
+```sh
+just deploy-program-dev "KEYPAIR_ORCA_WHIRLPOOL" "../whirlpools/target/deploy/whirlpool.so"
+just configure-orca-whirlpool-dev
+just orca-whirlpool-create-pools-dev
+```
+
+for testnet, run
+
+```sh
+just deploy-program-testnet "KEYPAIR_ORCA_WHIRLPOOL" "../whirlpools/target/deploy/whirlpool.so"
+just configure-orca-whirlpool-prd
+just orca-whirlpool-create-pools-testnet
 ```

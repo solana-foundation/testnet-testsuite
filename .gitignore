@@ -10,3 +10,4 @@ dist/
 /keys/*.json
 .pnpm-store/
 .raydium-clmm-recovery/
+.orca-whirlpool-recovery/
