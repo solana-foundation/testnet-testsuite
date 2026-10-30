@@ -11,3 +11,4 @@ dist/
 .pnpm-store/
 .raydium-clmm-recovery/
 .orca-whirlpool-recovery/
+.manifest-recovery/

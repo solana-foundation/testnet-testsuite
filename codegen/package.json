@@ -1,0 +1,14 @@
+{
+  "name": "mtm-codegen",
+  "private": true,
+  "type": "module",
+  "description": "Codama SDK generation for program IDLs (crates/sdks/*)",
+  "scripts": {
+    "generate": "node generate.mjs"
+  },
+  "dependencies": {
+    "codama": "1.10.2",
+    "@codama/nodes-from-anchor": "1.5.5",
+    "@codama/renderers-rust": "3.1.3"
+  }
+}
