@@ -80,10 +80,26 @@ scenario-surfpool:
         surfpool start --network testnet --no-deploy --disable-instruction-profiling \
             --airdrop "$PUBKEY_FAUCET" --airdrop "$PUBKEY_PROGRAM_AUTHORITY"'
 
-# Run a scenario.sh command under a Doppler config: CMD = deploy|up|bootstrap|observe|status.
-scenario-with CONFIG TARGET CMD:
+# Offline Surfpool (no testnet fallback for missing accounts: no remote
+# fetch latency, closer to a real validator). Metaplex is preloaded from a
+# snapshot; deploy the forks with `scenario-deploy-dev` afterwards.
+scenario-surfpool-offline:
+    test -f .scenario/metaplex.json || python3 -I bootstrap/scenario/metaplex-snapshot.py .scenario/metaplex.json
+    doppler run --project testnet-testsuite --config dev -- bash -c ' \
+        surfpool start --offline --snapshot .scenario/metaplex.json --no-deploy --disable-instruction-profiling \
+            --airdrop-amount 100000000000000 --airdrop "$PUBKEY_FAUCET" --airdrop "$PUBKEY_PROGRAM_AUTHORITY"'
+
+# Run a scenario.sh command under a Doppler config: CMD = deploy|up|bootstrap|observe|status,
+# or snapshot|report|measure with their operands in ARGS (e.g. `measure x10 600`).
+scenario-with CONFIG TARGET CMD *ARGS:
     doppler run --project testnet-testsuite --config "{{CONFIG}}" -- \
-        bootstrap/scenario/scenario.sh "{{CMD}}" "{{TARGET}}"
+        bootstrap/scenario/scenario.sh "{{CMD}}" {{ARGS}} "{{TARGET}}"
+
+# Measure a running scenario: snapshot → SECONDS of load sampling → snapshot → report,
+# into .scenario/runs/NAME-*.json. SCALE (x10|x100|assets) must match the one it was started with.
+scenario-measure CONFIG TARGET NAME SECONDS SCALE="":
+    SCENARIO_SCALE="{{SCALE}}" doppler run --project testnet-testsuite --config "{{CONFIG}}" -- \
+        bootstrap/scenario/scenario.sh measure "{{NAME}}" "{{SECONDS}}" "{{TARGET}}"
 
 scenario-deploy-dev: (scenario-with "dev" "local" "deploy")
 scenario-up-dev: (scenario-with "dev" "local" "up")

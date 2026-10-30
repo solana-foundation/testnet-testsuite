@@ -141,10 +141,66 @@ Taker refills mint tokens and would show up as PnL (the report warns when
 any happened in the window); for a clean window run flow with
 `MTM_SCENARIO__FLOW__REFILL_BELOW_RATIO=0`.
 
+## Scaling
+
+`bootstrap/scenario/scale.py` generates overlays layered over the profile
+(`MTM_PROFILE=scenario-local,scale-<name>`; `scenario.sh` does this from
+`SCENARIO_SCALE`):
+
+| `SCENARIO_SCALE` | participants | takers | arb bots | makers | assets / pools | maker capital |
+| ---------------- | ------------ | ------ | -------- | ------ | -------------- | ------------- |
+| (unset)          | 17           | 4      | 1        | 12     | 3 / 7          | ×1            |
+| `x10`            | 170          | 140    | 6        | 24     | 3 / 7          | ×3            |
+| `x100`           | 1700         | 1650   | 14       | 36     | 3 / 7          | ×10           |
+| `assets`         | 1756         | 1650   | 14       | 92     | 11 / 39        | ×10           |
+
+Takers keep the base 5 trades/min each, so offered load scales with them.
+The asset scale adds BONK, WIF, PYTH, JTO, ORCA, RENDER, W, TNSR (Binance
+feeds; mainnet metadata via `bootstrap/scenario/tokens-assets.json`), each
+on all three venues against USDC plus an Orca pool against JUP; it needs
+`KEYPAIR_TOKEN_<NAME>_MINT` / `PUBKEY_TOKEN_<NAME>_MINT` and
+`SCENARIO_TOKENS_CONFIG=bootstrap/scenario/tokens-assets.json`.
+
+`scale.py scale-x10` regenerates only the named overlays. Prices come from
+Binance at generation time; where it is unreachable or geo-blocked, pass
+them in: `SCALE_PRICES='{"JUP": "0.32", "RAY": "1.84"}'`.
+
+Measure a scale (10 minutes; writes `.scenario/runs/<name>-{t0,t1,load,report}.json`):
+
+```sh
+NO_DNA=1 just scenario-surfpool-offline        # fresh chain per scale (no testnet fallback)
+SCENARIO_SCALE=x10 just scenario-dev           # deploy + up
+SCENARIO_SCALE=x10 bootstrap/scenario/scenario.sh measure x10 600   # or: just scenario-measure dev local x10 600 x10
+python3 -I bootstrap/scenario/summarize.py .scenario/runs x1 x10 x100 assets
+```
+
+Always start Surfpool with `--disable-instruction-profiling` (both
+`scenario-surfpool*` recipes do; `--ci` also implies it). With profiling on,
+Surfpool pins one core and its memory grows with history: at x10 it lands
+4.3 TPS instead of 13 (RPC p95 7.4 s instead of 1 ms), and the x100
+bootstrap crawls at ~2 TPS.
+
+`measure` freezes flow, arb, and mm (`SIGSTOP`) while each snapshot reads,
+so every wallet, seat, and position is read in one chain state; without it,
+heavy flow moves value between participants mid-read and PnL stops summing
+to (minus) the protocol fees. Before each snapshot it waits
+`SCENARIO_SETTLE_S` for in-flight transactions to land: 3 s locally, 90 s on
+testnet, where the RPC node rebroadcasts until the blockhash expires. They
+stay frozen through the report, whose block scan would otherwise compete
+with flow for connections. `sample.py` records per-service CPU/RSS (from
+`.scenario/pids`), machine CPU, validator TPS (`getTransactionCount`), slot
+rate, and RPC latency; against a shared cluster that TPS is network-wide
+(`tpsScope`), so use the report's per-participant counts there. The report
+counts transactions from the window's blocks. Use the offline
+Surfpool for scale runs: the forking one fetches every missing account
+(uninitialized tick arrays, never-funded ATAs) from testnet, which turns
+snapshot loads into multi-second stalls.
+
 ## Doppler variables
 
 | Variable                                                                                                                                                     | Used by                                                                                                            |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `KEYPAIR_TOKEN_{BONK,WIF,PYTH,JTO,ORCA,RENDER,W,TNSR}_MINT`, `PUBKEY_TOKEN_*_MINT` **(new, asset scale only)**                                               | mint keypairs for the added assets                                                                                 |
 | `SCENARIO_SEED` **(new)**                                                                                                                                    | secret all maker/arb/taker wallets derive from (`prd` required; `dev` optional — the local profile has a dev seed) |
 | `KEYPAIR_ORCA_WHIRLPOOL`, `KEYPAIR_ORCA_WHIRLPOOLS_CONFIG`, `KEYPAIR_MANIFEST`                                                                               | from the DEX branches                                                                                              |
 | `KEYPAIR_RAYDIUM_CLMM`, `KEYPAIR_FAUCET`, `KEYPAIR_PROGRAM_AUTHORITY`, `KEYPAIR_TOKEN_*`, `PUBKEY_TOKEN_*_MINT`, `PUBKEY_FAUCET`, `PUBKEY_PROGRAM_AUTHORITY` | existing                                                                                                           |
