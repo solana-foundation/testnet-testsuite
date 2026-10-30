@@ -1133,6 +1133,7 @@ dependencies = [
  "reqwest 0.13.1",
  "rusqlite",
  "rustls",
+ "scenario-spec",
  "serde",
  "serde_json",
  "tokio",
@@ -1145,6 +1146,7 @@ name = "control-client"
 version = "0.1.0"
 dependencies = [
  "chain-watch-client",
+ "scenario-spec",
  "serde",
  "serde_json",
 ]
@@ -4055,6 +4057,7 @@ dependencies = [
  "reqwest 0.13.1",
  "rust_decimal",
  "rustls",
+ "scenario-spec",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4069,6 +4072,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "scenario-spec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mtm-scenario",
+ "reqwest 0.13.1",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "toml 0.8.23",
 ]
 
 [[package]]

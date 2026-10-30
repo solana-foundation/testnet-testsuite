@@ -233,3 +233,123 @@ export async function queryInstant(
     value: Number(r.value[1]),
   }));
 }
+
+// --- Compose (crates/scenario-spec through control) --------------------------
+
+export const VENUES = ["manifest", "orca-whirlpool", "raydium-clmm"] as const;
+export type Venue = (typeof VENUES)[number];
+
+export interface Spec {
+  /** Assets besides USDC (catalog names). */
+  tokens: string[];
+  /** Venues every <token>/USDC pair is listed on. */
+  venues: Venue[];
+  /** Extra Orca pools between two non-USDC tokens. */
+  crosses: [string, string][];
+  makers: {
+    ladders: number;
+    ranges: number;
+    pool_arbs: number;
+    thin_tokens: string[];
+    /** Decimal string; null sizes it to the flow. */
+    capital: string | null;
+  };
+  takers: {
+    count: number;
+    trades_per_min: number;
+    median_usd: number;
+    sigma: number;
+    large_probability: number;
+    large_multiplier: number;
+    exact_out_probability: number;
+    slippage_bps: number;
+    sol: string | null;
+  };
+  arb: { bots: number };
+}
+
+export interface NamedSpec {
+  name: string;
+  spec: Spec;
+}
+
+export interface Chain {
+  name: string;
+  slot_ms: number;
+  block_cu_limit: number;
+  account_cu_limit: number;
+  host_cu_per_s: number | null;
+  shared: boolean;
+}
+
+export type Calibration = Record<string, unknown>;
+
+export interface ComposeInfo {
+  presets: NamedSpec[];
+  overlays: NamedSpec[];
+  catalog: string[];
+  chains: Chain[];
+  calibration: Calibration;
+}
+
+export type Limit = "host" | "block" | "account";
+
+export interface Estimate {
+  chain: Chain;
+  takers: number;
+  makers: number;
+  bots: number;
+  participants: number;
+  pools: number;
+  capital: string;
+  offered_swaps_per_s: number;
+  trade_seconds: number;
+  taker_tx_per_s: number;
+  maker_tx_per_s: number;
+  arb_tx_per_s: number;
+  tps: number;
+  tps_capped: number;
+  cu_per_s: number;
+  cu_per_block: number;
+  headroom: { limit: Limit; utilisation: number; detail: string }[];
+  bottleneck: Limit | null;
+  venues: { venue: Venue; legs_per_s: number; share: number }[];
+  hottest: { pool: string; legs_per_s: number; cu_per_block: number }[];
+  bootstrap: { transactions: number; seconds: number };
+  sol: { fees_per_hour: number; rent: number; float: number };
+  warnings: string[];
+}
+
+export interface EstimateResponse {
+  error: string | null;
+  estimate: Estimate;
+  name: string;
+  target_takers: number | null;
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return (await (await check(response)).json()) as T;
+}
+
+export function estimateSpec(
+  spec: Spec,
+  chain: Chain,
+  targetTps: number | null,
+): Promise<EstimateResponse> {
+  return postJson("/api/compose/estimate", {
+    spec,
+    chain,
+    target_tps: targetTps,
+  });
+}
+
+export function composeSpec(
+  spec: Spec,
+): Promise<{ name: string; created: boolean }> {
+  return postJson("/api/compose", { spec });
+}

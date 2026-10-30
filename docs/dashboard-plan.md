@@ -263,6 +263,27 @@ Later the supervisor moves into control (the review already asks for one
 stop-with-escalation supervisor; scenario.sh's `stop()` is the template),
 and scenario.sh becomes a thin CLI over the control API.
 
+### Compose (built)
+
+The Control tab opens with a Compose panel: start from a preset or an
+existing overlay, then choose the tokens (the 11-token catalog), the
+venues per `<token>/USDC` pair, Orca cross pools, makers per pool by kind,
+maker capital (or sized to the flow), takers with their trade rate and
+sizes, and arb bots. Each change re-runs the estimate
+(`POST /api/compose/estimate`, crates/scenario-spec): expected tx/s by
+actor, compute per block, headroom against this host's execution rate, the
+block limit and the busiest pool's account limit, the venue split, the
+bootstrap size and SOL needs. A target tx/s sizes the takers. "Write
+overlay" (`POST /api/compose`) renders and checks
+`config/scale-<preset or c-hash>.toml`; "Write and run up" also starts `up`
+with it. An existing overlay is never rewritten.
+
+Not yet: targeting a share of transactions per venue. Today the split is
+emergent (the router takes the best price) and the estimate uses shares
+calibrated from the x1500 runs. Targeting would make those shares a spec
+input and need the flow to steer routes, e.g. a per-trade venue
+restriction passed to the router.
+
 ### Live knobs
 
 Today config is read once. Each long-running service gets a loopback admin

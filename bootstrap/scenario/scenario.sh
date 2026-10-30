@@ -18,11 +18,13 @@
 #   scenario.sh measure NAME SECONDS [local|devnet|testnet] snapshot → sample load → snapshot → report
 #                                       into .scenario/runs/NAME-{t0,t1,load,report}.json
 #
-# SCENARIO_SCALE=x10|x100|assets|x200|x500|x750|x1000|x2000 layers config/scale-<scale>.toml (generated
-# by scale.py) over the profile; `up` records it in .scenario/scale, and later
-# commands use that unless SCENARIO_SCALE names it (a different one is
-# refused). SCENARIO_TOKENS_CONFIG picks the token bootstrap config (the
-# asset scale uses bootstrap/scenario/tokens-assets.json).
+# SCENARIO_SCALE=<name> layers config/scale-<name>.toml over the profile: a
+# preset (x10|x100|assets|x200|x500|x750|x1000|x1500|x2000) or a composed
+# spec (c-<hash>), both written by `scenario overlay`. `up` records it in
+# .scenario/scale, and later commands use that unless SCENARIO_SCALE names it
+# (a different one is refused). SCENARIO_TOKENS_CONFIG picks the token
+# bootstrap config; an overlay that lists its own tokens defaults it to
+# bootstrap/scenario/tokens-assets.json.
 #   scenario.sh down                    stop every service started by `up`/`observe`
 #                                       (TERM, then KILL after 30 s)
 #   scenario.sh teardown [local|devnet|testnet]  stop the scenario services, unwind every
@@ -105,7 +107,15 @@ elif [[ "$cmd" =~ ^(bootstrap|status|snapshot|report|measure|teardown)$ && -f "$
     exit 2
   fi
 fi
-[[ -n "${SCENARIO_SCALE:-}" ]] && export MTM_PROFILE="$MTM_PROFILE,scale-$SCENARIO_SCALE"
+if [[ -n "${SCENARIO_SCALE:-}" ]]; then
+  overlay="config/scale-$SCENARIO_SCALE.toml"
+  # The config loader skips a missing profile file: a typo would run the base profile.
+  [[ -f "$overlay" ]] || { echo "no overlay $overlay (scenario overlay writes it)" >&2; exit 2; }
+  export MTM_PROFILE="$MTM_PROFILE,scale-$SCENARIO_SCALE"
+  if grep -q '^\[\[scenario\.tokens\]\]' "$overlay"; then
+    : "${SCENARIO_TOKENS_CONFIG:=bootstrap/scenario/tokens-assets.json}"
+  fi
+fi
 export MTM_RPC__HTTP_URL="$rpc"
 if [[ -n "${SCENARIO_WS_URL:-}" ]]; then
   export MTM_RPC__WS_URL="$SCENARIO_WS_URL"

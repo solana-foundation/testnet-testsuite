@@ -22,6 +22,7 @@ members = [
     "crates/raydium-clmm-client",
     "crates/raydium-clmm-orchestrator",
     "crates/router-client",
+    "crates/scenario-spec",
     "crates/sdks/manifest",
     "services/flow",
     "services/manifest-dex-orchestrator",
@@ -61,6 +62,7 @@ orca-whirlpool-orchestrator = { path = "crates/orca-whirlpool-orchestrator" }
 raydium-clmm-client = { path = "crates/raydium-clmm-client" }
 raydium-clmm-orchestrator = { path = "crates/raydium-clmm-orchestrator" }
 router-client = { path = "crates/router-client" }
+scenario-spec = { path = "crates/scenario-spec" }
 
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net"] }
 futures = "0.3"
@@ -90,6 +92,7 @@ solana-program-error = "3"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 solana-rpc-client = "4.2.1"
 solana-commitment-config = "3"
 solana-compute-budget-interface = "3"
