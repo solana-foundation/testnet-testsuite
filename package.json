@@ -7,7 +7,7 @@
     "bootstrap:tokens:local": "tsx bootstrap/tokens/deploy.ts --mainnet-rpc http://localhost:8899 --testnet-rpc http://localhost:7899",
     "surfpool:mainnet": "surfpool start",
     "surfpool:testnet": "surfpool start --rpc-url https://api.testnet.solana.com --port 7899 --ws-port 7900",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit && pnpm --filter dashboard run check"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.14",

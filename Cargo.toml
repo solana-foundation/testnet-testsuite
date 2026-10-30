@@ -2,6 +2,10 @@
 resolver = "2"
 members = [
     "services/arb",
+    "services/chain-watch",
+    "services/control",
+    "crates/control-client",
+    "crates/chain-watch-client",
     "crates/janitor-interface",
     "crates/mtm-chain",
     "crates/mtm-common",
@@ -38,6 +42,8 @@ rust-version = "1.97"
 publish = false
 
 [workspace.dependencies]
+chain-watch-client = { path = "crates/chain-watch-client" }
+control-client = { path = "crates/control-client" }
 janitor-interface = { path = "crates/janitor-interface" }
 mtm-chain = { path = "crates/mtm-chain" }
 mtm-common = { path = "crates/mtm-common" }
@@ -114,6 +120,12 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 figment = { version = "0.10", features = ["toml", "env"] }
 dotenvy = "0.15"
+# chain-watch: feature-gate descriptions (same 4.x major as the Agave CLI),
+# the per-run store, raw-block compression, compute-budget instruction data
+agave-feature-set = "4.3"
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+zstd = "0.13"
+bs58 = "0.5"
 clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]

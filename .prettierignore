@@ -3,3 +3,5 @@ crates/sdks/*/idl/
 codegen/pnpm-lock.yaml
 # solana-keygen keypair files
 programs/*/tests/fixtures/*.json
+# Built dashboard bundle
+apps/dashboard/dist/

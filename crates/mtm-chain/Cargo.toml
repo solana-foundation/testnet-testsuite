@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+metrics = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-compute-budget-interface = { workspace = true }

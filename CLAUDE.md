@@ -17,6 +17,9 @@ teardown janitor in `programs/janitor` (Pyth pull oracle instead of a custom one
 - `just scenario-dev` / `scenario-testnet` / `scenario-down` — market-making scenario
   (oracle + router + mm + flow + Prometheus/Grafana; bootstrap/scenario/README.md).
   Scenario ports: oracle 8180, router 8181, metrics 9180-9183, Prometheus 9190, Grafana 3100
+- `just control-dev` / `control-testnet` + `just dashboard-build` — the dashboard
+  (services/control on 8182 serving apps/dashboard; chain-watch API 8183, metrics
+  9185; docs/dashboard-plan.md). `just scenario-watch-*` runs chain-watch alone
 
 ## Architecture rules
 

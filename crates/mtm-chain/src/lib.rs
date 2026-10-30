@@ -1,6 +1,7 @@
 //! Off-chain Solana toolkit shared by every service that touches the chain.
 
 pub mod keys;
+pub mod tag;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -133,7 +134,24 @@ impl ChainClient {
     ///
     /// Transport retries reuse the exact signed bytes. Once the transaction may
     /// have reached a validator, this method never refreshes its blockhash.
+    /// Counted in `chain_tx_*` under the current [`tag`].
     pub async fn submit(
+        &self,
+        instructions: Vec<Instruction>,
+        payer: &dyn Signer,
+        additional_signers: &[&dyn Signer],
+        config: SubmissionConfig,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let started = Instant::now();
+        tag::record_submitted(tag::Path::Submit);
+        let result = self
+            .submit_inner(instructions, payer, additional_signers, config)
+            .await;
+        tag::record_outcome(&result, started.elapsed());
+        result
+    }
+
+    async fn submit_inner(
         &self,
         mut instructions: Vec<Instruction>,
         payer: &dyn Signer,
@@ -210,6 +228,7 @@ impl ChainClient {
                 }
                 Err(error) if is_transport_error(error.kind()) && attempt < attempts => {
                     warn!(attempt, %signature, error = %error, "transaction transport retry");
+                    tag::record_retry();
                     sleep(Duration::from_millis(200 * attempt as u64)).await;
                 }
                 Err(error) if is_transport_error(error.kind()) => {
@@ -278,8 +297,20 @@ impl ChainClient {
     /// [`SubmissionError::Execution`], expiry [`SubmissionError::Expired`],
     /// and an unknown status [`SubmissionError::AmbiguousConfirmation`]. A
     /// lost send response is not an error by itself: the status poll
-    /// decides.
+    /// decides. Counted in `chain_tx_*` under the current [`tag`].
     pub async fn send_versioned(
+        &self,
+        transaction: &VersionedTransaction,
+        config: VersionedSendConfig,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let started = Instant::now();
+        tag::record_submitted(tag::Path::Versioned);
+        let result = self.send_versioned_inner(transaction, config).await;
+        tag::record_outcome(&result, started.elapsed());
+        result
+    }
+
+    async fn send_versioned_inner(
         &self,
         transaction: &VersionedTransaction,
         config: VersionedSendConfig,

@@ -102,8 +102,9 @@ just scenario-down                   # stop services (Surfpool state is in memor
 
 Grafana: <http://127.0.0.1:3100> (admin/admin), dashboard **mtm — market-making
 scenario**. Prometheus: <http://127.0.0.1:9190>. Logs: `.scenario/logs/`.
-Scenario ports (oracle 8180, router 8181, metrics 9180–9184, Prometheus 9190,
-Grafana 3100) are chosen so the default `just up` stack can run alongside.
+Scenario ports (oracle 8180, router 8181, chain-watch 8183, metrics
+9180–9185, node-exporter 9186, Prometheus 9190, Grafana 3100) are chosen so the
+default `just up` stack can run alongside.
 
 `just scenario-observe` uses `ops/compose.scenario.yaml` when Docker is usable
 and otherwise runs `prometheus` and `grafana` binaries from `PATH` as the
@@ -120,6 +121,62 @@ NO_DNA=1 just scenario-status-testnet
 The testnet profile slows every maker 5× and flow to 4 trades/min for the
 public RPC; set `SCENARIO_RPC_URL` (and `SCENARIO_WS_URL`) to a dedicated
 endpoint for sustained runs. `SCENARIO_SEED` is mandatory there.
+
+### The dashboard (control)
+
+```sh
+just dashboard-build          # once (and after UI changes)
+NO_DNA=1 just control-dev     # or control-testnet / control-devnet
+# → http://127.0.0.1:8182
+```
+
+`services/control` serves `apps/dashboard` and runs `scenario.sh` against the
+target that matches its Doppler config (one job at a time; `down`, `deploy`
+and `teardown` ask for the command name again). Overview: live slot strip,
+event timeline (feature gates, epochs, versions, jobs), charts, failure
+tables; Feature gates; Control: commands, processes and their logs, job
+output. It needs chain-watch (started by `up` or `watch`) and Prometheus
+(`observe`) for the charts. Loopback only: there is no auth yet.
+`just dashboard-dev` runs the UI with hot reload on :5173 against a running
+control.
+
+To reach it from your other devices, publish it on your tailnet (HTTPS,
+tailnet members only; control itself stays on loopback):
+
+```sh
+tailscale serve --bg --https=8443 http://127.0.0.1:8182   # https://<host>.<tailnet>.ts.net:8443
+tailscale serve --https=8443 off                          # stop publishing
+```
+
+Everyone on the tailnet can then use the Control tab (run and cancel jobs):
+publish only on a tailnet you alone use until the API has auth.
+
+### Watching the cluster (chain-watch)
+
+`up` starts `services/chain-watch` before the bootstrap, and `scenario.sh
+watch <target>` (`just scenario-watch-testnet`) starts it alone. It follows
+every slot at `confirmed` — produced or skipped, with the leader's client and
+version — fetches each block, and records cluster TPS, block compute, priority
+prices, stake by client and version, epochs, and every feature gate (with its
+activation slot, including ones activated long before the run). Transactions
+paid by a scenario wallet (or `PUBKEY_FAUCET` / `PUBKEY_PROGRAM_AUTHORITY`)
+are ours: their outcome, error, failing program, CU and fees are kept.
+
+- Metrics: `chain_*` on :9185 (Grafana rows "Cluster", "Our transactions").
+- Run store: `.scenario/runs/<run id>/run.db` (SQLite: `slots`, `txs`,
+  `features`, `events`, `cluster_versions`), and raw blocks holding one of our
+  failed transactions in `blocks/<slot>.json.zst` (`raw_blocks`: off | failed
+  | ours | all; `ours` is every block at scale, about 4 GB/h at x1000); never
+  pruned automatically.
+  `SCENARIO_RUN_ID` names the run (default `<target>-<UTC time>`).
+- API on :8183: `/health`, `/features`, `/events?after=<id>`,
+  `/slots?from=&to=` (types in `crates/chain-watch-client`).
+
+Full blocks at testnet's 5 slots/s need the dedicated provider: against a
+public endpoint chain-watch falls back to account-level blocks (no CU or
+priority prices) and says so at startup. It uses `SCENARIO_RPC_URL` unless
+`CHAIN_WATCH_RPC_URL` is set (same key is fine; a second key keeps the
+observer from being throttled by the scenario's own traffic).
 
 ### Devnet
 
@@ -154,7 +211,8 @@ Doppler `devnet` config — required:
 | `SCENARIO_SEED`                                                                                      | every maker / arb / taker wallet derives from it (no dev seed outside local)         |
 
 Optional: `SCENARIO_RPC_URL` / `SCENARIO_WS_URL` (a dedicated devnet RPC;
-the public one rate-limits sustained runs), `SCENARIO_MAINNET_RPC` (token
+the public one rate-limits sustained runs), `CHAIN_WATCH_RPC_URL` /
+`CHAIN_WATCH_WS_URL` (chain-watch's own endpoint), `SCENARIO_MAINNET_RPC` (token
 metadata source), `PUBKEY_JUPITER_FORK`, `GRAFANA_PASSWORD`. Not Doppler:
 the fork artifact paths (`SCENARIO_{RAYDIUM,ORCA,MANIFEST}_SO`) and the
 teardown switches above.
@@ -496,31 +554,42 @@ open, so the asset scale (39 pools) locks proportionally more.
 | Variable                                                                                                                                                     | Used by                                                                                                            |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
 | `KEYPAIR_TOKEN_{BONK,WIF,PYTH,JTO,ORCA,RENDER,W,TNSR}_MINT`, `PUBKEY_TOKEN_*_MINT` **(new, asset scale only)**                                               | mint keypairs for the added assets                                                                                 |
+| `SCENARIO_RPC_URL`, `SCENARIO_WS_URL` **(new, optional)**                                                                                                    | dedicated RPC for the scenario (Helius, key in the URL); the WS URL defaults to the HTTP one with `wss`            |
+| `CHAIN_WATCH_RPC_URL`, `CHAIN_WATCH_WS_URL` **(new, optional)**                                                                                              | chain-watch's own endpoint; unset, it shares `SCENARIO_RPC_URL`                                                    |
 | `SCENARIO_SEED` **(new)**                                                                                                                                    | secret all maker/arb/taker wallets derive from (`prd` required; `dev` optional — the local profile has a dev seed) |
 | `KEYPAIR_ORCA_WHIRLPOOL`, `KEYPAIR_ORCA_WHIRLPOOLS_CONFIG`, `KEYPAIR_MANIFEST`                                                                               | from the DEX branches                                                                                              |
 | `KEYPAIR_RAYDIUM_CLMM`, `KEYPAIR_FAUCET`, `KEYPAIR_PROGRAM_AUTHORITY`, `KEYPAIR_TOKEN_*`, `PUBKEY_TOKEN_*_MINT`, `PUBKEY_FAUCET`, `PUBKEY_PROGRAM_AUTHORITY` | existing                                                                                                           |
 
 ## Metrics
 
-| Metric                                                                                         | Labels                      | Meaning                                                                                                        |
-| ---------------------------------------------------------------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `mm_oracle_price`                                                                              | pair                        | oracle pair price the makers use                                                                               |
-| `mm_venue_price`, `mm_deviation_bps`                                                           | maker, venue                | venue price and its gap to the oracle                                                                          |
-| `mm_inventory`, `mm_inventory_value_usd`                                                       | maker, token                | holdings (wallet + seat) and USD value                                                                         |
-| `mm_actions_total`                                                                             | maker, action               | requote / open / close / arb_buy / arb_sell                                                                    |
-| `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                               | maker, stage / venue        | failures (ticks retry)                                                                                         |
-| `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                              | maker                       | skew, arbitrage volume (µUSD), tick latency                                                                    |
-| `mm_hedge_micro_usd_total`, `mm_hedge_cost_micro_usd_total`                                    | maker, side                 | inventory hedged at the oracle (µUSD) and its cost                                                             |
-| `flow_swaps_total`                                                                             | pair, status, outcome, size | routed swaps landed/failed, why, normal/large                                                                  |
-| `flow_venue_swaps_total`                                                                       | venue, status, outcome      | quoted swaps' send outcomes, once per venue the route touches                                                  |
-| `flow_fee_lamports_total`, `flow_fill_read_errors_total`                                       | —                           | fees paid by takers; landed swaps with unread fills                                                            |
-| `flow_takers_alive`, `flow_taker_restarts_total`                                               | —                           | taker loops running / restarted after an error                                                                 |
-| `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                                 | pair                        | cost to uninformed flow vs oracle; landed vs quoted                                                            |
-| `flow_route_legs_total`, `flow_notional_micro_usd_total`, `flow_refills_total`                 | venue / pair                | routing mix, volume (µUSD), refills                                                                            |
-| `router_quote_seconds`, `router_quote_errors_total`, `router_quotes_total`                     | execution, status           | router latency and failures                                                                                    |
-| `oracle_price_updates_total`, `{orca_whirlpool,raydium_clmm,manifest}_actions_total`           | —                           | feed health and per-venue transactions                                                                         |
-| `arb_trades_total`                                                                             | bot, status, legs           | landed / reverted / expired / ambiguous / send_failed / below_floor / simulation_failed / quote_failed / error |
-| `arb_opportunities_total`, `arb_last_profit_usd`                                               | bot, legs, trigger          | cycles found, last realized PnL                                                                                |
-| `arb_profit_micro_usd_total`, `arb_loss_micro_usd_total`, `arb_fees_lamports_total`            | bot                         | realized gains and losses (all touched tokens), fees                                                           |
-| `arb_in_flight`                                                                                | —                           | cycles sent and not yet resolved                                                                               |
-| `arb_scans_total`, `arb_scan_seconds`, `arb_pool_updates_total`, `arb_snapshot_failures_total` | trigger / reason            | search cadence and latency, ws updates, slow reloads                                                           |
+| Metric                                                                                             | Labels                                            | Meaning                                                                                                        |
+| -------------------------------------------------------------------------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `mm_oracle_price`                                                                                  | pair                                              | oracle pair price the makers use                                                                               |
+| `mm_venue_price`, `mm_deviation_bps`                                                               | maker, venue                                      | venue price and its gap to the oracle                                                                          |
+| `mm_inventory`, `mm_inventory_value_usd`                                                           | maker, token                                      | holdings (wallet + seat) and USD value                                                                         |
+| `mm_actions_total`                                                                                 | maker, action                                     | requote / open / close / arb_buy / arb_sell                                                                    |
+| `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                                   | maker, stage / venue                              | failures (ticks retry)                                                                                         |
+| `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                                  | maker                                             | skew, arbitrage volume (µUSD), tick latency                                                                    |
+| `mm_hedge_micro_usd_total`, `mm_hedge_cost_micro_usd_total`                                        | maker, side                                       | inventory hedged at the oracle (µUSD) and its cost                                                             |
+| `flow_swaps_total`                                                                                 | pair, status, outcome, size                       | routed swaps landed/failed, why, normal/large                                                                  |
+| `flow_venue_swaps_total`                                                                           | venue, status, outcome                            | quoted swaps' send outcomes, once per venue the route touches                                                  |
+| `flow_fee_lamports_total`, `flow_fill_read_errors_total`                                           | —                                                 | fees paid by takers; landed swaps with unread fills                                                            |
+| `flow_takers_alive`, `flow_taker_restarts_total`                                                   | —                                                 | taker loops running / restarted after an error                                                                 |
+| `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                                     | pair                                              | cost to uninformed flow vs oracle; landed vs quoted                                                            |
+| `flow_route_legs_total`, `flow_notional_micro_usd_total`, `flow_refills_total`                     | venue / pair                                      | routing mix, volume (µUSD), refills                                                                            |
+| `router_quote_seconds`, `router_quote_errors_total`, `router_quotes_total`                         | execution, status                                 | router latency and failures                                                                                    |
+| `oracle_price_updates_total`, `{orca_whirlpool,raydium_clmm,manifest}_actions_total`               | —                                                 | feed health and per-venue transactions                                                                         |
+| `arb_trades_total`                                                                                 | bot, status, legs                                 | landed / reverted / expired / ambiguous / send_failed / below_floor / simulation_failed / quote_failed / error |
+| `arb_opportunities_total`, `arb_last_profit_usd`                                                   | bot, legs, trigger                                | cycles found, last realized PnL                                                                                |
+| `arb_profit_micro_usd_total`, `arb_loss_micro_usd_total`, `arb_fees_lamports_total`                | bot                                               | realized gains and losses (all touched tokens), fees                                                           |
+| `arb_in_flight`                                                                                    | —                                                 | cycles sent and not yet resolved                                                                               |
+| `arb_scans_total`, `arb_scan_seconds`, `arb_pool_updates_total`, `arb_snapshot_failures_total`     | trigger / reason                                  | search cadence and latency, ws updates, slow reloads                                                           |
+| `chain_slot`, `chain_slot_interval_seconds`, `chain_epoch`, `chain_epoch_progress`                 | commitment                                        | tips per commitment, slot pacing (ws), epoch (chain-watch)                                                     |
+| `chain_slots_total`                                                                                | status, leader_client                             | produced / skipped / unavailable slots per producing client                                                    |
+| `chain_block_transactions_total`, `chain_block_failed_transactions_total`, `chain_perf_tps`        | kind                                              | cluster transactions from every block (vote / non_vote); the node's 60 s samples                               |
+| `chain_block_cu`, `chain_block_cost_units`, `chain_prio_price_micro_lamports`                      | scope                                             | per-block compute and cost; priority prices (all / ours)                                                       |
+| `chain_stake_ratio`, `chain_stake_by_version_ratio`, `chain_nodes`, `chain_delinquent_stake_ratio` | client / version                                  | who holds the stake                                                                                            |
+| `chain_feature_active`, `chain_feature_activation_slot`, `chain_features`                          | feature, description, state                       | feature gates on chain (pending: active = 0)                                                                   |
+| `chain_ours_transactions_total`, `chain_ours_cu`, `chain_ours_fees_lamports_total`                 | actor_kind, program, status, error, error_program | our transactions as landed on chain                                                                            |
+| `chain_tx_submitted_total`, `chain_tx_outcome_total`, `chain_tx_settle_seconds`                    | actor, action, venue, outcome, error              | every service's sends, labelled at the source (`mtm_chain::tag`)                                               |
+| `chain_rpc_seconds`, `chain_rpc_errors_total`, `chain_block_lag_slots`                             | method, kind                                      | chain-watch's RPC health and how far it trails the tip                                                         |

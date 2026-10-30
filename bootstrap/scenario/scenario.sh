@@ -7,6 +7,12 @@
 #   scenario.sh status [local|devnet|testnet]  pools, wallets, processes
 #   scenario.sh observe                 Prometheus :9190 + Grafana :3100 (dashboard
 #                                       "mtm — market-making scenario")
+#   scenario.sh watch [local|devnet|testnet]  chain-watch alone (API :8183, metrics :9185):
+#                                       slots, blocks, versions, feature gates into
+#                                       .scenario/runs/<run id>/run.db. `up` starts it too.
+#                                       CHAIN_WATCH_RPC_URL / CHAIN_WATCH_WS_URL (Doppler)
+#                                       override the scenario RPC for it; SCENARIO_RUN_ID
+#                                       names the run (default <target>-<UTC time>).
 #   scenario.sh snapshot FILE [local|devnet|testnet]   participant holdings at oracle prices
 #   scenario.sh report START END [local|devnet|testnet] PnL, transactions, trades between snapshots
 #   scenario.sh measure NAME SECONDS [local|devnet|testnet] snapshot → sample load → snapshot → report
@@ -40,7 +46,7 @@
 # topped up to their targets.
 set -euo pipefail
 
-usage() { echo "usage: $0 {deploy|up|bootstrap|observe|status|down} [local|devnet|testnet]" \
+usage() { echo "usage: $0 {deploy|up|bootstrap|observe|watch|status|down} [local|devnet|testnet]" \
   "| snapshot FILE [target] | report START END [target] | measure NAME SECONDS [target]" >&2; exit 2; }
 is_target() { [[ "$1" == local || "$1" == devnet || "$1" == testnet ]]; }
 
@@ -110,6 +116,16 @@ elif [[ "$target" == local ]]; then
   echo "cannot derive the websocket URL from $rpc: set SCENARIO_WS_URL" >&2; exit 2
 else
   export MTM_RPC__WS_URL="${rpc/https/wss}"
+fi
+
+# chain-watch observes through its own endpoint when Doppler sets one (the
+# provider's key is in the URL); otherwise it shares the scenario's.
+if [[ -n "${CHAIN_WATCH_RPC_URL:-}" ]]; then
+  export MTM_CHAIN_WATCH__RPC__HTTP_URL="$CHAIN_WATCH_RPC_URL"
+  watch_ws="${CHAIN_WATCH_RPC_URL/https/wss}"
+  export MTM_CHAIN_WATCH__RPC__WS_URL="${CHAIN_WATCH_WS_URL:-${watch_ws/http/ws}}"
+elif [[ -n "${CHAIN_WATCH_WS_URL:-}" ]]; then
+  export MTM_CHAIN_WATCH__RPC__WS_URL="$CHAIN_WATCH_WS_URL"
 fi
 
 bin="${CARGO_TARGET_DIR:-$root/target}/${SCENARIO_BUILD:-release}"
@@ -186,7 +202,14 @@ require_agave_cli() { # deploys need an Agave >= 4.x CLI (Manifest is SBPF v3)
 }
 
 build() {
-  cargo build -q $build_flag -p oracle -p router -p mm -p flow -p arb -p scenario
+  cargo build -q $build_flag -p oracle -p router -p mm -p flow -p arb -p scenario -p chain-watch
+}
+
+watch() { # start chain-watch first, so the run store covers bootstrap too
+  running chain-watch && { echo "chain-watch already running (pid $(cat "$state/pids/chain-watch"))"; return; }
+  MTM_CHAIN_WATCH__RUN_ID="${SCENARIO_RUN_ID:-$target-$(date -u +%Y%m%dT%H%M%SZ)}" \
+    start chain-watch "$bin/chain-watch"
+  wait_http http://127.0.0.1:8183/health chain-watch
 }
 
 tokens() {
@@ -320,7 +343,11 @@ observe() {
   command -v prometheus >/dev/null && command -v grafana >/dev/null || {
     echo "need docker (or prometheus + grafana binaries on PATH) for observability" >&2; exit 1; }
   start prometheus prometheus --config.file="$root/ops/prometheus.scenario.yml" \
-    --web.listen-address=127.0.0.1:9190 --storage.tsdb.path="$state/prometheus"
+    --web.listen-address=127.0.0.1:9190 --storage.tsdb.path="$state/prometheus" \
+    --storage.tsdb.retention.time=90d
+  if command -v node_exporter >/dev/null; then
+    start node_exporter node_exporter --web.listen-address=127.0.0.1:9186
+  fi
   local prov="$state/grafana/provisioning"
   mkdir -p "$prov/datasources" "$prov/dashboards" "$state/grafana/data"
   cp "$root/ops/grafana/scenario/datasources.yml" "$prov/datasources/"
@@ -339,11 +366,16 @@ case "$cmd" in
   observe)
     observe
     ;;
+  watch)
+    cargo build -q $build_flag -p chain-watch
+    watch
+    ;;
   deploy)
     deploy
     ;;
   up)
     build
+    watch
     tokens
     start oracle "$bin/oracle"
     wait_http http://127.0.0.1:8180/health oracle
@@ -357,7 +389,7 @@ case "$cmd" in
     sleep "${SCENARIO_WARMUP_S:-20}"
     start flow "$bin/flow"
     start arb "$bin/arb"
-    echo "scenario up — oracle :8180, router :8181; metrics :9180-9184"
+    echo "scenario up — oracle :8180, router :8181, chain-watch :8183; metrics :9180-9185"
     ;;
   bootstrap)
     build
@@ -460,7 +492,8 @@ case "$cmd" in
     ;;
   down)
     # Takers first, so nothing trades against makers that are unwinding.
-    for name in arb flow mm router oracle grafana prometheus; do
+    # chain-watch after the participants: it records their last transactions.
+    for name in arb flow mm router oracle chain-watch grafana prometheus node_exporter; do
       if [[ -f "$state/pids/$name" ]]; then stop "$name"; fi
     done
     compose="${MTM_COMPOSE:-docker compose}"
@@ -469,5 +502,5 @@ case "$cmd" in
       $compose -f ops/compose.scenario.yaml down # volumes are kept
     fi
     ;;
-  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|snapshot|report|measure|teardown|down)" >&2; exit 2 ;;
+  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|watch|status|snapshot|report|measure|teardown|down)" >&2; exit 2 ;;
 esac
