@@ -3881,6 +3881,7 @@ name = "scenario"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "futures",
  "manifest-dex-client",
@@ -3900,7 +3901,12 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "solana-commitment-config",
+ "solana-compute-budget-interface",
+ "solana-instruction 3.5.1",
+ "solana-keypair",
+ "solana-message 4.6.0",
  "solana-pubkey 4.4.0",
  "solana-signer 3.0.1",
  "thiserror 2.0.21",

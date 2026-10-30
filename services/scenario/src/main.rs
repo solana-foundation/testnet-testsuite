@@ -11,6 +11,7 @@
 
 mod pnl;
 mod rpc;
+mod teardown;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,6 +60,9 @@ enum Command {
     },
     /// Print every scenario pool and wallet with its balances.
     Status,
+    /// Resolve the scenario (seed, program ids, mints) and change nothing:
+    /// the preflight for commands that must not fail halfway.
+    Check,
     /// Wait until the oracle has a fresh price for every scenario token
     /// (pools are created at oracle prices).
     WaitPrices {
@@ -84,6 +88,41 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         compute_sample_every: u64,
     },
+    /// Unwind every participant (LP positions, Manifest orders and seats),
+    /// burn its scenario tokens, close its token accounts, and sweep its SOL
+    /// to the faucet. Stop the services first. Idempotent.
+    Teardown {
+        #[arg(long, default_value = "KEYPAIR_FAUCET")]
+        faucet_keypair_env: String,
+        /// Also sweep the operator wallets (`--operator-env`) into the faucet.
+        #[arg(long)]
+        operators: bool,
+        #[arg(long = "operator-env", default_values_t = OPERATOR_ENVS.map(String::from))]
+        operator_envs: Vec<String>,
+    },
+    /// Rent still locked on chain (pools, tick arrays, markets, vaults,
+    /// mints, programs) and what the participant / operator wallets hold.
+    Leftovers {
+        #[arg(long, default_value = "KEYPAIR_FAUCET")]
+        faucet_keypair_env: String,
+        #[arg(long = "operator-env", default_values_t = OPERATOR_ENVS.map(String::from))]
+        operator_envs: Vec<String>,
+    },
+}
+
+/// Operator keypairs the bootstrap funds (each is skipped when unset).
+const OPERATOR_ENVS: [&str; 4] = [
+    "KEYPAIR_PROGRAM_AUTHORITY",
+    "KEYPAIR_TOKEN_MINT_AUTHORITY",
+    "KEYPAIR_TOKEN_FREEZE_AUTHORITY",
+    "KEYPAIR_TOKEN_METADATA_AUTHORITY",
+];
+
+/// The operator keypairs that are set, labelled by variable.
+fn operator_keys(envs: &[String]) -> Vec<(String, solana_keypair::Keypair)> {
+    envs.iter()
+        .filter_map(|env| Some((env.clone(), keypair_from_environment(env).ok()?)))
+        .collect()
 }
 
 /// role, wallet, SOL target, token targets, funding mode
@@ -130,6 +169,11 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
+        Command::Check => json!({
+            "ok": true,
+            "participants": scenario.participants().len(),
+            "tokens": scenario.tokens.len(),
+        }),
         Command::WaitPrices { timeout_s } => wait_prices(&scenario, timeout_s).await?,
         Command::Snapshot { out } => {
             let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
@@ -158,6 +202,37 @@ async fn main() -> Result<()> {
                 compute_sample_every,
             )
             .await?
+        }
+        Command::Teardown {
+            faucet_keypair_env,
+            operators,
+            operator_envs,
+        } => {
+            let faucet = keypair_from_environment(&faucet_keypair_env)?.pubkey();
+            let operators = if operators {
+                operator_keys(&operator_envs)
+                    .into_iter()
+                    .filter(|(_, key)| key.pubkey() != faucet)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            teardown::teardown(&chain, &rpc, &scenario, &faucet, operators).await?
+        }
+        Command::Leftovers {
+            faucet_keypair_env,
+            operator_envs,
+        } => {
+            let mut keys = vec![(
+                faucet_keypair_env.clone(),
+                keypair_from_environment(&faucet_keypair_env)?.pubkey(),
+            )];
+            keys.extend(
+                operator_keys(&operator_envs)
+                    .into_iter()
+                    .map(|(env, key)| (env, key.pubkey())),
+            );
+            teardown::leftovers(&chain, &rpc, &scenario, &keys).await?
         }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);

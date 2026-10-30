@@ -89,6 +89,37 @@ scenario-surfpool-offline:
         surfpool start --offline --snapshot .scenario/metaplex.json --no-deploy --disable-instruction-profiling \
             --airdrop-amount 100000000000000 --airdrop "$PUBKEY_FAUCET" --airdrop "$PUBKEY_PROGRAM_AUTHORITY"'
 
+# SIMD-0500 (no new SBPF v0-v2 deploys) is active at test-validator genesis
+# but not on testnet; the Raydium and Orca forks are v0 builds, so it is
+# deactivated. The faucet is the genesis mint; run scenario-test-validator-fund next.
+# Local Agave validator (real banking stage) to compare against Surfpool; ledger on tmpfs.
+# The ledger lives in RAM when /dev/shm is writable: the default 5M-shred cap is
+# ~20 GB (~40 min at x2000); SCENARIO_TV_SHREDS lowers or raises it.
+# Short epochs: the SIMD-0525 slot-time features are active at genesis but only
+# apply from the first epoch boundary (default 432k slots, ~2 days at 400 ms).
+# 1024 slots puts the chain on 200 ms slots ~7 min in, before bootstrap ends.
+# SCENARIO_TV_CLONE_FEATURES=<rpc url> copies that cluster's feature set into genesis
+# instead, e.g. https://api.testnet.solana.com (Alpenglow on, so no vote transactions;
+# SIMD-0500 already off there). Match the cluster's Agave version (testnet: 4.4).
+scenario-test-validator:
+    test -f .scenario/metaplex.json || python3 -I bootstrap/scenario/metaplex-snapshot.py .scenario/metaplex.json
+    python3 -I bootstrap/scenario/metaplex-snapshot.py --account-dir .scenario/metaplex-accounts .scenario/metaplex.json
+    doppler run --project testnet-testsuite --config dev -- bash -c ' \
+        ledger="$([[ -w /dev/shm ]] && echo /dev/shm/mtm-test-ledger || echo .scenario/test-ledger)"; \
+        solana-test-validator --ledger "$ledger" --reset --quiet --mint "$PUBKEY_FAUCET" \
+            --account-dir .scenario/metaplex-accounts \
+            --account-index program-id spl-token-owner spl-token-mint --limit-blockstore-size "${SCENARIO_TV_SHREDS:-5000000}" \
+            --slots-per-epoch "${SCENARIO_TV_SLOTS_PER_EPOCH:-1024}" \
+            $([[ -n "${SCENARIO_TV_CLONE_FEATURES:-}" ]] \
+                && echo --clone-feature-set --url "$SCENARIO_TV_CLONE_FEATURES" \
+                || echo --deactivate-feature B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g)'
+
+# Fund the program authority on a fresh test validator (Surfpool airdrops it instead).
+scenario-test-validator-fund:
+    doppler run --project testnet-testsuite --config dev -- bash -c ' \
+        solana transfer -u http://127.0.0.1:8899 --keypair <(printf %s "$KEYPAIR_FAUCET") \
+            --allow-unfunded-recipient "$PUBKEY_PROGRAM_AUTHORITY" 100000'
+
 # Run a scenario.sh command under a Doppler config: CMD = deploy|up|bootstrap|observe|status,
 # or snapshot|report|measure with their operands in ARGS (e.g. `measure x10 600`).
 scenario-with CONFIG TARGET CMD *ARGS:
@@ -105,6 +136,8 @@ scenario-deploy-dev: (scenario-with "dev" "local" "deploy")
 scenario-up-dev: (scenario-with "dev" "local" "up")
 scenario-status-dev: (scenario-with "dev" "local" "status")
 scenario-deploy-testnet: (scenario-with "prd" "testnet" "deploy")
+scenario-teardown-dev: (scenario-with "dev" "local" "teardown")
+scenario-teardown-testnet: (scenario-with "prd" "testnet" "teardown")
 scenario-testnet: (scenario-with "prd" "testnet" "up")
 scenario-status-testnet: (scenario-with "prd" "testnet" "status")
 

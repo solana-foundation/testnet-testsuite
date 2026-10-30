@@ -12,13 +12,21 @@
 #   scenario.sh measure NAME SECONDS [local|testnet] snapshot → sample load → snapshot → report
 #                                       into .scenario/runs/NAME-{t0,t1,load,report}.json
 #
-# SCENARIO_SCALE=x10|x100|assets layers config/scale-<scale>.toml (generated
+# SCENARIO_SCALE=x10|x100|assets|x200|x500|x750|x1000|x2000 layers config/scale-<scale>.toml (generated
 # by scale.py) over the profile; `up` records it in .scenario/scale, and later
 # commands use that unless SCENARIO_SCALE names it (a different one is
 # refused). SCENARIO_TOKENS_CONFIG picks the token bootstrap config (the
 # asset scale uses bootstrap/scenario/tokens-assets.json).
 #   scenario.sh down                    stop every service started by `up`/`observe`
 #                                       (TERM, then KILL after 30 s)
+#   scenario.sh teardown [local|testnet]  stop the scenario services, unwind every
+#                                       participant, sweep all SOL to the faucet, and
+#                                       write .scenario/{teardown,leftovers}.json
+#                                       (rent still locked in pools, markets, …).
+#                                       SCENARIO_CLOSE_PROGRAMS=1 also closes the three
+#                                       DEX programs (rent to the faucet; pools become
+#                                       unusable). Operator wallets are swept too on
+#                                       local (SCENARIO_SWEEP_OPERATORS=0|1 overrides).
 #
 # Secrets come from the environment (normally `doppler run --`; see
 # bootstrap/scenario/README.md). Every step is idempotent, so `up` can be
@@ -71,7 +79,7 @@ esac
 # the recorded scale applies; a different one is refused.
 if [[ "$cmd" == up ]]; then
   printf %s "${SCENARIO_SCALE:-}" >"$state/scale"
-elif [[ "$cmd" =~ ^(bootstrap|status|snapshot|report|measure)$ && -f "$state/scale" ]]; then
+elif [[ "$cmd" =~ ^(bootstrap|status|snapshot|report|measure|teardown)$ && -f "$state/scale" ]]; then
   recorded="$(cat "$state/scale")"
   if [[ -z "${SCENARIO_SCALE+set}" ]]; then
     SCENARIO_SCALE="$recorded"
@@ -339,6 +347,47 @@ case "$cmd" in
     signal CONT
     echo "wrote $runs/$name-{t0,t1,load,report}.json"
     ;;
+  teardown)
+    # Everything the unwind needs, checked before anything is stopped: a
+    # missing secret must not leave the run half torn down.
+    missing=()
+    [[ -n "${KEYPAIR_FAUCET:-}" ]] || missing+=(KEYPAIR_FAUCET)
+    if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" == 1 ]]; then
+      [[ -n "${KEYPAIR_PROGRAM_AUTHORITY:-}" ]] || missing+=(KEYPAIR_PROGRAM_AUTHORITY)
+    fi
+    if (( ${#missing[@]} )); then
+      echo "teardown: missing ${missing[*]}; nothing was stopped" >&2; exit 1
+    fi
+    # Seed, program ids and mints, resolved exactly as the unwind will.
+    "$bin/scenario" check >/dev/null || { echo "teardown: scenario check failed; nothing was stopped" >&2; exit 1; }
+    # Wait for every participant to exit: the unwind must not race a maker
+    # that is still re-centring.
+    for name in arb flow mm router oracle; do
+      if [[ -f "$state/pids/$name" ]]; then stop "$name"; fi
+    done
+    "$bin/scenario" teardown | tee "$state/teardown.json"
+    if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" == 1 ]]; then (
+      # Same key handling as deploy: tmpfs when available, removed on any exit.
+      umask 077
+      dir=""
+      trap '[[ -n "$dir" ]] && rm -rf "$dir"' EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      if [[ -d /dev/shm && -w /dev/shm ]]; then dir="$(mktemp -d /dev/shm/kp.XXXXXX)"; else dir="$(mktemp -d)"; fi
+      printf %s "${KEYPAIR_PROGRAM_AUTHORITY:?missing secret}" >"$dir/authority.json"
+      printf %s "${KEYPAIR_FAUCET:?missing secret}" >"$dir/faucet.json"
+      # The faucet pays: the authority may already be swept (re-runs).
+      for var in KEYPAIR_RAYDIUM_CLMM KEYPAIR_ORCA_WHIRLPOOL KEYPAIR_MANIFEST; do
+        solana program close -u "$rpc" -k "$dir/faucet.json" "$(pubkey_of "$var")" \
+          --authority "$dir/authority.json" --recipient "$(pubkey_of KEYPAIR_FAUCET)" --bypass-warning \
+          || echo "closing $var failed (already closed?)" >&2
+      done
+    ) fi
+    sweep_operators="${SCENARIO_SWEEP_OPERATORS:-$([[ "$target" == local ]] && echo 1 || echo 0)}"
+    [[ "$sweep_operators" == 1 ]] && "$bin/scenario" teardown --operators >"$state/teardown-operators.json"
+    rm -rf "$state/state" # mm position state files
+    "$bin/scenario" leftovers | tee "$state/leftovers.json"
+    ;;
   down)
     # Takers first, so nothing trades against makers that are unwinding.
     for name in arb flow mm router oracle grafana prometheus; do
@@ -350,5 +399,5 @@ case "$cmd" in
       $compose -f ops/compose.scenario.yaml down # volumes are kept
     fi
     ;;
-  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|snapshot|report|measure|down)" >&2; exit 2 ;;
+  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|snapshot|report|measure|teardown|down)" >&2; exit 2 ;;
 esac
