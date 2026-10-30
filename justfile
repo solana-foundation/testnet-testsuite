@@ -150,6 +150,31 @@ scenario-observe:
 scenario-down:
     bootstrap/scenario/scenario.sh down
 
+# --- janitor program (programs/janitor) ----------------------------------------------
+
+# Build the janitor for a Doppler config, with that config's program authority
+# and faucet compiled in as its authorities: target/janitor/CONFIG/janitor.so.
+build-janitor CONFIG="dev":
+    doppler run --project testnet-testsuite --config "{{CONFIG}}" -- bash -c ' \
+        set -euo pipefail; \
+        JANITOR_AUTHORITIES="${PUBKEY_PROGRAM_AUTHORITY:?}, ${PUBKEY_FAUCET:?}" \
+            cargo-build-sbf --manifest-path programs/janitor/Cargo.toml --arch v3 \
+            --sbf-out-dir "target/janitor/{{CONFIG}}"; \
+        rm -f "target/janitor/{{CONFIG}}/janitor-keypair.json"'
+
+# Lint and test the janitor: an SBF build embedding the test-only authorities in
+# programs/janitor/tests/fixtures, then LiteSVM tests against it.
+test-janitor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fixtures=programs/janitor/tests/fixtures
+    export JANITOR_AUTHORITIES="$(solana-keygen pubkey $fixtures/authority-a.json),$(solana-keygen pubkey $fixtures/authority-b.json)"
+    cargo-build-sbf --manifest-path programs/janitor/Cargo.toml --arch v3 --sbf-out-dir target/janitor/test
+    rm -f target/janitor/test/janitor-keypair.json
+    export JANITOR_SO="$PWD/target/janitor/test/janitor.so"
+    cargo clippy --manifest-path programs/janitor/Cargo.toml --all-targets -- -D warnings
+    cargo test --manifest-path programs/janitor/Cargo.toml
+
 # --- token bootstrap (doppler-managed secrets) ----------------------------------
 
 bootstrap-tokens *ARGS:
