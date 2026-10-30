@@ -260,3 +260,24 @@ inventory = { JUP = "60000", RAY = "8000", USDC = "25000" }
 sol = "2"
 refill_below_ratio = "0.25"
 rng_seed = 7
+
+# --- cross-venue arbitrage: reacts to pool changes caused by flow -------------
+# Oracle-free: searches 2-leg (same pair, two venues) and 3-leg (triangular)
+# cycles across every pool above whenever a pool account changes.
+
+[arb]
+metrics_addr = "127.0.0.1:9184"
+
+[scenario.arb]
+poll_ms = 5000
+debounce_ms = 250
+
+[[scenario.arb.bots]]
+name = "searcher"
+start_tokens = ["USDC", "JUP", "RAY"]
+max_legs = 3
+min_profit_usd = "0.50"
+max_trade_usd = "5000"
+leg_slippage_bps = 5
+inventory = { USDC = "20000", JUP = "50000", RAY = "8000" }
+sol = "3"

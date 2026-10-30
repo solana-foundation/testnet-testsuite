@@ -1,6 +1,6 @@
 # Observability for the market-making scenario. The services run on the host
 # (bootstrap/scenario/scenario.sh), so Prometheus and Grafana use host
-# networking to scrape them on 127.0.0.1:9180-9183. Ports (Prometheus 9190,
+# networking to scrape them on 127.0.0.1:9180-9184. Ports (Prometheus 9190,
 # Grafana 3100) avoid the default stack in ops/compose.yaml.
 #   bootstrap/scenario/scenario.sh observe  → Grafana http://127.0.0.1:3100
 #   (user admin, password $GRAFANA_PASSWORD, default admin; loopback only)

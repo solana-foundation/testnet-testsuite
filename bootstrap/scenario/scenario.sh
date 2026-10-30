@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the market-making scenario: oracle → bootstrap → router → makers → flow.
+# Run the market-making scenario: oracle → bootstrap → router → makers → flow + arb.
 #
 #   scenario.sh deploy [local|testnet]  deploy the three DEX fork artifacts
 #   scenario.sh up [local|testnet]      build, start every service, bootstrap
@@ -7,6 +7,8 @@
 #   scenario.sh status [local|testnet]  pools, wallets, processes
 #   scenario.sh observe                 Prometheus :9190 + Grafana :3100 (dashboard
 #                                       "mtm — market-making scenario")
+#   scenario.sh snapshot FILE [local|testnet]   participant holdings at oracle prices
+#   scenario.sh report START END [local|testnet] PnL, transactions, trades between snapshots
 #   scenario.sh down                    stop every service started by `up`/`observe`
 #                                       (TERM, then KILL after 30 s)
 #
@@ -18,6 +20,11 @@
 set -euo pipefail
 
 cmd="${1:-up}"
+args=()
+case "$cmd" in
+  snapshot) args=("${2:?snapshot FILE}"); shift ;;
+  report) args=("${2:?report START END}" "${3:?report START END}"); shift 2 ;;
+esac
 target="${2:-local}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 state="$root/.scenario"
@@ -118,7 +125,7 @@ require_agave_cli() { # deploys need an Agave >= 4.x CLI (Manifest is SBPF v3)
 }
 
 build() {
-  cargo build -q $build_flag -p oracle -p router -p mm -p flow -p scenario
+  cargo build -q $build_flag -p oracle -p router -p mm -p flow -p arb -p scenario
 }
 
 tokens() {
@@ -235,7 +242,8 @@ case "$cmd" in
     # Give makers a few ticks to put liquidity on every venue.
     sleep "${SCENARIO_WARMUP_S:-20}"
     start flow "$bin/flow"
-    echo "scenario up — oracle :8180, router :8181; metrics :9180-9183"
+    start arb "$bin/arb"
+    echo "scenario up — oracle :8180, router :8181; metrics :9180-9184"
     ;;
   bootstrap)
     build
@@ -250,9 +258,16 @@ case "$cmd" in
       if running "$name"; then echo "$name: running"; else echo "$name: stopped"; fi
     done
     ;;
+  snapshot)
+    "$bin/scenario" snapshot --out "${args[0]}"
+    ;;
+  report)
+    "$bin/scenario" report --start "${args[0]}" --end "${args[1]}" \
+      --prometheus "${SCENARIO_PROMETHEUS:-http://127.0.0.1:9190}"
+    ;;
   down)
     # Takers first, so nothing trades against makers that are unwinding.
-    for name in flow mm router oracle grafana prometheus; do
+    for name in arb flow mm router oracle grafana prometheus; do
       if [[ -f "$state/pids/$name" ]]; then stop "$name"; fi
     done
     compose="${MTM_COMPOSE:-docker compose}"
@@ -261,5 +276,5 @@ case "$cmd" in
       $compose -f ops/compose.scenario.yaml down # volumes are kept
     fi
     ;;
-  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|down)" >&2; exit 2 ;;
+  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|snapshot|report|down)" >&2; exit 2 ;;
 esac

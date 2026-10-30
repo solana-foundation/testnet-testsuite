@@ -12,7 +12,9 @@
 //! Every trade ends in one [`Outcome`], exported as the `outcome` label of
 //! `flow_swaps_total` next to the coarse `status` (landed/failed), so market
 //! effects (unaffordable, preflight slippage, landed-failed) can be told
-//! apart from infrastructure faults (expired, ambiguous RPC).
+//! apart from infrastructure faults (expired, ambiguous RPC). Once the router
+//! has quoted a route, `flow_venue_swaps_total` also counts the send's
+//! outcome once per venue the route touches, for per-venue failure rates.
 //!
 //! Each landed swap is a `debug` line; `info` gets one summary a minute
 //! (outcome counts), so a long run at thousands of swaps per second doesn't
@@ -23,12 +25,12 @@
 //! float.
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use metrics::{counter, gauge, histogram};
-use mtm_chain::ChainClient;
+use mtm_chain::{ChainClient, SubmissionError, VersionedSendConfig};
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::signer_from_environment;
 use mtm_scenario::funding::{Funding, LAMPORTS_PER_SOL, top_up, wallet_balances};
@@ -39,13 +41,11 @@ use oracle_client::OracleClient;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Exp, LogNormal, Uniform};
-use router_client::{Execution, QuoteRequest, RouterClient, SwapMode};
+use router_client::{Execution, QuoteRequest, RouteLeg, RouterClient, SwapMode};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use solana_keypair::Keypair;
-use solana_rpc_client_api::client_error::ErrorKind as RpcErrorKind;
-use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
@@ -97,6 +97,30 @@ async fn main() -> Result<()> {
             None
         }
     };
+    // Every swap series at zero: `increase()` misses the first increment
+    // of a series that appears mid-window.
+    for (a, b) in &flow.pairs {
+        for size in ["normal", "large"] {
+            for outcome in Outcome::ALL {
+                counter!("flow_swaps_total", "pair" => format!("{a}/{b}"), "status" => outcome.status(), "outcome" => outcome.as_str(), "size" => size)
+                    .absolute(0);
+            }
+        }
+    }
+    let mut venues: Vec<&str> = scenario
+        .config
+        .pools
+        .iter()
+        .map(|pool| pool.venue.as_str())
+        .collect();
+    venues.sort_unstable();
+    venues.dedup();
+    for venue in venues {
+        for outcome in Outcome::SENT {
+            counter!("flow_venue_swaps_total", "venue" => venue, "status" => outcome.status(), "outcome" => outcome.as_str())
+                .absolute(0);
+        }
+    }
     let takers: Vec<Keypair> = (0..flow.takers).map(|i| scenario.taker_wallet(i)).collect();
     anyhow::ensure!(!takers.is_empty(), "the flow needs at least one taker");
     // Takers are sharded over OS threads, each with its own single-threaded
@@ -237,6 +261,37 @@ enum Outcome {
 }
 
 impl Outcome {
+    /// The outcomes of a quoted swap once it is sent.
+    const SENT: [Self; 6] = [
+        Self::Landed,
+        Self::PreflightRejected,
+        Self::SendFailed,
+        Self::LandedFailed,
+        Self::Expired,
+        Self::RpcAmbiguous,
+    ];
+
+    const ALL: [Self; 10] = [
+        Self::Landed,
+        Self::Unaffordable,
+        Self::NoPrice,
+        Self::QuoteFailed,
+        Self::PreflightRejected,
+        Self::SendFailed,
+        Self::LandedFailed,
+        Self::Expired,
+        Self::RpcAmbiguous,
+        Self::Error,
+    ];
+
+    fn status(self) -> &'static str {
+        if self == Self::Landed {
+            "landed"
+        } else {
+            "failed"
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Landed => "landed",
@@ -280,17 +335,20 @@ impl<T> OutcomeContext<T> for Option<T> {
     }
 }
 
+/// Each venue a route touches, once, in route order.
+fn route_venues(route: &[RouteLeg]) -> Vec<&str> {
+    let mut venues: Vec<&str> = Vec::with_capacity(route.len());
+    for leg in route {
+        if !venues.contains(&leg.venue.as_str()) {
+            venues.push(&leg.venue);
+        }
+    }
+    venues
+}
+
 fn fail<T>(outcome: Outcome, error: anyhow::Error) -> std::result::Result<T, TradeError> {
     Err(TradeError { outcome, error })
 }
-
-/// How long to poll a sent swap's status, and how often.
-const CONFIRM_DEADLINE: Duration = Duration::from_secs(90);
-const STATUS_POLL: Duration = Duration::from_millis(400);
-/// Check blockhash validity every this many status polls.
-const BLOCKHASH_CHECK_EVERY: u32 = 5;
-/// A status RPC failing this many polls in a row ends the wait.
-const MAX_STATUS_ERRORS: u32 = 5;
 
 impl Flow<'_> {
     /// Every taker is an independent Poisson process at `rate / takers`
@@ -362,8 +420,8 @@ impl Flow<'_> {
             };
             let label = format!("{}/{}", pair.0, pair.1);
             let size_label = if large { "large" } else { "normal" };
-            let (status, outcome) = match self.trade(taker, &trade).await {
-                Ok(()) => ("landed", Outcome::Landed),
+            let outcome = match self.trade(taker, &trade).await {
+                Ok(()) => Outcome::Landed,
                 Err(TradeError { outcome, error }) => {
                     // Routine market outcomes are metrics, not log lines: at
                     // high rates a warn per failed trade floods the logs.
@@ -372,14 +430,14 @@ impl Flow<'_> {
                     } else {
                         debug!(taker = index, %label, outcome = outcome.as_str(), error = %format!("{error:#}"), "trade failed");
                     }
-                    ("failed", outcome)
+                    outcome
                 }
             };
             self.tally.add(outcome.as_str());
             counter!(
                 "flow_swaps_total",
                 "pair" => label,
-                "status" => status,
+                "status" => outcome.status(),
                 "outcome" => outcome.as_str(),
                 "size" => size_label
             )
@@ -472,7 +530,15 @@ impl Flow<'_> {
             wincode::deserialize(&bytes).outcome(Outcome::Error)?;
         let signed =
             VersionedTransaction::try_new(unsigned.message, &[taker]).outcome(Outcome::Error)?;
-        let (signature, slot) = self.send_and_confirm(&signed).await?;
+        let sent = self.send_and_confirm(&signed).await;
+        let outcome = sent
+            .as_ref()
+            .map_or_else(|error| error.outcome, |_| Outcome::Landed);
+        for venue in route_venues(&quote.route) {
+            counter!("flow_venue_swaps_total", "venue" => venue.to_owned(), "status" => outcome.status(), "outcome" => outcome.as_str())
+                .increment(1);
+        }
+        let (signature, slot) = sent?;
 
         // Pinned to the confirmation slot: a lagging node cannot hand back
         // the pre-swap balances and record a phantom 100% slippage.
@@ -522,90 +588,28 @@ impl Flow<'_> {
     }
 
     /// Sends with preflight (the RPC's simulation catches stale quotes
-    /// before they cost a fee) and polls the status until the client's
-    /// commitment. Returns the signature and the slot it landed in.
+    /// before they cost a fee) and waits for the client's commitment.
+    /// Returns the signature and the slot it landed in.
     async fn send_and_confirm(
         &self,
         transaction: &VersionedTransaction,
     ) -> std::result::Result<(Signature, u64), TradeError> {
-        let rpc = self.chain.rpc();
-        let commitment = rpc.commitment();
-        let signature = transaction.signatures[0];
-        match rpc
-            .send_transaction_with_config(
-                transaction,
-                RpcSendTransactionConfig {
-                    preflight_commitment: Some(commitment.commitment),
-                    ..RpcSendTransactionConfig::default()
-                },
-            )
+        match self
+            .chain
+            .send_versioned(transaction, VersionedSendConfig::default())
             .await
         {
-            Ok(_) => {}
-            Err(error) if error.kind().get_transaction_error().is_some() => {
-                return fail(Outcome::PreflightRejected, error.into());
-            }
-            // The request may have reached the node: wait for a status
-            // rather than calling it failed.
-            Err(error) if is_transport_error(error.kind()) => {
-                debug!(%signature, error = %error, "send response lost; polling status");
-            }
-            Err(error) => return fail(Outcome::SendFailed, error.into()),
-        }
-        let blockhash = *transaction.message.recent_blockhash();
-        let started = Instant::now();
-        let (mut polls, mut errors) = (0_u32, 0_u32);
-        loop {
-            tokio::time::sleep(STATUS_POLL).await;
-            polls += 1;
-            if started.elapsed() >= CONFIRM_DEADLINE {
-                return fail(
-                    Outcome::RpcAmbiguous,
-                    anyhow::anyhow!("{signature}: no confirmation within {CONFIRM_DEADLINE:?}"),
-                );
-            }
-            match rpc.get_signature_statuses(&[signature]).await {
-                Ok(response) => {
-                    errors = 0;
-                    if let Some(status) = response.value.into_iter().next().flatten() {
-                        if let Some(error) = status.err {
-                            return fail(
-                                Outcome::LandedFailed,
-                                anyhow::anyhow!(
-                                    "{signature} failed in slot {}: {error:?}",
-                                    status.slot
-                                ),
-                            );
-                        }
-                        if status.satisfies_commitment(commitment) {
-                            return Ok((signature, status.slot));
-                        }
-                        // Seen but not yet at our commitment: it cannot
-                        // expire any more, so skip the blockhash check.
-                        continue;
-                    }
-                }
-                Err(error) => {
-                    errors += 1;
-                    if errors >= MAX_STATUS_ERRORS {
-                        return fail(Outcome::RpcAmbiguous, error.into());
-                    }
-                }
-            }
-            if polls.is_multiple_of(BLOCKHASH_CHECK_EVERY)
-                && let Ok(false) = rpc.is_blockhash_valid(&blockhash, commitment).await
-            {
-                // One last look: it may have landed just before expiry, in
-                // which case the next poll classifies it.
-                if let Ok(response) = rpc.get_signature_statuses(&[signature]).await
-                    && response.value.first().is_some_and(Option::is_some)
-                {
-                    continue;
-                }
-                return fail(
-                    Outcome::Expired,
-                    anyhow::anyhow!("{signature}: blockhash expired with no status"),
-                );
+            Ok(outcome) => Ok((outcome.signature, outcome.confirmation_slot)),
+            Err(error) => {
+                let outcome = match &error {
+                    SubmissionError::Simulation { .. } => Outcome::PreflightRejected,
+                    SubmissionError::Submission(_) => Outcome::SendFailed,
+                    SubmissionError::Execution { .. } => Outcome::LandedFailed,
+                    SubmissionError::Expired { .. } => Outcome::Expired,
+                    SubmissionError::AmbiguousConfirmation { .. } => Outcome::RpcAmbiguous,
+                    _ => Outcome::Error,
+                };
+                fail(outcome, error.into())
             }
         }
     }
@@ -649,13 +653,6 @@ impl Flow<'_> {
     }
 }
 
-fn is_transport_error(error: &RpcErrorKind) -> bool {
-    matches!(
-        error,
-        RpcErrorKind::Io(_) | RpcErrorKind::Reqwest(_) | RpcErrorKind::Middleware(_)
-    )
-}
-
 /// USD to whole micro-USD for the notional counter (counters are integers;
 /// whole USD would drop most of a small trade's volume).
 fn micro_usd(usd: Decimal) -> u64 {
@@ -688,6 +685,27 @@ mod tests {
     }
 
     use super::*;
+
+    fn leg(venue: &str) -> RouteLeg {
+        RouteLeg {
+            venue: venue.to_owned(),
+            pool: String::new(),
+            input_mint: String::new(),
+            output_mint: String::new(),
+            in_amount: 0,
+            out_amount: 0,
+            fee_amount: 0,
+            price_impact_bps: 0,
+            cu_estimate: 0,
+        }
+    }
+
+    #[test]
+    fn route_venues_counts_each_venue_once() {
+        let route = [leg("manifest"), leg("raydium-clmm"), leg("manifest")];
+        assert_eq!(route_venues(&route), ["manifest", "raydium-clmm"]);
+        assert!(route_venues(&[]).is_empty());
+    }
 
     #[test]
     fn slippage_is_normalised_by_the_quote() {

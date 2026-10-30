@@ -6,7 +6,13 @@
 //!    price if it does not exist (existing ones are left alone).
 //! 3. Wallets: every maker and taker (derived from the scenario seed) is
 //!    topped up to its configured SOL and token inventory.
+//!
+//! `snapshot` and `report` account for every participant (see `pnl`).
 
+mod pnl;
+mod rpc;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -51,6 +57,25 @@ enum Command {
     },
     /// Print every scenario pool and wallet with its balances.
     Status,
+    /// Record every participant's holdings (wallet, seats, LP positions) and
+    /// the oracle prices, for `report`.
+    Snapshot {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// PnL, transactions, and trades per participant between two snapshots.
+    Report {
+        #[arg(long)]
+        start: PathBuf,
+        #[arg(long)]
+        end: PathBuf,
+        /// Prometheus scraping the scenario services (for trade counts).
+        #[arg(long)]
+        prometheus: Option<String>,
+        /// Sample per-venue compute from every n-th slot's full block (0: off).
+        #[arg(long, default_value_t = 10)]
+        compute_sample_every: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +99,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    let rpc = rpc::JsonRpc::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let report = match cli.command {
         Command::Bootstrap {
@@ -93,6 +119,34 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
+        Command::Snapshot { out } => {
+            let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
+            // Compact: at tens of thousands of participants a pretty
+            // snapshot is several MB of whitespace.
+            std::fs::write(&out, serde_json::to_vec(&snapshot)?)?;
+            json!({ "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len() })
+        }
+        Command::Report {
+            start,
+            end,
+            prometheus,
+            compute_sample_every,
+        } => {
+            let read = |path: &PathBuf| -> Result<pnl::Snapshot> {
+                Ok(serde_json::from_slice(
+                    &std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+                )?)
+            };
+            pnl::report(
+                &rpc,
+                &read(&start)?,
+                &read(&end)?,
+                prometheus.as_deref(),
+                &pnl::VenuePrograms::of(&scenario),
+                compute_sample_every,
+            )
+            .await?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -270,6 +324,25 @@ async fn bootstrap(
             .await?;
             wallets.push(json!({ "role": format!("maker/{}", maker.name), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
         }
+        for bot in scenario.config.arb.iter().flat_map(|arb| &arb.bots) {
+            let wallet = scenario.arb_wallet(&bot.name).pubkey();
+            let tokens = bot
+                .inventory
+                .iter()
+                .map(|(name, amount)| Ok((scenario.token(name)?, *amount)))
+                .collect::<Result<Vec<_>>>()?;
+            let outcome = top_up(
+                chain,
+                faucet.as_ref(),
+                mint_authority.as_ref(),
+                &wallet,
+                bot.sol,
+                &tokens,
+                Funding::Endowment,
+            )
+            .await?;
+            wallets.push(json!({ "role": format!("arb/{}", bot.name), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
+        }
         if let Some(flow) = &scenario.config.flow {
             let tokens = flow
                 .inventory
@@ -312,25 +385,11 @@ async fn status(chain: &ChainClient, scenario: &Scenario) -> Result<Value> {
         };
         pools.push(json!({ "venue": pool.venue.as_str(), "base": pool.base, "quote": pool.quote, "address": address.map(|a| a.to_string()), "live": live }));
     }
-    let mut roles: Vec<(String, solana_pubkey::Pubkey)> = scenario
-        .config
-        .makers
-        .iter()
-        .map(|maker| {
-            (
-                format!("maker/{}", maker.name),
-                scenario.maker_wallet(&maker.name).pubkey(),
-            )
-        })
+    let roles: Vec<(String, solana_pubkey::Pubkey)> = scenario
+        .participants()
+        .into_iter()
+        .map(|p| (p.role, p.wallet))
         .collect();
-    if let Some(flow) = &scenario.config.flow {
-        roles.extend((0..flow.takers).map(|index| {
-            (
-                format!("taker/{index}"),
-                scenario.taker_wallet(index).pubkey(),
-            )
-        }));
-    }
     // Batched reads: one round trip per 100 accounts instead of one per
     // (wallet, token).
     let tokens: Vec<&Token> = scenario.tokens.values().collect();
