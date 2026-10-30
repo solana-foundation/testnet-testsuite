@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use manifest_dex_client::{ManifestClient, OrderSpec, Side, TokenAmount};
 use mtm_scenario::Strategy;
+use mtm_scenario::pricing::PriceBook;
 use mtm_scenario::venue::to_ui;
 use rust_decimal::{Decimal, RoundingStrategy};
 use solana_commitment_config::CommitmentConfig;
@@ -61,6 +62,48 @@ impl Clob {
             last: None,
             pulled: false,
         })
+    }
+
+    /// Hedge the seat when its inventory strays from the target: withdraw
+    /// what is not locked in orders, hedge it in the wallet, deposit back.
+    async fn hedge(
+        &mut self,
+        ctx: &Ctx,
+        prices: &PriceBook,
+        seat: &manifest_dex_client::Seat,
+        base_atoms: u64,
+        quote_atoms: u64,
+    ) -> Result<bool> {
+        let held = crate::hedge::Inventory {
+            base_total: to_ui(&ctx.base, base_atoms),
+            quote_total: to_ui(&ctx.quote, quote_atoms),
+            base_free: to_ui(&ctx.base, seat.base_withdrawable),
+            quote_free: to_ui(&ctx.quote, seat.quote_withdrawable),
+        };
+        let Some(plan) = crate::hedge::check(ctx, prices, held)? else {
+            return Ok(false);
+        };
+        self.client
+            .withdraw_all(ctx.pool)
+            .await
+            .context("withdrawing the seat to hedge")?;
+        crate::hedge::execute(ctx, &plan).await?;
+        for token in [&ctx.base, &ctx.quote] {
+            let atoms = ctx.wallet_balance(token).await?;
+            if atoms > 0 {
+                self.client
+                    .deposit(
+                        ctx.pool,
+                        TokenAmount {
+                            mint: token.mint,
+                            amount: to_ui(token, atoms),
+                        },
+                    )
+                    .await
+                    .with_context(|| format!("re-depositing {} after a hedge", token.name))?;
+            }
+        }
+        Ok(true)
     }
 
     pub async fn tick(&mut self, ctx: &Ctx) -> Result<()> {
@@ -120,6 +163,14 @@ impl Clob {
             }
         }
         ctx.record_inventory(&prices, base_atoms, quote_atoms);
+        if self
+            .hedge(ctx, &prices, &seat, base_atoms, quote_atoms)
+            .await?
+        {
+            // The seat changed: re-quote from a fresh read next tick.
+            self.last = None;
+            return Ok(());
+        }
         let best_bid = snapshot.book.bids.first().map(|o| o.price_raw);
         let best_ask = snapshot.book.asks.first().map(|o| o.price_raw);
         let book_mid = match (best_bid, best_ask) {

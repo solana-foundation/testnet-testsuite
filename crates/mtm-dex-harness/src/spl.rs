@@ -165,6 +165,30 @@ pub fn mint_to_checked(
     }
 }
 
+/// `BurnChecked` (discriminant 15), signed by the account owner.
+pub fn burn_checked(
+    token_program: &Pubkey,
+    account: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+    decimals: u8,
+) -> Instruction {
+    let mut data = Vec::with_capacity(10);
+    data.push(15);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.push(decimals);
+    Instruction {
+        program_id: *token_program,
+        accounts: vec![
+            AccountMeta::new(*account, false),
+            AccountMeta::new(*mint, false),
+            AccountMeta::new_readonly(*owner, true),
+        ],
+        data,
+    }
+}
+
 /// `TransferChecked` (discriminant 12).
 pub fn transfer_checked(
     token_program: &Pubkey,

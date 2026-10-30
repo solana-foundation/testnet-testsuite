@@ -14,7 +14,7 @@ manifest-dex-client = { workspace = true }
 metrics = { workspace = true }
 mtm-chain = { workspace = true }
 mtm-common = { workspace = true }
-mtm-dex-harness = { workspace = true }
+mtm-dex-harness = { workspace = true, features = ["cli"] }
 mtm-scenario = { workspace = true }
 mtm-telemetry = { workspace = true }
 mtm-venues = { workspace = true }

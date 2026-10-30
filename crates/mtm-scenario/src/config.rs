@@ -34,6 +34,10 @@ pub struct ScenarioConfig {
     pub flow: Option<FlowConfig>,
     #[serde(default)]
     pub arb: Option<ArbConfig>,
+    /// Makers rebalance their inventory "off-chain" at the oracle price, as
+    /// real market makers hedge on a CEX. Off when absent.
+    #[serde(default)]
+    pub hedge: Option<HedgeConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,6 +283,46 @@ fn default_max_price_age_ms() -> u64 {
 fn default_orca_tick_spacing() -> u16 {
     64
 }
+/// Off-chain hedging at the oracle price (test tokens: the sold side is
+/// burned, the bought side minted, at oracle × (1 − cost)). A real market
+/// maker lays off on-chain fills on a CEX; without this, uninformed flow
+/// leaves every maker one-sided within an hour or two.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HedgeConfig {
+    /// Hedge when the base share of a maker's inventory value is this far
+    /// from its target, in basis points of the total (2000 = 20 points).
+    pub threshold_bps: u32,
+    /// What a hedge costs, in basis points of its notional (an exchange fee
+    /// plus half the spread).
+    #[serde(default = "default_hedge_cost_bps")]
+    pub cost_bps: u32,
+    /// Smallest hedge worth a transaction, in USD.
+    #[serde(default = "default_hedge_min_usd")]
+    pub min_usd: Decimal,
+}
+
+fn default_hedge_cost_bps() -> u32 {
+    10
+}
+fn default_hedge_min_usd() -> Decimal {
+    Decimal::from(50)
+}
+
+impl HedgeConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(1..=5_000).contains(&self.threshold_bps) {
+            anyhow::bail!("hedge.threshold_bps must be in 1..=5000");
+        }
+        if self.cost_bps > 1_000 {
+            anyhow::bail!("hedge.cost_bps cannot exceed 1000");
+        }
+        if self.min_usd < Decimal::ZERO {
+            anyhow::bail!("hedge.min_usd cannot be negative");
+        }
+        Ok(())
+    }
+}
+
 impl FlowConfig {
     /// Checks the sampling parameters up front: a bad value would otherwise
     /// end every taker loop at its first arrival.

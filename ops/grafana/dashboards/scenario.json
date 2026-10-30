@@ -744,6 +744,84 @@
       "id": 22
     },
     {
+      "type": "timeseries",
+      "title": "Hedged at the oracle (USD / 5m)",
+      "description": "inventory laid off at the oracle price (CEX-hedge model): sell_base = maker was long base",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 60
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (maker, side) (increase(mm_hedge_micro_usd_total[5m])) / 1e6",
+          "legendFormat": "{{maker}} {{side}}"
+        }
+      ],
+      "id": 23
+    },
+    {
+      "type": "timeseries",
+      "title": "Hedge cost (USD / 5m)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 60
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (maker) (increase(mm_hedge_cost_micro_usd_total[5m])) / 1e6",
+          "legendFormat": "{{maker}}"
+        }
+      ],
+      "id": 24
+    },
+    {
       "type": "row",
       "title": "Uninformed flow + router",
       "collapsed": false,
@@ -751,10 +829,10 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 68
       },
       "panels": [],
-      "id": 23
+      "id": 25
     },
     {
       "type": "timeseries",
@@ -768,7 +846,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 61
+        "y": 69
       },
       "fieldConfig": {
         "defaults": {
@@ -793,7 +871,7 @@
           "legendFormat": "{{pair}} {{status}} {{size}}"
         }
       ],
-      "id": 24
+      "id": 26
     },
     {
       "type": "timeseries",
@@ -807,7 +885,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 61
+        "y": 69
       },
       "fieldConfig": {
         "defaults": {
@@ -832,7 +910,7 @@
           "legendFormat": "{{outcome}}"
         }
       ],
-      "id": 25
+      "id": 27
     },
     {
       "type": "timeseries",
@@ -846,7 +924,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 69
+        "y": 77
       },
       "fieldConfig": {
         "defaults": {
@@ -876,7 +954,7 @@
           "legendFormat": "p95 {{pair}}"
         }
       ],
-      "id": 26
+      "id": 28
     },
     {
       "type": "timeseries",
@@ -890,7 +968,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 69
+        "y": 77
       },
       "fieldConfig": {
         "defaults": {
@@ -920,94 +998,11 @@
           "legendFormat": "p50 {{pair}}"
         }
       ],
-      "id": 27
-    },
-    {
-      "type": "timeseries",
-      "title": "Route legs by venue / min",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 77
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": ["lastNotNull"]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (venue) (rate(flow_route_legs_total[5m])) * 60",
-          "legendFormat": "{{venue}}"
-        }
-      ],
-      "id": 28
-    },
-    {
-      "type": "timeseries",
-      "title": "Router quote latency",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 77
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": ["lastNotNull"]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "router_quote_seconds{quantile=\"0.5\"}",
-          "legendFormat": "p50 {{execution}}"
-        },
-        {
-          "refId": "B",
-          "expr": "router_quote_seconds{quantile=\"0.95\"}",
-          "legendFormat": "p95 {{execution}}"
-        }
-      ],
       "id": 29
     },
     {
       "type": "timeseries",
-      "title": "Router quotes and errors / min",
+      "title": "Route legs by venue / min",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -1038,6 +1033,89 @@
       "targets": [
         {
           "refId": "A",
+          "expr": "sum by (venue) (rate(flow_route_legs_total[5m])) * 60",
+          "legendFormat": "{{venue}}"
+        }
+      ],
+      "id": 30
+    },
+    {
+      "type": "timeseries",
+      "title": "Router quote latency",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 85
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "router_quote_seconds{quantile=\"0.5\"}",
+          "legendFormat": "p50 {{execution}}"
+        },
+        {
+          "refId": "B",
+          "expr": "router_quote_seconds{quantile=\"0.95\"}",
+          "legendFormat": "p95 {{execution}}"
+        }
+      ],
+      "id": 31
+    },
+    {
+      "type": "timeseries",
+      "title": "Router quotes and errors / min",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 93
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
           "expr": "sum by (execution) (rate(router_quotes_total[5m])) * 60",
           "legendFormat": "quotes {{execution}}"
         },
@@ -1047,7 +1125,7 @@
           "legendFormat": "errors {{status}}"
         }
       ],
-      "id": 30
+      "id": 32
     },
     {
       "type": "row",
@@ -1057,10 +1135,10 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 93
+        "y": 101
       },
       "panels": [],
-      "id": 31
+      "id": 33
     },
     {
       "type": "timeseries",
@@ -1074,7 +1152,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 94
+        "y": 102
       },
       "fieldConfig": {
         "defaults": {
@@ -1104,7 +1182,7 @@
           "legendFormat": "opportunities {{bot}} {{legs}}-leg"
         }
       ],
-      "id": 32
+      "id": 34
     },
     {
       "type": "timeseries",
@@ -1118,7 +1196,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 94
+        "y": 102
       },
       "fieldConfig": {
         "defaults": {
@@ -1153,7 +1231,7 @@
           "legendFormat": "last trade {{bot}}"
         }
       ],
-      "id": 33
+      "id": 35
     },
     {
       "type": "timeseries",
@@ -1167,7 +1245,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 102
+        "y": 110
       },
       "fieldConfig": {
         "defaults": {
@@ -1202,7 +1280,7 @@
           "legendFormat": "errors"
         }
       ],
-      "id": 34
+      "id": 36
     },
     {
       "type": "timeseries",
@@ -1216,7 +1294,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 102
+        "y": 110
       },
       "fieldConfig": {
         "defaults": {
@@ -1246,7 +1324,7 @@
           "legendFormat": "p95"
         }
       ],
-      "id": 35
+      "id": 37
     },
     {
       "type": "timeseries",
@@ -1260,7 +1338,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 110
+        "y": 118
       },
       "fieldConfig": {
         "defaults": {
@@ -1290,7 +1368,7 @@
           "legendFormat": "in flight"
         }
       ],
-      "id": 36
+      "id": 38
     }
   ]
 }
