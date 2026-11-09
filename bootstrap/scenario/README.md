@@ -161,7 +161,7 @@ NO_DNA=1 just scenario-deploy-devnet        # DEX forks at the config's program 
 just build-janitor devnet                    # janitor with the devnet authorities baked in
 NO_DNA=1 just scenario-devnet                # tokens + configs + pools + funding + services
 NO_DNA=1 just scenario-status-devnet
-SCENARIO_JANITOR=1 SCENARIO_CLOSE_PROGRAMS=1 SCENARIO_SWEEP_OPERATORS=1 \
+SCENARIO_JANITOR=1 SCENARIO_SWEEP_OPERATORS=1 \
   SCENARIO_JANITOR_SO=target/janitor/devnet/janitor.so NO_DNA=1 just scenario-teardown-devnet
 ```
 
@@ -172,15 +172,15 @@ airdrops, so fund it before the run (see the budget below).
 
 Doppler `devnet` config — required:
 
-| Variable                                                                                             | What                                                                                 |
-| ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `KEYPAIR_FAUCET`, `PUBKEY_FAUCET`                                                                    | the funded main wallet; fans out to every participant; teardown destination          |
-| `KEYPAIR_PROGRAM_AUTHORITY`, `PUBKEY_PROGRAM_AUTHORITY`                                              | upgrade authority of the forks and admin of the venue configs (bootstrap funds it)   |
-| `KEYPAIR_TOKEN_MINT_AUTHORITY`, `KEYPAIR_TOKEN_FREEZE_AUTHORITY`, `KEYPAIR_TOKEN_METADATA_AUTHORITY` | token bootstrap authorities (sign only; the faucet pays)                             |
-| `KEYPAIR_TOKEN_{USDC,JUP,RAY}_MINT`, `PUBKEY_TOKEN_{USDC,JUP,RAY}_MINT`                              | the devnet mints (created by the token bootstrap)                                    |
-| `KEYPAIR_RAYDIUM_CLMM`, `KEYPAIR_ORCA_WHIRLPOOL`, `KEYPAIR_MANIFEST`                                 | program-ID keypairs; use fresh ones: a closed program ID can never be deployed again |
-| `KEYPAIR_ORCA_WHIRLPOOLS_CONFIG`                                                                     | the Orca config account keypair                                                      |
-| `SCENARIO_SEED`                                                                                      | every maker / arb / taker wallet derives from it (no dev seed outside local)         |
+| Variable                                                                                             | What                                                                                                                                        |
+| ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KEYPAIR_FAUCET`, `PUBKEY_FAUCET`                                                                    | the funded main wallet; fans out to every participant; teardown destination                                                                 |
+| `KEYPAIR_PROGRAM_AUTHORITY`, `PUBKEY_PROGRAM_AUTHORITY`                                              | upgrade authority of the forks and admin of the venue configs (bootstrap funds it)                                                          |
+| `KEYPAIR_TOKEN_MINT_AUTHORITY`, `KEYPAIR_TOKEN_FREEZE_AUTHORITY`, `KEYPAIR_TOKEN_METADATA_AUTHORITY` | token bootstrap authorities (sign only; the faucet pays)                                                                                    |
+| `KEYPAIR_TOKEN_{USDC,JUP,RAY}_MINT`, `PUBKEY_TOKEN_{USDC,JUP,RAY}_MINT`                              | the devnet mints (created by the token bootstrap)                                                                                           |
+| `KEYPAIR_RAYDIUM_CLMM`, `KEYPAIR_ORCA_WHIRLPOOL`, `KEYPAIR_MANIFEST`                                 | program-ID keypairs, reused across runs (teardown never closes the programs; an ID closed by an older teardown can never be deployed again) |
+| `KEYPAIR_ORCA_WHIRLPOOLS_CONFIG`                                                                     | the Orca config account keypair                                                                                                             |
+| `SCENARIO_SEED`                                                                                      | every maker / arb / taker wallet derives from it (no dev seed outside local)                                                                |
 
 Optional: `SCENARIO_RPC_URL` / `SCENARIO_WS_URL` (a dedicated devnet RPC;
 the public one rate-limits sustained runs), `SCENARIO_MAINNET_RPC` (token
@@ -190,17 +190,18 @@ teardown switches above.
 
 Faucet budget (measured on 2026-10-15 local runs of 30 min, 1 h and 2 h):
 
-| what                                                               | peak SOL | after a full teardown                                 |
-| ------------------------------------------------------------------ | -------- | ----------------------------------------------------- |
-| DEX programs (programdata 20.3; a deploy buffer on top)            | ~26      | 0 with `SCENARIO_CLOSE_PROGRAMS=1` (else 20.3 locked) |
-| participants (devnet profile targets: 17 wallets)                  | 3.6      | 0 (swept back)                                        |
-| program authority (venue-config fees and rent; bootstrap funds it) | 0.5      | 0 with `SCENARIO_SWEEP_OPERATORS=1`                   |
-| configs, pools, markets, tick arrays, positions, vaults            | ~1.8     | 0 (janitor)                                           |
-| mints and their metadata                                           | 0.06     | 0.06 (cannot be closed)                               |
-| transaction fees, whole lifecycle                                  | ~0.06    | spent (≈0.03 fixed + 0.012/h)                         |
+| what                                                               | peak SOL | after a full teardown                 |
+| ------------------------------------------------------------------ | -------- | ------------------------------------- |
+| DEX programs (programdata 20.3; a deploy buffer on top)            | ~26      | 20.3 (kept deployed for the next run) |
+| participants (devnet profile targets: 17 wallets)                  | 3.6      | 0 (swept back)                        |
+| program authority (venue-config fees and rent; bootstrap funds it) | 0.5      | 0 with `SCENARIO_SWEEP_OPERATORS=1`   |
+| configs, pools, markets, tick arrays, positions, vaults            | ~1.8     | 0 (janitor)                           |
+| mints and their metadata                                           | 0.06     | 0.06 (cannot be closed)               |
+| transaction fees, whole lifecycle                                  | ~0.06    | spent (≈0.03 fixed + 0.012/h)         |
 
-So fund the faucet with **~35 SOL** for a devnet run; a full teardown
-returns all but ~0.1 SOL (fees plus the mints). Raydium LPs are the only
+So fund the faucet with **~35 SOL** for the first devnet run; a full
+teardown returns all but ~20.4 SOL (the programs, which later runs reuse,
+plus fees and the mints), so each later run needs only ~6 SOL on top. Raydium LPs are the only
 participants that spend SOL in volume (tick-array and position rent on
 re-centres, up to ~0.22 SOL/h); everyone else pays fees only.
 
