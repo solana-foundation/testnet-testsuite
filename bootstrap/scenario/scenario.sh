@@ -23,15 +23,14 @@
 #                                       participant, sweep all SOL to the faucet, and
 #                                       write .scenario/{teardown,leftovers}.json
 #                                       (rent still locked in pools, markets, …).
-#                                       SCENARIO_CLOSE_PROGRAMS=1 also closes the three
-#                                       DEX programs (rent to the faucet; pools become
-#                                       unusable). Operator wallets are swept too on
+#                                       The DEX programs stay deployed: a closed program
+#                                       ID can never be reused. Operator wallets are swept too on
 #                                       local (SCENARIO_SWEEP_OPERATORS=0|1 overrides).
 #                                       SCENARIO_JANITOR=1 first upgrades the DEX programs
 #                                       to SCENARIO_JANITOR_SO and closes every account
 #                                       they own (pools, tick arrays, positions, markets)
 #                                       and every vault their PDAs hold, then restores the
-#                                       forks unless they are closed.
+#                                       forks.
 #   scenario.sh supervise NAME CMD...   (internal) rerun CMD whenever it exits
 #
 # Secrets come from the environment (normally `doppler run --`; see
@@ -296,10 +295,8 @@ janitor() (
   [[ "$live" == 3 ]] || { echo "janitor: only $live of 3 DEX programs exist; refusing a partial run" >&2; exit 1; }
   while IFS= read -r spec; do upgrade "${spec%%:*}" "$so"; done < <(artifacts)
   "$bin/scenario" janitor --janitor-so "$so" | tee "$state/janitor.json"
-  if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" != 1 ]]; then
-    while IFS= read -r spec; do upgrade "${spec%%:*}" "${spec#*:}"; done < <(artifacts)
-    echo "janitor: forks restored with no accounts or vaults; bootstrap re-creates them" >&2
-  fi
+  while IFS= read -r spec; do upgrade "${spec%%:*}" "${spec#*:}"; done < <(artifacts)
+  echo "janitor: forks restored with no accounts or vaults; bootstrap re-creates them" >&2
 )
 
 program_closed() { # pubkey → 0 if it is an upgradeable program that was closed
@@ -460,9 +457,14 @@ case "$cmd" in
   teardown)
     # Everything the unwind needs, checked before anything is stopped: a
     # missing secret must not leave the run half torn down.
+    if [[ -n "${SCENARIO_CLOSE_PROGRAMS:-}" ]]; then
+      echo "teardown: SCENARIO_CLOSE_PROGRAMS is gone: the DEX programs stay deployed (a closed" \
+        "program ID can never be reused); unset it. Nothing was stopped" >&2
+      exit 1
+    fi
     missing=()
     [[ -n "${KEYPAIR_FAUCET:-}" ]] || missing+=(KEYPAIR_FAUCET)
-    if [[ "${SCENARIO_JANITOR:-0}" == 1 || "${SCENARIO_CLOSE_PROGRAMS:-0}" == 1 ]]; then
+    if [[ "${SCENARIO_JANITOR:-0}" == 1 ]]; then
       [[ -n "${KEYPAIR_PROGRAM_AUTHORITY:-}" ]] || missing+=(KEYPAIR_PROGRAM_AUTHORITY)
     fi
     if [[ "${SCENARIO_JANITOR:-0}" == 1 && ! -f "${SCENARIO_JANITOR_SO:-}" ]]; then
@@ -481,23 +483,6 @@ case "$cmd" in
     "$bin/scenario" teardown | tee "$state/teardown.json"
     # After the unwind (which needs the real DEX code), before any close.
     if [[ "${SCENARIO_JANITOR:-0}" == 1 ]]; then janitor; fi
-    if [[ "${SCENARIO_CLOSE_PROGRAMS:-0}" == 1 ]]; then (
-      # Same key handling as deploy: tmpfs when available, removed on any exit.
-      umask 077
-      dir=""
-      trap '[[ -n "$dir" ]] && rm -rf "$dir"' EXIT
-      trap 'exit 130' INT
-      trap 'exit 143' TERM
-      if [[ -d /dev/shm && -w /dev/shm ]]; then dir="$(mktemp -d /dev/shm/kp.XXXXXX)"; else dir="$(mktemp -d)"; fi
-      printf %s "${KEYPAIR_PROGRAM_AUTHORITY:?missing secret}" >"$dir/authority.json"
-      printf %s "${KEYPAIR_FAUCET:?missing secret}" >"$dir/faucet.json"
-      # The faucet pays: the authority may already be swept (re-runs).
-      for var in KEYPAIR_RAYDIUM_CLMM KEYPAIR_ORCA_WHIRLPOOL KEYPAIR_MANIFEST; do
-        solana program close -u "$rpc" -k "$dir/faucet.json" "$(pubkey_of "$var")" \
-          --authority "$dir/authority.json" --recipient "$(pubkey_of KEYPAIR_FAUCET)" --bypass-warning \
-          || echo "closing $var failed (already closed?)" >&2
-      done
-    ) fi
     sweep_operators="${SCENARIO_SWEEP_OPERATORS:-$([[ "$target" == local ]] && echo 1 || echo 0)}"
     [[ "$sweep_operators" == 1 ]] && "$bin/scenario" teardown --operators >"$state/teardown-operators.json"
     rm -rf "$state/state" # mm position state files

@@ -339,8 +339,8 @@ transactions failed). The limits, in order:
 
 `scenario.sh teardown` (`just scenario-teardown-dev` / `-testnet`) recovers
 the scenario's SOL into the faucet. Before stopping anything it checks the
-faucet key, the program authority (with `SCENARIO_JANITOR` or
-`SCENARIO_CLOSE_PROGRAMS`), the janitor `.so` (with `SCENARIO_JANITOR`) and
+faucet key, the program authority and the janitor `.so` (with
+`SCENARIO_JANITOR`) and
 `scenario check` (seed, program ids and mints resolve), so a missing secret
 cannot leave the run half torn down; like `snapshot` and `report` it runs at
 the scale `up` recorded unless `SCENARIO_SCALE` names it:
@@ -357,18 +357,22 @@ the scale `up` recorded unless `SCENARIO_SCALE` names it:
 4. with `SCENARIO_JANITOR=1`, closes every account the DEX programs own
    (pools, tick arrays, positions, observation and bitmap accounts, venue
    configs, Manifest markets) with the janitor (below);
-5. with `SCENARIO_CLOSE_PROGRAMS=1`, closes the three DEX programs
-   (programdata rent to the faucet; the pools stop working, and closed
-   program IDs can never be deployed to again: `deploy` refuses them);
-6. sweeps the operator wallets (program / mint / freeze / metadata
+5. sweeps the operator wallets (program / mint / freeze / metadata
    authorities) into the faucet: by default on `local`, opt-in on testnet
    (`SCENARIO_SWEEP_OPERATORS=1`), where those keys are shared;
-7. writes `.scenario/teardown.json` (what moved) and
+6. writes `.scenario/teardown.json` (what moved) and
    `.scenario/leftovers.json` (`scenario leftovers`: the rent still locked,
    by owner program and account type).
 
 Every step is idempotent, so a teardown can be re-run after a partial
 failure; `scenario leftovers` can also be run on its own at any time.
+
+The three DEX programs are never closed: a closed program ID can never be
+deployed to again (`deploy` refuses one), so the next run would need new
+program keypairs and configs. Their programdata (~20.3 SOL) stays locked
+between runs. Once SIMD-0433 is active (an upgrade resizes programdata to
+the new code and refunds the rest), teardown will park them on a no-op
+program instead, which keeps the IDs at almost no rent.
 
 ### The janitor (`programs/janitor`)
 
@@ -393,8 +397,7 @@ touched; any failure fails the whole instruction.
 ```sh
 just build-janitor dev        # target/janitor/dev/janitor.so, dev authorities baked in
 just test-janitor             # LiteSVM tests against a build with test-only authorities
-SCENARIO_JANITOR=1 SCENARIO_CLOSE_PROGRAMS=1 \
-  SCENARIO_JANITOR_SO=target/janitor/dev/janitor.so just scenario-teardown-dev
+SCENARIO_JANITOR=1 SCENARIO_JANITOR_SO=target/janitor/dev/janitor.so just scenario-teardown-dev
 ```
 
 `teardown` upgrades each DEX program to the janitor (after the participant
@@ -413,8 +416,7 @@ unwind, which still needs the real code) and runs `scenario janitor`, which:
 market, mint]`); token accounts held by anyone else are left alone;
 3. closes every account the programs own.
 
-It then either closes the programs (`SCENARIO_CLOSE_PROGRAMS=1`) or
-upgrades the forks back, empty: `bootstrap` re-creates configs, pools and
+It then upgrades the forks back, empty: `bootstrap` re-creates configs, pools and
 markets on the same chain. Building needs the Agave platform tools
 (`cargo-build-sbf`, Agave >= 4.x) and `PUBKEY_PROGRAM_AUTHORITY` /
 `PUBKEY_FAUCET` in the Doppler config.
@@ -422,19 +424,19 @@ markets on the same chain. Building needs the Agave platform tools
 Without the janitor, what stays locked has no close instruction in the
 forked programs (or is a mint): pools, tick arrays, observation and bitmap
 accounts, venue configs, Manifest markets, pool/market vaults, the mints
-and their Metaplex metadata, and the 36-byte stubs of closed programs. With
-`SCENARIO_JANITOR=1 SCENARIO_CLOSE_PROGRAMS=1` only the mints (classic
-Token mints cannot be closed) with their metadata and the program stubs
-remain: 0.055 SOL on the base scenario (from 21.80), measured on a test
-validator on 2026-10-14. Measured on the x2000
-chain (33 086 participants, 3 tokens, 7 pools) on 2026-10-13:
+and their Metaplex metadata. With `SCENARIO_JANITOR=1` only the mints
+(classic Token mints cannot be closed) with their metadata remain besides
+the programs' ~20.3 SOL of programdata. The figures below were measured
+when teardown still closed the programs (since removed): 0.055 SOL locked
+on the base scenario (from 21.80) on a test validator on 2026-10-14, and on
+the x2000 chain (33 086 participants, 3 tokens, 7 pools) on 2026-10-13:
 
 | recovered into the faucet                   | SOL       |
 | ------------------------------------------- | --------- |
 | participant wallets (33 086, all left at 0) | 16 715.19 |
 | token-account rent (99 222 accounts closed) | 202.34    |
 | operator wallets                            | 200 000   |
-| programdata (`SCENARIO_CLOSE_PROGRAMS=1`)   | 20.29     |
+| programdata (programs closed; now kept)     | 20.29     |
 
 | still locked                                               | accounts | SOL   |
 | ---------------------------------------------------------- | -------- | ----- |
