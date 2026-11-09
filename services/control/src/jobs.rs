@@ -93,14 +93,11 @@ pub fn plan(
         check_name(run_id)?;
         env.push(("SCENARIO_RUN_ID".to_owned(), run_id.clone()));
     }
-    if (request.janitor || request.close_programs) && command != Command::Teardown {
-        return Err("janitor / close_programs apply to teardown".to_owned());
+    if request.janitor && command != Command::Teardown {
+        return Err("janitor applies to teardown".to_owned());
     }
     if request.janitor {
         env.push(("SCENARIO_JANITOR".to_owned(), "1".to_owned()));
-    }
-    if request.close_programs {
-        env.push(("SCENARIO_CLOSE_PROGRAMS".to_owned(), "1".to_owned()));
     }
     Ok((args, env))
 }
@@ -280,7 +277,6 @@ mod tests {
             scale: None,
             run_id: None,
             janitor: false,
-            close_programs: false,
             confirm: None,
         }
     }

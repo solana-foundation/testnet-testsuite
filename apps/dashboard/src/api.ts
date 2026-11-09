@@ -98,7 +98,6 @@ export interface JobRequest {
   scale: string | null;
   run_id: string | null;
   janitor: boolean;
-  close_programs: boolean;
   confirm: string | null;
 }
 

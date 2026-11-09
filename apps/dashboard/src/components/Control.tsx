@@ -71,7 +71,6 @@ function JobForm({ status }: { status: Status | null }) {
   const [scale, setScale] = useState("");
   const [runId, setRunId] = useState("");
   const [janitor, setJanitor] = useState(false);
-  const [closePrograms, setClosePrograms] = useState(false);
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -96,7 +95,6 @@ function JobForm({ status }: { status: Status | null }) {
         run_id:
           (command === "up" || command === "watch") && runId ? runId : null,
         janitor: command === "teardown" && janitor,
-        close_programs: command === "teardown" && closePrograms,
         confirm: needsConfirm ? confirm : null,
       });
     } catch (e) {
@@ -172,24 +170,14 @@ function JobForm({ status }: { status: Status | null }) {
           </label>
         )}
         {command === "teardown" && (
-          <>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={janitor}
-                onChange={(e) => setJanitor(e.target.checked)}
-              />
-              janitor (close every DEX account)
-            </label>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={closePrograms}
-                onChange={(e) => setClosePrograms(e.target.checked)}
-              />
-              close the DEX programs
-            </label>
-          </>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={janitor}
+              onChange={(e) => setJanitor(e.target.checked)}
+            />
+            janitor (close every DEX account)
+          </label>
         )}
         {needsConfirm && (
           <label>

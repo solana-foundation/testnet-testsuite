@@ -75,9 +75,6 @@ pub struct JobRequest {
     /// teardown: close accounts with the janitor first.
     #[serde(default)]
     pub janitor: bool,
-    /// teardown: close the DEX programs too.
-    #[serde(default)]
-    pub close_programs: bool,
     /// Must equal the command name for [`Command::needs_confirmation`].
     pub confirm: Option<String>,
 }
