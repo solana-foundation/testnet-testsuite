@@ -171,7 +171,6 @@ export function Compose({ status }: { status: Status | null }) {
           scale: name,
           run_id: null,
           janitor: false,
-          close_programs: false,
           confirm: null,
         });
       }
