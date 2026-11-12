@@ -27,7 +27,7 @@ use solana_signer::Signer;
 use solana_transaction::Transaction;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, warn};
 
 use crate::confirm::{Confirmer, Verdict, Watch};
@@ -494,24 +494,40 @@ impl ChainClient {
             }
         }
 
+        // The confirmer applies the cap after a status read; this one holds
+        // when that read (or the whole tick) is stuck.
+        let timeout = delivery.watch.timeout;
+        let cap = sleep_until(Instant::now() + timeout + CAP_SLACK);
+        tokio::pin!(cap);
         let mut verdict = self.confirmer.watch(delivery.watch);
-        let verdict = match delivery.rebroadcast_interval {
-            None => verdict.await,
-            Some(interval) => {
-                let resend = RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    ..delivery.send
+        let resend = RpcSendTransactionConfig {
+            skip_preflight: true,
+            ..delivery.send
+        };
+        let interval = delivery.rebroadcast_interval;
+        let verdict = loop {
+            let wait = interval;
+            // Raced against the verdict, so a slow resend never delays it.
+            let rebroadcast = async move {
+                let Some(wait) = wait else {
+                    return std::future::pending().await;
                 };
-                loop {
-                    tokio::select! {
-                        verdict = &mut verdict => break verdict,
-                        () = sleep(interval) => {
-                            if let Err(error) = self.rpc.send_transaction_with_config(transaction, resend).await {
-                                debug!(%signature, %error, "rebroadcast failed");
-                            }
-                        }
-                    }
+                sleep(wait).await;
+                if let Err(error) = self
+                    .rpc
+                    .send_transaction_with_config(transaction, resend)
+                    .await
+                {
+                    debug!(%signature, %error, "rebroadcast failed");
                 }
+            };
+            tokio::select! {
+                biased;
+                verdict = &mut verdict => break verdict,
+                () = &mut cap => {
+                    break Ok(Verdict::Ambiguous(format!("no confirmation within {timeout:?}")));
+                }
+                () = rebroadcast => {}
             }
         };
         match verdict {
@@ -534,6 +550,10 @@ impl ChainClient {
 
     // TODO: account subscription trait with pubsub-ws and yellowstone-geyser backends.
 }
+
+/// How long past the hard cap a caller still waits for the confirmer's
+/// verdict before giving up on its own.
+const CAP_SLACK: Duration = Duration::from_secs(2);
 
 /// Smallest limit [`sized_compute_unit_limit`] requests.
 pub const MIN_SIZED_COMPUTE_UNITS: u32 = 10_000;

@@ -756,6 +756,50 @@ async fn status_polls_do_not_queue_behind_callers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_stuck_status_read_still_ends_at_the_cap() {
+    let mock = MockRpc::new(node(Value::Null)).with_delays(|method| {
+        (method == "getSignatureStatuses").then_some(Duration::from_secs(3600))
+    });
+    let started = tokio::time::Instant::now();
+    let error = client(&mock)
+        .send_versioned(
+            &signed(&Keypair::new()),
+            VersionedSendConfig {
+                confirmation_timeout: Duration::from_secs(5),
+                ..VersionedSendConfig::default()
+            },
+        )
+        .await
+        .expect_err("capped");
+    assert!(
+        matches!(error, SubmissionError::AmbiguousConfirmation { .. }),
+        "{error:?}"
+    );
+    assert!(started.elapsed() <= Duration::from_secs(8));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hanging_rebroadcast_does_not_delay_the_verdict() {
+    // The first send answers; the rebroadcast at 2 s never does. The
+    // transaction is seen landed at about 2.4 s.
+    let sends = AtomicUsize::new(0);
+    let mock = MockRpc::new(scripted(1000, after(5, mock::status(8, "confirmed", None))))
+        .with_delays(move |method| {
+            (method == "sendTransaction" && sends.fetch_add(1, Ordering::SeqCst) > 0)
+                .then_some(Duration::from_secs(3600))
+        });
+    let payer = Keypair::new();
+    let started = tokio::time::Instant::now();
+    let outcome = client(&mock)
+        .submit(vec![noop(&payer)], &payer, &[], SubmissionConfig::default())
+        .await
+        .expect("landed");
+    assert_eq!(outcome.confirmation_slot, 8);
+    assert_eq!(mock.count("sendTransaction"), 2);
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+#[tokio::test(start_paused = true)]
 async fn heights_are_read_before_statuses() {
     let mock = MockRpc::new(scripted(1000, after(3, mock::status(9, "confirmed", None))));
     client(&mock)
