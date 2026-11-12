@@ -1,8 +1,9 @@
-//! Oracle service: ingests real market data (Pyth Hermes), runs the pricing
-//! engine over the instrument registry, and serves the results over HTTP/WSS.
-//! On-chain pushing is parked until a testnet oracle program exists.
-//! `/health` is liveness; `/ready` reports whether every registered
-//! instrument has been published recently.
+//! Oracle service: ingests real market data (Pyth Hermes, Binance,
+//! CoinGecko), runs the pricing engine over the instrument registry, and
+//! serves the results over HTTP/WSS. On-chain pushing is parked until a
+//! testnet oracle program exists. `/health` is liveness; `/ready` reports
+//! whether every registered instrument has been published recently, and the
+//! same answer is exported as the `oracle_ready` gauge.
 
 pub mod api;
 pub mod binance;
@@ -88,6 +89,7 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
         "pricing engine",
         pricing::run(engine, tick_rx, state.clone()),
     ));
+    tasks.spawn(named("readiness gauges", record_readiness(state.clone())));
 
     if cfg.oracle.pusher.enabled {
         // Not supervised: the parked stub returns straight away.
@@ -101,6 +103,18 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
     info!(addr = %cfg.oracle.listen_addr, "oracle api listening");
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
     supervise(tasks, async move { server.await }).await
+}
+
+/// How often the `/ready` gauges are refreshed.
+const READINESS_INTERVAL: Duration = Duration::from_secs(1);
+
+async fn record_readiness(state: std::sync::Arc<AppState>) {
+    let mut tick = tokio::time::interval(READINESS_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        state.record_readiness(mtm_common::time::now_us()).await;
+    }
 }
 
 async fn named<F: Future<Output = ()>>(name: &'static str, task: F) -> &'static str {

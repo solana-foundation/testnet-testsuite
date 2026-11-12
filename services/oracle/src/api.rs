@@ -43,6 +43,26 @@ async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, String) {
     )
 }
 
+/// Where `oracle ready` probes by default: the compose listen port.
+pub const DEFAULT_READY_URL: &str = "http://127.0.0.1:8080/ready";
+
+/// Client side of `/ready`, for `oracle ready [URL]` as a container
+/// healthcheck (the distroless image has no curl). Ok only on a 200.
+pub async fn probe_ready(url: &str) -> anyhow::Result<()> {
+    let res = reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
+        .timeout(crate::HTTP_TIMEOUT)
+        .connect_timeout(crate::HTTP_CONNECT_TIMEOUT)
+        .build()?
+        .get(url)
+        .send()
+        .await?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    anyhow::ensure!(status.is_success(), "{url}: {status}: {body}");
+    Ok(())
+}
+
 async fn all_prices(State(state): State<Arc<AppState>>) -> Json<Vec<PricePoint>> {
     Json(state.all().await)
 }
@@ -191,5 +211,24 @@ mod tests {
             get(format!("{base}/ready")).await,
             (200, "ready".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn the_ready_probe_fails_until_every_instrument_is_fresh() {
+        let state = AppState::new(
+            vec![info("A/USD")],
+            ReadyLimits::uniform(Duration::from_secs(15)),
+        );
+        let base = serve(state.clone()).await;
+        let err = probe_ready(&format!("{base}/ready"))
+            .await
+            .expect_err("no price yet");
+        assert!(err.to_string().contains("A/USD: no price"), "{err}");
+        state
+            .update(point("A/USD", mtm_common::time::now_us()))
+            .await;
+        probe_ready(&format!("{base}/ready")).await.expect("ready");
+        // Nothing listening is a failure too.
+        assert!(probe_ready("http://127.0.0.1:1/ready").await.is_err());
     }
 }

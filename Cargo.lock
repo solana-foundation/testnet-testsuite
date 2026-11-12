@@ -2649,6 +2649,7 @@ dependencies = [
  "figment",
  "futures",
  "metrics",
+ "metrics-exporter-prometheus",
  "mtm-common",
  "mtm-telemetry",
  "oracle-client",

@@ -31,6 +31,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 figment = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [lints]
 workspace = true

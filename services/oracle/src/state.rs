@@ -90,6 +90,17 @@ impl AppState {
             .collect()
     }
 
+    /// Exports what `/ready` would answer as gauges, so a feed that retries
+    /// forever (and never exits) shows up in Prometheus: `oracle_ready`
+    /// (1 = every registered instrument is fresh) and
+    /// `oracle_not_ready_instruments`. Returns the not-ready count.
+    pub async fn record_readiness(&self, now_us: i64) -> usize {
+        let not_ready = self.not_ready(now_us).await.len();
+        metrics::gauge!("oracle_ready").set(if not_ready == 0 { 1.0 } else { 0.0 });
+        metrics::gauge!("oracle_not_ready_instruments").set(not_ready as f64);
+        not_ready
+    }
+
     pub async fn update(&self, point: PricePoint) {
         metrics::counter!("oracle_price_updates_total", "symbol" => point.symbol.to_string())
             .increment(1);
@@ -119,5 +130,76 @@ impl AppState {
 
     pub fn symbol_for_mint(&self, mint: &str) -> Option<&Symbol> {
         self.mint_to_symbol.get(mint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use oracle_client::{Price, PriceData, PriceSource};
+
+    use super::*;
+
+    fn info(symbol: &str) -> InstrumentInfo {
+        InstrumentInfo {
+            symbol: Symbol::new(symbol),
+            mint: None,
+            base: "peg".to_string(),
+            transforms: Vec::new(),
+        }
+    }
+
+    fn point(symbol: &str, received_at_us: i64) -> PricePoint {
+        PricePoint {
+            symbol: Symbol::new(symbol),
+            data: PriceData::Aggregate {
+                price: Price::new(100_000_000, -8),
+                conf: None,
+                ema: None,
+            },
+            publish_time_us: None,
+            received_at_us,
+            slot: None,
+            source: PriceSource::Derived,
+        }
+    }
+
+    fn gauge(rendered: &str, name: &str) -> String {
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing from:\n{rendered}"))
+            .to_string()
+    }
+
+    // Current-thread runtime: the thread-local recorder sees every gauge.
+    #[tokio::test]
+    async fn readiness_gauges_follow_the_price_map() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let state = AppState::new(
+            vec![info("A/USD"), info("B/USD")],
+            ReadyLimits::uniform(Duration::from_secs(15)),
+        );
+        let now = mtm_common::time::now_us();
+
+        assert_eq!(state.record_readiness(now).await, 2);
+        let rendered = handle.render();
+        assert_eq!(gauge(&rendered, "oracle_ready"), "0");
+        assert_eq!(gauge(&rendered, "oracle_not_ready_instruments"), "2");
+
+        state.update(point("A/USD", now)).await;
+        state.update(point("B/USD", now - 60_000_000)).await;
+        state.record_readiness(now).await;
+        let rendered = handle.render();
+        assert_eq!(gauge(&rendered, "oracle_ready"), "0");
+        assert_eq!(gauge(&rendered, "oracle_not_ready_instruments"), "1");
+
+        state.update(point("B/USD", now)).await;
+        assert_eq!(state.record_readiness(now).await, 0);
+        let rendered = handle.render();
+        assert_eq!(gauge(&rendered, "oracle_ready"), "1");
+        assert_eq!(gauge(&rendered, "oracle_not_ready_instruments"), "0");
     }
 }
