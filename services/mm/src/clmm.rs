@@ -246,7 +246,19 @@ enum Holding {
     Held,
     /// The close landed (but may not have been recorded: crash, timeout).
     Closed,
+    /// Held on a ledger that restarted below the open's slot (a local
+    /// validator or surfpool reset without a teardown): reads must be pinned
+    /// to `slot` from now on, not to the old ledger's open.
+    HeldAfterReset {
+        slot: u64,
+    },
 }
+
+/// How far below the open's slot the cluster must be before a refused
+/// pinned read is taken for a ledger reset rather than a lagging node. RPC
+/// nodes report unhealthy beyond 128 slots behind; a reset whose gap is
+/// smaller clears by itself within about two minutes.
+const LEDGER_RESET_SLOTS: u64 = 300;
 
 /// Accounts that show whether the wallet `owner` still has position `mint`:
 /// the NFT's classic and Token-2022 ATAs, and the position account (Orca
@@ -264,14 +276,53 @@ fn holding_keys(owner: Pubkey, mint: Pubkey, program: Pubkey) -> [Pubkey; 3] {
 /// from before the open. Closing burns the NFT and closes the position
 /// account in one instruction, so only both gone means closed; an NFT gone
 /// while its position account remains is an error, never a cleared state.
-async fn holding<R, Fut>(read: R, keys: [Pubkey; 3], opened_slot: Option<u64>) -> Result<Holding>
+///
+/// If the pinned read fails and `current_slot` is more than
+/// [`LEDGER_RESET_SLOTS`] below the open's slot, the ledger was reset: the
+/// old pin can never be met, so the accounts are read unpinned instead
+/// (gone means closed and the maker re-opens; still there is adopted).
+async fn holding<R, Fut, S, SFut>(
+    read: R,
+    current_slot: S,
+    keys: [Pubkey; 3],
+    opened_slot: Option<u64>,
+) -> Result<Holding>
 where
-    R: FnOnce([Pubkey; 3], Option<u64>) -> Fut,
+    R: Fn([Pubkey; 3], Option<u64>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Option<Vec<u8>>>>>,
+    S: FnOnce() -> SFut,
+    SFut: std::future::Future<Output = Result<u64>>,
 {
-    let accounts = read(keys, opened_slot)
-        .await
-        .context("reading the position NFT and account")?;
+    let accounts = match read(keys, opened_slot).await {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            let Some(opened) = opened_slot else {
+                return Err(error.context("reading the position NFT and account"));
+            };
+            let slot = current_slot()
+                .await
+                .context("reading the current slot after a refused position read")?;
+            if slot.saturating_add(LEDGER_RESET_SLOTS) >= opened {
+                return Err(error.context("reading the position NFT and account"));
+            }
+            warn!(
+                opened_slot = opened,
+                current_slot = slot,
+                "cluster is far below the position's open slot: ledger reset; re-reading unpinned"
+            );
+            let accounts = read(keys, None)
+                .await
+                .context("reading the position NFT and account after a ledger reset")?;
+            return Ok(match classify(&accounts, keys)? {
+                Holding::Held => Holding::HeldAfterReset { slot },
+                other => other,
+            });
+        }
+    };
+    classify(&accounts, keys)
+}
+
+fn classify(accounts: &[Option<Vec<u8>>], keys: [Pubkey; 3]) -> Result<Holding> {
     let nft = accounts
         .iter()
         .take(2)
@@ -402,8 +453,19 @@ impl Clmm {
             let read = |keys: [Pubkey; 3], min_context_slot| async move {
                 mtm_scenario::funding::account_data(&ctx.chain, &keys, min_context_slot).await
             };
-            if holding(read, keys, position.opened_slot).await? == Holding::Closed {
-                // The close landed but was not recorded (crash, timeout).
+            let current_slot = || ctx.chain.current_slot();
+            let held = holding(read, current_slot, keys, position.opened_slot).await?;
+            if let Holding::HeldAfterReset { slot } = held {
+                // Re-pin to the new ledger so later reads are protected again.
+                info!(maker = %ctx.maker.name, %mint, slot, "adopting the position after a ledger reset");
+                let mut adopted = position.clone();
+                adopted.opened_slot = Some(slot);
+                self.position = Some(adopted);
+                self.save()?;
+            }
+            if held == Holding::Closed {
+                // The close landed but was not recorded (crash, timeout), or
+                // the ledger was reset under the state file.
                 info!(maker = %ctx.maker.name, %mint, "position already closed");
             } else {
                 let (liquidity, mint_a, amount_a, _, amount_b) = self.lp.value(mint).await?;
@@ -601,7 +663,7 @@ mod tests {
     /// the state from before an open in a later slot.
     fn lagging_node(
         node_slot: u64,
-    ) -> impl FnOnce([Pubkey; 3], Option<u64>) -> std::future::Ready<Accounts> {
+    ) -> impl Fn([Pubkey; 3], Option<u64>) -> std::future::Ready<Accounts> {
         move |_, min_context_slot| {
             std::future::ready(match min_context_slot {
                 Some(slot) if slot > node_slot => {
@@ -621,12 +683,60 @@ mod tests {
         );
         // Pinned to the open's slot, the lagging node refuses: the tick
         // fails and the state file survives.
-        assert!(holding(lagging_node(90), keys, Some(100)).await.is_err());
+        assert!(
+            holding(lagging_node(90), slot(90), keys, Some(100))
+                .await
+                .is_err()
+        );
         // Unpinned (state files from before the slot was recorded), the
         // pre-open read looks closed: what the pin protects against.
         assert_eq!(
-            holding(lagging_node(90), keys, None).await.expect("read"),
+            holding(lagging_node(90), slot(90), keys, None)
+                .await
+                .expect("read"),
             Holding::Closed
+        );
+    }
+
+    /// A current-slot reader for [`holding`].
+    fn slot(slot: u64) -> impl FnOnce() -> std::future::Ready<Result<u64>> {
+        move || std::future::ready(Ok(slot))
+    }
+
+    #[tokio::test]
+    async fn a_ledger_reset_reopens_or_adopts_instead_of_stalling() {
+        let keys = holding_keys(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        // The state file pins slot 50,000 from the old ledger; the reset
+        // ledger is at 200 and the position is gone: closed, so the maker
+        // re-opens instead of failing every tick until slot 50,000.
+        assert_eq!(
+            holding(lagging_node(200), slot(200), keys, Some(50_000))
+                .await
+                .expect("read"),
+            Holding::Closed
+        );
+        // Still there on the new ledger: adopted and re-pinned to it.
+        let held = move |_: [Pubkey; 3], min_context_slot: Option<u64>| {
+            std::future::ready(match min_context_slot {
+                Some(_) => Err(anyhow::anyhow!("Minimum context slot has not been reached")),
+                None => Ok(vec![Some(nft_account(1)), None, Some(vec![0; 216])]),
+            })
+        };
+        assert_eq!(
+            holding(held, slot(200), keys, Some(50_000))
+                .await
+                .expect("read"),
+            Holding::HeldAfterReset { slot: 200 }
+        );
+        // A node only a little behind is a lag, not a reset: keep failing.
+        assert!(
+            holding(lagging_node(49_900), slot(49_900), keys, Some(50_000))
+                .await
+                .is_err()
         );
     }
 
@@ -638,21 +748,21 @@ mod tests {
             Pubkey::new_unique(),
         );
         let serve = |accounts: Vec<Option<Vec<u8>>>| {
-            move |_: [Pubkey; 3], _: Option<u64>| std::future::ready(Ok(accounts))
+            move |_: [Pubkey; 3], _: Option<u64>| std::future::ready(Ok(accounts.clone()))
         };
         let held = serve(vec![None, Some(nft_account(1)), Some(vec![0; 216])]);
         assert_eq!(
-            holding(held, keys, Some(1)).await.expect("read"),
+            holding(held, slot(1), keys, Some(1)).await.expect("read"),
             Holding::Held
         );
         let closed = serve(vec![None, None, None]);
         assert_eq!(
-            holding(closed, keys, Some(1)).await.expect("read"),
+            holding(closed, slot(1), keys, Some(1)).await.expect("read"),
             Holding::Closed
         );
         // An emptied NFT account with the position still open: not closed.
         let inconsistent = serve(vec![Some(nft_account(0)), None, Some(vec![0; 216])]);
-        assert!(holding(inconsistent, keys, Some(1)).await.is_err());
+        assert!(holding(inconsistent, slot(1), keys, Some(1)).await.is_err());
     }
 
     #[test]
