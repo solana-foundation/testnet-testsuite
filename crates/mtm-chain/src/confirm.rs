@@ -8,10 +8,14 @@
 //! The height is read before the statuses, so a status read in the tick
 //! that sees the blockhash expire is the final check: nothing found then
 //! means the transaction can no longer land.
+//!
+//! The confirmer's requests use their own permits (see `transport`), and a
+//! tick's status batches go out concurrently.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::join_all;
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_signature::Signature;
@@ -191,18 +195,23 @@ async fn run(
 
 /// One poll of every pending entry; returns those still pending.
 async fn tick(rpc: &RpcClient, mut pending: Vec<Pending>) -> Vec<Pending> {
-    let mut heights: Vec<(CommitmentConfig, Option<u64>)> = Vec::new();
+    let mut commitments: Vec<CommitmentConfig> = Vec::new();
     for entry in &pending {
-        let commitment = entry.watch.commitment;
-        if heights.iter().all(|(known, _)| *known != commitment) {
+        if !commitments.contains(&entry.watch.commitment) {
+            commitments.push(entry.watch.commitment);
+        }
+    }
+    // Every height before any status (see the module docs).
+    let heights: Vec<(CommitmentConfig, Option<u64>)> =
+        join_all(commitments.into_iter().map(|commitment| async move {
             let height = rpc
                 .get_block_height_with_commitment(commitment)
                 .await
                 .inspect_err(|error| debug!(%error, "block height read failed"))
                 .ok();
-            heights.push((commitment, height));
-        }
-    }
+            (commitment, height)
+        }))
+        .await;
     let height = |commitment: CommitmentConfig| {
         heights
             .iter()
@@ -210,22 +219,29 @@ async fn tick(rpc: &RpcClient, mut pending: Vec<Pending>) -> Vec<Pending> {
             .and_then(|(_, height)| *height)
     };
 
+    let batches: Vec<Vec<Signature>> = pending
+        .chunks(MAX_STATUS_BATCH)
+        .map(|batch| batch.iter().map(|entry| entry.watch.signature).collect())
+        .collect();
+    let responses = join_all(batches.iter().map(|signatures| async move {
+        let response = rpc.get_signature_statuses(signatures).await;
+        (response, Instant::now())
+    }))
+    .await;
+
     let mut verdicts: Vec<Option<Verdict>> = vec![None; pending.len()];
-    for start in (0..pending.len()).step_by(MAX_STATUS_BATCH) {
-        let end = (start + MAX_STATUS_BATCH).min(pending.len());
-        let signatures: Vec<Signature> = pending[start..end]
-            .iter()
-            .map(|entry| entry.watch.signature)
-            .collect();
-        let response = rpc.get_signature_statuses(&signatures).await;
-        let now = Instant::now();
-        match response {
-            Ok(response) => {
-                let mut statuses = response.value.into_iter();
-                for (entry, verdict) in pending[start..end]
-                    .iter_mut()
-                    .zip(&mut verdicts[start..end])
-                {
+    for ((entries, verdicts), (response, now)) in pending
+        .chunks_mut(MAX_STATUS_BATCH)
+        .zip(verdicts.chunks_mut(MAX_STATUS_BATCH))
+        .zip(responses)
+    {
+        let statuses = response
+            .map(|response| response.value)
+            .map_err(|error| error.to_string());
+        match statuses {
+            Ok(statuses) => {
+                let mut statuses = statuses.into_iter();
+                for (entry, verdict) in entries.iter_mut().zip(verdicts) {
                     let commitment = entry.watch.commitment;
                     let status = statuses.next().flatten().map(|status| Seen {
                         slot: status.slot,
@@ -236,12 +252,8 @@ async fn tick(rpc: &RpcClient, mut pending: Vec<Pending>) -> Vec<Pending> {
                 }
             }
             Err(error) => {
-                let error = error.to_string();
-                debug!(%error, signatures = signatures.len(), "status read failed");
-                for (entry, verdict) in pending[start..end]
-                    .iter_mut()
-                    .zip(&mut verdicts[start..end])
-                {
+                debug!(%error, signatures = entries.len(), "status read failed");
+                for (entry, verdict) in entries.iter_mut().zip(verdicts) {
                     *verdict = entry.on_error(&error, now);
                 }
             }

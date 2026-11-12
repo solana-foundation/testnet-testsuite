@@ -503,9 +503,29 @@ async fn send_versioned_resends_after_a_lost_response() {
     assert!(sent.iter().all(|params| params[0] == sent[0][0]));
 }
 
-/// A local HTTP endpoint answering every request with `status_line` (and
-/// no body); returns its URL and the JSON-RPC methods it was asked.
-async fn http_endpoint(status_line: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+/// How [`http_endpoint`] answers one JSON-RPC method: status line, extra
+/// header lines, body.
+type HttpAnswer = (&'static str, &'static str, String);
+
+/// Every request answered with `status_line`, `Retry-After: 0` and no body.
+fn every(status_line: &'static str) -> impl Fn(&str) -> HttpAnswer + Send + Sync + 'static {
+    move |_| (status_line, "Retry-After: 0\r\n", String::new())
+}
+
+/// A JSON-RPC success answer.
+fn http_ok(result: Value) -> HttpAnswer {
+    (
+        "200 OK",
+        "Content-Type: application/json\r\n",
+        json!({ "jsonrpc": "2.0", "id": 0, "result": result }).to_string(),
+    )
+}
+
+/// A local HTTP endpoint answering each request with `answer(method)`;
+/// returns its URL and the JSON-RPC methods it was asked.
+async fn http_endpoint(
+    answer: impl Fn(&str) -> HttpAnswer + Send + Sync + 'static,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -514,9 +534,11 @@ async fn http_endpoint(status_line: &'static str) -> (String, Arc<std::sync::Mut
     let url = format!("http://{}", listener.local_addr().expect("address"));
     let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = Arc::clone(&methods);
+    let answer = Arc::new(answer);
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             let seen = Arc::clone(&seen);
+            let answer = Arc::clone(&answer);
             tokio::spawn(async move {
                 let mut buffer = Vec::new();
                 let mut chunk = [0_u8; 4096];
@@ -543,12 +565,13 @@ async fn http_endpoint(status_line: &'static str) -> (String, Arc<std::sync::Mut
                     }
                     let body: Value = serde_json::from_slice(&buffer[end + 4..end + 4 + length])
                         .unwrap_or_default();
-                    seen.lock()
-                        .expect("methods lock")
-                        .push(body["method"].as_str().unwrap_or_default().to_owned());
+                    let method = body["method"].as_str().unwrap_or_default().to_owned();
+                    let (status_line, headers, body) = answer(&method);
+                    seen.lock().expect("methods lock").push(method);
                     buffer.drain(..end + 4 + length);
                     let response = format!(
-                        "HTTP/1.1 {status_line}\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n"
+                        "HTTP/1.1 {status_line}\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                        body.len()
                     );
                     if socket.write_all(response.as_bytes()).await.is_err() {
                         return;
@@ -570,7 +593,7 @@ async fn send_over_http(url: &str) -> SubmissionError {
 
 #[tokio::test]
 async fn http_429_on_send_is_rate_limited_and_not_polled() {
-    let (url, methods) = http_endpoint("429 Too Many Requests").await;
+    let (url, methods) = http_endpoint(every("429 Too Many Requests")).await;
     let error = send_over_http(&url).await;
     assert!(
         matches!(error, SubmissionError::RateLimited(_)),
@@ -585,13 +608,52 @@ async fn http_429_on_send_is_rate_limited_and_not_polled() {
 
 #[tokio::test]
 async fn http_5xx_on_send_is_unavailable_and_not_polled() {
-    let (url, methods) = http_endpoint("503 Service Unavailable").await;
+    let (url, methods) = http_endpoint(every("503 Service Unavailable")).await;
     let error = send_over_http(&url).await;
     assert!(
         matches!(error, SubmissionError::Unavailable(_)),
         "{error:?}"
     );
     assert_eq!(*methods.lock().expect("methods lock"), ["sendTransaction"]);
+}
+
+#[tokio::test]
+async fn a_rate_limited_request_does_not_hold_its_permit() {
+    // One permit. The send's 429s make `HttpSender` sleep 500 ms between
+    // retries; a read issued meanwhile goes through at once.
+    let (url, methods) = http_endpoint(|method| match method {
+        "sendTransaction" => ("429 Too Many Requests", "", String::new()),
+        _ => http_ok(json!(42)),
+    })
+    .await;
+    let chain = ChainClient::with_options(
+        url,
+        "confirmed",
+        ChainOptions {
+            max_in_flight: 1,
+            ..ChainOptions::default()
+        },
+    )
+    .expect("client");
+    let sender = chain.clone();
+    let send = tokio::spawn(async move {
+        sender
+            .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+            .await
+    });
+    while !methods
+        .lock()
+        .expect("methods lock")
+        .iter()
+        .any(|m| m == "sendTransaction")
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let started = std::time::Instant::now();
+    assert_eq!(chain.rpc().get_slot().await.expect("slot"), 42);
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_millis(300), "{waited:?}");
+    send.abort();
 }
 
 #[tokio::test]
@@ -661,4 +723,56 @@ fn sized_limits_keep_headroom_under_the_ceiling() {
     assert_eq!(sized_compute_unit_limit(200_000, 1_400_000), 240_000);
     assert_eq!(sized_compute_unit_limit(1_300_000, 1_400_000), 1_400_000);
     assert_eq!(sized_compute_unit_limit(u64::MAX, 1_400_000), 1_400_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_polls_do_not_queue_behind_callers() {
+    // One permit, held by a caller read that never returns: the confirmer
+    // still polls on its own permits.
+    let mock = MockRpc::new(|method, params| match method {
+        "getSlot" => Ok(json!(1)),
+        _ => node(mock::status(9, "confirmed", None))(method, params),
+    })
+    .with_delays(|method| (method == "getSlot").then_some(Duration::from_secs(3600)));
+    let options = ChainOptions {
+        max_in_flight: 1,
+        ..ChainOptions::default()
+    };
+    let chain = ChainClient::from_sender(mock.clone(), CommitmentConfig::confirmed(), options);
+    let reader = chain.clone();
+    let stuck = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        reader.rpc().get_slot().await
+    });
+    let started = tokio::time::Instant::now();
+    let outcome = chain
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect("confirmed");
+    assert_eq!(outcome.confirmation_slot, 9);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(mock.count("getSlot"), 1, "the caller holds the permit");
+    stuck.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn heights_are_read_before_statuses() {
+    let mock = MockRpc::new(scripted(1000, after(3, mock::status(9, "confirmed", None))));
+    client(&mock)
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect("landed");
+    let polls: Vec<String> = mock
+        .methods()
+        .into_iter()
+        .filter(|method| method == "getBlockHeight" || method == "getSignatureStatuses")
+        .collect();
+    let ticks: Vec<&[String]> = polls.chunks(2).collect();
+    assert_eq!(ticks.len(), 4, "{polls:?}");
+    assert!(
+        ticks
+            .iter()
+            .all(|tick| tick == &["getBlockHeight", "getSignatureStatuses"]),
+        "{polls:?}"
+    );
 }

@@ -18,18 +18,23 @@ use solana_signature::Signature;
 pub const BLOCKHASH: &str = "11111111111111111111111111111111";
 
 type Handler = dyn Fn(&str, &Value) -> ClientResult<Value> + Send + Sync;
+type Delays = dyn Fn(&str) -> Option<Duration> + Send + Sync;
 
+/// Clones share the call log and counters.
 #[derive(Clone)]
 pub struct MockRpc {
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     handler: Arc<Handler>,
-    /// Every answer takes this long.
+    /// Every answer takes this long...
     delay: Duration,
+    /// ...unless this says otherwise for a request (by method).
+    delays: Option<Arc<Delays>>,
     in_flight: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
 }
 
 impl MockRpc {
+    /// A mock answering every request with `handler(method, params)`.
     pub fn new(
         handler: impl Fn(&str, &Value) -> ClientResult<Value> + Send + Sync + 'static,
     ) -> Self {
@@ -37,13 +42,26 @@ impl MockRpc {
             calls: Arc::default(),
             handler: Arc::new(handler),
             delay: Duration::ZERO,
+            delays: None,
             in_flight: Arc::default(),
             peak: Arc::default(),
         }
     }
 
+    /// Every answer takes `delay`.
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    /// Per-request delays: `delays(method)` is called once per request,
+    /// in order (`None`: the [`Self::with_delay`] default). An hour stands
+    /// for a request that never returns within the test.
+    pub fn with_delays(
+        mut self,
+        delays: impl Fn(&str) -> Option<Duration> + Send + Sync + 'static,
+    ) -> Self {
+        self.delays = Some(Arc::new(delays));
         self
     }
 
@@ -63,8 +81,19 @@ impl MockRpc {
             .collect()
     }
 
+    /// Requests made so far for `method`.
     pub fn count(&self, method: &str) -> usize {
         self.calls(method).len()
+    }
+
+    /// Every method requested so far, in order.
+    pub fn methods(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 }
 
@@ -84,11 +113,16 @@ impl RpcSender for MockRpc {
             .expect("calls lock")
             .push((method.clone(), params.clone()));
         let result = (self.handler)(&method, &params);
+        let delay = self
+            .delays
+            .as_ref()
+            .and_then(|delays| delays(&method))
+            .unwrap_or(self.delay);
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
         Box::pin(async move {
-            if !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             result
@@ -104,11 +138,12 @@ impl RpcSender for MockRpc {
     }
 }
 
-/// `{context, value}` as RPC methods with a context return it.
+/// `{context, value}`, as RPC methods with a context return it.
 pub fn with_context(value: Value) -> Value {
     json!({ "context": { "slot": 1 }, "value": value })
 }
 
+/// A `getLatestBlockhash` answer ([`BLOCKHASH`]).
 pub fn latest_blockhash(last_valid_block_height: u64) -> Value {
     with_context(json!({
         "blockhash": BLOCKHASH,
@@ -116,6 +151,7 @@ pub fn latest_blockhash(last_valid_block_height: u64) -> Value {
     }))
 }
 
+/// A `simulateTransaction` answer.
 pub fn simulation(units_consumed: u64, err: Option<Value>) -> Value {
     with_context(json!({
         "err": err,

@@ -6,9 +6,8 @@ pub mod keys;
 mod mock;
 #[cfg(test)]
 mod tests;
+mod transport;
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,25 +15,23 @@ use anyhow::Context;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
-use solana_rpc_client::http_sender::HttpSender;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client::rpc_client::{RpcClientConfig, SerializableTransaction};
-use solana_rpc_client::rpc_sender::{RpcSender, RpcTransportStats};
-use solana_rpc_client_api::client_error::{
-    Error as ClientError, ErrorKind as RpcErrorKind, Result as ClientResult,
-};
+#[cfg(test)]
+use solana_rpc_client::rpc_sender::RpcSender;
+use solana_rpc_client_api::client_error::{Error as ClientError, ErrorKind as RpcErrorKind};
 use solana_rpc_client_api::config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
-use solana_rpc_client_api::request::{RpcError, RpcRequest, RpcResponseErrorData};
+use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::confirm::{Confirmer, Verdict, Watch};
+use crate::transport::Transport;
 
 /// Controls transaction construction, submission retries, and confirmation.
 #[derive(Clone, Copy, Debug)]
@@ -158,7 +155,10 @@ impl Default for VersionedSendConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct ChainOptions {
     /// RPC requests in flight at once, over every clone of the client and
-    /// its [`ChainClient::with_commitment`] views; the rest queue.
+    /// its [`ChainClient::with_commitment`] views; the rest queue. Over
+    /// HTTP this counts HTTP exchanges: no permit is held while the HTTP
+    /// sender sleeps before retrying an HTTP 429. The confirmer has its
+    /// own few permits on top, so status polls never queue behind callers.
     pub max_in_flight: usize,
     /// How often the shared confirmer polls pending transactions.
     pub confirm_interval: Duration,
@@ -179,47 +179,11 @@ impl Default for ChainOptions {
     }
 }
 
-/// The client's transport: every request waits for a permit first.
-#[derive(Clone)]
-struct Limited {
-    inner: Arc<dyn RpcSender + Send + Sync>,
-    permits: Arc<Semaphore>,
-}
-
-impl RpcSender for Limited {
-    // `RpcSender` is an `async_trait`; this is its expanded signature.
-    fn send<'life0, 'async_trait>(
-        &'life0 self,
-        request: RpcRequest,
-        params: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = ClientResult<serde_json::Value>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(async move {
-            let _permit = self
-                .permits
-                .acquire()
-                .await
-                .expect("the RPC semaphore is never closed");
-            self.inner.send(request, params).await
-        })
-    }
-
-    fn get_transport_stats(&self) -> RpcTransportStats {
-        self.inner.get_transport_stats()
-    }
-
-    fn url(&self) -> String {
-        self.inner.url()
-    }
-}
-
 #[derive(Clone)]
 pub struct ChainClient {
     rpc: Arc<RpcClient>,
-    transport: Limited,
+    /// The callers' transport, shared with [`Self::with_commitment`] views.
+    transport: Transport,
     confirmer: Arc<Confirmer>,
 }
 
@@ -234,31 +198,47 @@ impl ChainClient {
         options: ChainOptions,
     ) -> anyhow::Result<Self> {
         let commitment = parse_commitment(commitment)?;
-        let sender = match options.request_timeout {
-            Some(timeout) => HttpSender::new_with_timeout(http_url.into(), timeout),
-            None => HttpSender::new(http_url.into()),
-        };
-        Ok(Self::from_sender(sender, commitment, options))
+        let (callers, confirmer) = Transport::http(
+            http_url.into(),
+            options.request_timeout,
+            options.max_in_flight,
+        )
+        .context("failed to build the RPC HTTP client")?;
+        Ok(Self::assemble(callers, confirmer, commitment, options))
     }
 
     /// A client over any transport (the seam the state machine tests use).
+    /// Callers share `options.max_in_flight` permits per request; the
+    /// confirmer has its own.
+    #[cfg(test)]
     pub(crate) fn from_sender(
         sender: impl RpcSender + Send + Sync + 'static,
         commitment: CommitmentConfig,
         options: ChainOptions,
     ) -> Self {
-        let transport = Limited {
-            inner: Arc::new(sender),
-            permits: Arc::new(Semaphore::new(options.max_in_flight.max(1))),
-        };
+        let callers = Transport::limited(Arc::new(sender), options.max_in_flight);
+        let confirmer = callers.sibling(transport::CONFIRMER_MAX_IN_FLIGHT);
+        Self::assemble(callers, confirmer, commitment, options)
+    }
+
+    fn assemble(
+        callers: Transport,
+        confirmer: Transport,
+        commitment: CommitmentConfig,
+        options: ChainOptions,
+    ) -> Self {
         let rpc = Arc::new(RpcClient::new_sender(
-            transport.clone(),
+            callers.clone(),
+            RpcClientConfig::with_commitment(commitment),
+        ));
+        let confirmer_rpc = Arc::new(RpcClient::new_sender(
+            confirmer,
             RpcClientConfig::with_commitment(commitment),
         ));
         Self {
-            confirmer: Arc::new(Confirmer::new(Arc::clone(&rpc), options.confirm_interval)),
+            confirmer: Arc::new(Confirmer::new(confirmer_rpc, options.confirm_interval)),
             rpc,
-            transport,
+            transport: callers,
         }
     }
 
