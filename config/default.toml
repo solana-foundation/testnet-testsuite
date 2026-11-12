@@ -15,6 +15,10 @@ metrics_addr = "127.0.0.1:9100"
 # (instruments on a slower source cadence get twice that cadence instead).
 # /health is liveness only.
 ready_max_age_ms = 15000
+# Optional: save synthetic generator state (GBM price + RNG position, rebased
+# basket factors) here and restore it on restart, so a restart does not
+# re-anchor prices away from where pools sit. Unset: every start re-anchors.
+# state_path = ".state/oracle-pricing.json"
 
 [oracle.hermes]
 base_url = "https://hermes.pyth.network"

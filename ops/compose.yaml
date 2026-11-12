@@ -23,8 +23,11 @@ services:
       # optional; keyless works at the default 5-min cadence
       MTM_ORACLE__COINGECKO__API_KEY: ${COINGECKO_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
+      # restarts carry synthetic prices on instead of re-anchoring them
+      MTM_ORACLE__STATE_PATH: /app/state/pricing.json
     volumes:
       - ../config:/app/config:ro
+      - oracle-state:/app/state
     ports:
       # host loopback only — the oracle has no auth
       - "127.0.0.1:8080:8080"
@@ -78,5 +81,6 @@ services:
       - "127.0.0.1:3000:3000"
 
 volumes:
+  oracle-state:
   prometheus-data:
   grafana-data:

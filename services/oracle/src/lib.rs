@@ -41,7 +41,13 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
         .iter()
         .map(|u| u.symbol.clone())
         .collect();
-    let engine = pricing::Engine::from_config(&cfg.oracle.instruments, &underlying_symbols)?;
+    let mut engine = pricing::Engine::from_config(&cfg.oracle.instruments, &underlying_symbols)?;
+    if let Some(path) = &cfg.oracle.state_path
+        && let Some(saved) = pricing::load_state(path)
+    {
+        let restored = engine.restore(&saved);
+        info!(path = %path.display(), restored, "pricing state restored");
+    }
 
     let registry: Vec<InstrumentInfo> = cfg
         .oracle
@@ -87,7 +93,12 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
     drop(tick_tx);
     tasks.spawn(named(
         "pricing engine",
-        pricing::run(engine, tick_rx, state.clone()),
+        pricing::run(
+            engine,
+            tick_rx,
+            state.clone(),
+            cfg.oracle.state_path.clone(),
+        ),
     ));
     tasks.spawn(named("readiness gauges", record_readiness(state.clone())));
 

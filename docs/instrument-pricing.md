@@ -71,6 +71,14 @@ one, `gbm` synthesizes it from its configured vol, and `peg` has none.
   `oracle ready [URL]` (default `http://127.0.0.1:8080/ready`) exits 0 only
   on a 200, for container healthchecks
 
+## Restarts
+
+With `oracle.state_path` set, each GBM's price and RNG position and each
+rebased basket's factor are saved every 5 s and restored on start (for
+instruments whose base config is unchanged), so a restart continues the
+synthetic path instead of jumping back to `initial` or re-basing on the
+current legs. Transform state (noise, lag buffers) is not saved.
+
 ## Later
 
 - `jump` transform (scheduled/Poisson jumps, vol regimes, halts)

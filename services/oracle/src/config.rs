@@ -2,6 +2,7 @@
 //! `config/default.toml` <- `config/{MTM_PROFILE}.toml` <- `MTM_*` env vars.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use mtm_common::Symbol;
 pub use mtm_common::config::RpcConfig;
@@ -34,6 +35,11 @@ pub struct OracleConfig {
     /// cadence (CoinGecko polls, slow GBM clocks) get twice that cadence.
     #[serde(default = "default_ready_max_age_ms")]
     pub ready_max_age_ms: u64,
+    /// Where synthetic generator state (GBM price + RNG position, rebased
+    /// basket factors) is saved and restored across restarts. Unset: every
+    /// start re-anchors at the configured `initial` / `rebase`.
+    #[serde(default)]
+    pub state_path: Option<PathBuf>,
 }
 
 fn default_ready_max_age_ms() -> u64 {
