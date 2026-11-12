@@ -8,8 +8,9 @@
 //! last load failed: then they get that failure at once. Loads run in their
 //! own task, so a caller that is cancelled (request timeout, client gone)
 //! never cancels the load others are waiting on. Every load is bounded by
-//! `load_timeout`, and a failed load is cached for one `ttl` so a dead pool
-//! costs one attempt per `ttl`, not one per quote.
+//! `load_timeout`, and a failed load is cached for one `ttl` (at least
+//! [`MIN_FAILURE_BACKOFF`]) so a dead pool costs one attempt per backoff, not
+//! one per quote.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -54,6 +55,18 @@ pub struct CacheTimings {
     pub load_timeout: Duration,
 }
 
+/// Shortest time a failed pool waits before its next load, so `ttl = 0`
+/// (refresh on every quote) cannot reload a dead pool back to back.
+pub const MIN_FAILURE_BACKOFF: Duration = Duration::from_millis(200);
+
+impl CacheTimings {
+    /// How long a failure suppresses reloads: one `ttl`, at least
+    /// [`MIN_FAILURE_BACKOFF`].
+    pub fn failure_backoff(&self) -> Duration {
+        self.ttl.max(MIN_FAILURE_BACKOFF)
+    }
+}
+
 /// A snapshot, when its load started (its data is no older) and when it
 /// completed.
 #[derive(Debug, Clone)]
@@ -81,7 +94,8 @@ type InFlight<V> = Shared<BoxFuture<'static, Result<Loaded<V>, String>>>;
 
 struct PoolCache<V> {
     good: Option<Loaded<V>>,
-    /// Last failure and when it happened; suppresses reloads for one `ttl`.
+    /// Last failure and when it happened; suppresses reloads for one
+    /// failure backoff.
     failure: Option<(Instant, String)>,
     refresh: Option<InFlight<V>>,
 }
@@ -143,6 +157,7 @@ impl<V: Clone + Send + Sync + 'static> SnapshotCache<V> {
 
     fn next(&self, entry: &Entry) -> Next<V> {
         let CacheTimings { ttl, max_age, .. } = self.timings;
+        let backoff = self.timings.failure_backoff();
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         let pool = entries.entry(entry.pool).or_default();
@@ -155,7 +170,7 @@ impl<V: Clone + Send + Sync + 'static> SnapshotCache<V> {
         let failure_cached = pool
             .failure
             .as_ref()
-            .is_some_and(|(at, _)| now.saturating_duration_since(*at) < ttl);
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) < backoff);
         if pool.refresh.is_none() && !failure_cached {
             pool.refresh = Some(self.spawn_load(*entry));
         }
@@ -271,6 +286,19 @@ mod tests {
             delay: impl Fn(usize) -> Duration + Send + Sync + 'static,
             fails: impl Fn(usize) -> bool + Send + Sync + 'static,
         ) -> (Self, SnapshotCache<usize>) {
+            let timings = CacheTimings {
+                ttl: TTL,
+                max_age: MAX_AGE,
+                load_timeout: LOAD_TIMEOUT,
+            };
+            Self::with_timings(timings, delay, fails)
+        }
+
+        fn with_timings(
+            timings: CacheTimings,
+            delay: impl Fn(usize) -> Duration + Send + Sync + 'static,
+            fails: impl Fn(usize) -> bool + Send + Sync + 'static,
+        ) -> (Self, SnapshotCache<usize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             let counter = Arc::clone(&calls);
             let delay = Arc::new(delay);
@@ -289,11 +317,6 @@ mod tests {
                 }
                 .boxed()
             });
-            let timings = CacheTimings {
-                ttl: TTL,
-                max_age: MAX_AGE,
-                load_timeout: LOAD_TIMEOUT,
-            };
             (Self { calls }, SnapshotCache::new(timings, loader))
         }
 
@@ -512,6 +535,26 @@ mod tests {
         assert!(started.elapsed() > MAX_AGE);
         let result = cache.get(&entry(), Duration::ZERO).await;
         assert!(result.is_err(), "served past max age: {result:?}");
+    }
+
+    /// R2-ROUTER-5: `ttl = 0` still backs a failed pool off, at least
+    /// `MIN_FAILURE_BACKOFF` per load instead of one load per quote.
+    #[tokio::test(start_paused = true)]
+    async fn zero_ttl_keeps_a_failure_backoff() {
+        let timings = CacheTimings {
+            ttl: Duration::ZERO,
+            max_age: MAX_AGE,
+            load_timeout: LOAD_TIMEOUT,
+        };
+        let (fake, cache) = Fake::with_timings(timings, |_| Duration::ZERO, |_| true);
+        let window = Duration::from_secs(1);
+        let started = Instant::now();
+        while started.elapsed() < window {
+            assert!(cache.get(&entry(), Duration::from_millis(10)).await.is_err());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let most = (window.as_millis() / MIN_FAILURE_BACKOFF.as_millis()) as usize + 1;
+        assert!(fake.calls() <= most, "{} loads in {window:?}", fake.calls());
     }
 
     /// A failed refresh keeps the last good snapshot until it ages out.

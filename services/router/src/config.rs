@@ -43,7 +43,11 @@ pub struct RouterConfig {
     /// background refresh and quotes keep using the previous snapshot until
     /// `snapshot_max_age_ms`. Concurrent quotes always share one load.
     /// Without reuse every quote reloads every candidate pool: ~900 quotes/s
-    /// averaged 5 s per quote in load tests.
+    /// averaged 5 s per quote in load tests. A failed load is reused for one
+    /// TTL, at least 200 ms. `0` means a refresh starts with every quote
+    /// while none is in flight (still one load at a time per pool, and
+    /// quotes still use the previous snapshot meanwhile); a failed pool is
+    /// then retried every 200 ms.
     #[serde(default = "default_snapshot_ttl_ms")]
     pub snapshot_ttl_ms: u64,
     /// Hard bound on snapshot age when a quote is planned, counted from the
