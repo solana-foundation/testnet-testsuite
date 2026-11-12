@@ -605,3 +605,60 @@ async fn a_refused_connection_is_unavailable() {
         "{error:?}"
     );
 }
+
+/// Whether a base64 wire transaction (first param) carries
+/// `SetComputeUnitLimit(limit)`: data length 5, tag 2, the limit LE.
+fn has_compute_unit_limit(params: &Value, limit: u32) -> bool {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(params[0].as_str().expect("encoded transaction"))
+        .expect("base64");
+    let mut data = vec![5, 2];
+    data.extend_from_slice(&limit.to_le_bytes());
+    bytes.windows(data.len()).any(|window| window == data)
+}
+
+#[tokio::test(start_paused = true)]
+async fn submit_sizes_the_compute_unit_limit_from_the_simulation() {
+    let mock = MockRpc::new(node(mock::status(7, "confirmed", None)));
+    let payer = Keypair::new();
+    let outcome = client(&mock)
+        .submit(vec![noop(&payer)], &payer, &[], SubmissionConfig::default())
+        .await
+        .expect("confirmed");
+    // Simulated at the 1.4M ceiling, sent at 40k used + 10k headroom.
+    assert!(has_compute_unit_limit(
+        &mock.calls("simulateTransaction")[0],
+        1_400_000
+    ));
+    let sent = &mock.calls("sendTransaction")[0];
+    assert!(has_compute_unit_limit(sent, 50_000));
+    assert_eq!(
+        mock::sent_signature(sent),
+        json!(outcome.signature.to_string())
+    );
+
+    let exact = MockRpc::new(node(mock::status(7, "confirmed", None)));
+    let config = SubmissionConfig {
+        compute_unit_limit: 300_000,
+        size_compute_units: false,
+        ..SubmissionConfig::default()
+    };
+    client(&exact)
+        .submit(vec![noop(&payer)], &payer, &[], config)
+        .await
+        .expect("confirmed");
+    assert!(has_compute_unit_limit(
+        &exact.calls("sendTransaction")[0],
+        300_000
+    ));
+}
+
+#[test]
+fn sized_limits_keep_headroom_under_the_ceiling() {
+    use crate::sized_compute_unit_limit;
+    assert_eq!(sized_compute_unit_limit(450, 1_400_000), 10_450);
+    assert_eq!(sized_compute_unit_limit(200_000, 1_400_000), 240_000);
+    assert_eq!(sized_compute_unit_limit(1_300_000, 1_400_000), 1_400_000);
+    assert_eq!(sized_compute_unit_limit(u64::MAX, 1_400_000), 1_400_000);
+}

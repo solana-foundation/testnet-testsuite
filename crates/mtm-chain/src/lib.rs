@@ -39,7 +39,13 @@ use crate::confirm::{Confirmer, Verdict, Watch};
 /// Controls transaction construction, submission retries, and confirmation.
 #[derive(Clone, Copy, Debug)]
 pub struct SubmissionConfig {
+    /// The simulation's limit, and the ceiling of the sent one.
     pub compute_unit_limit: u32,
+    /// Send with the limit the simulation needs plus headroom (see
+    /// [`sized_compute_unit_limit`]) instead of `compute_unit_limit`:
+    /// leaders pack blocks by requested CU, and the priority fee is paid
+    /// per requested unit.
+    pub size_compute_units: bool,
     pub compute_unit_price_micro_lamports: u64,
     /// Blockhash, simulation, preflight and confirmation commitment.
     pub commitment: CommitmentConfig,
@@ -58,6 +64,7 @@ impl Default for SubmissionConfig {
     fn default() -> Self {
         Self {
             compute_unit_limit: 1_400_000,
+            size_compute_units: true,
             compute_unit_price_micro_lamports: 0,
             commitment: CommitmentConfig::confirmed(),
             max_send_attempts: 3,
@@ -302,19 +309,11 @@ impl ChainClient {
     /// ([`SubmissionError::Expired`]).
     pub async fn submit(
         &self,
-        mut instructions: Vec<Instruction>,
+        instructions: Vec<Instruction>,
         payer: &dyn Signer,
         additional_signers: &[&dyn Signer],
         config: SubmissionConfig,
     ) -> Result<SubmissionOutcome, SubmissionError> {
-        let mut budget = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(config.compute_unit_limit),
-            ComputeBudgetInstruction::set_compute_unit_price(
-                config.compute_unit_price_micro_lamports,
-            ),
-        ];
-        budget.append(&mut instructions);
-
         let (blockhash, last_valid_block_height) = self
             .rpc
             .get_latest_blockhash_with_commitment(config.commitment)
@@ -332,11 +331,23 @@ impl ChainClient {
                 signers.push(*signer);
             }
         }
-        let mut transaction = Transaction::new_with_payer(&budget, Some(&payer.pubkey()));
-        transaction
-            .try_sign(&signers, blockhash)
-            .map_err(|error| SubmissionError::Signing(error.to_string()))?;
-        let signature = transaction.signatures[0];
+        let build = |compute_unit_limit: u32| {
+            let mut budget = vec![
+                ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
+                ComputeBudgetInstruction::set_compute_unit_price(
+                    config.compute_unit_price_micro_lamports,
+                ),
+            ];
+            budget.extend(instructions.iter().cloned());
+            let mut transaction = Transaction::new_with_payer(&budget, Some(&payer.pubkey()));
+            transaction
+                .try_sign(&signers, blockhash)
+                .map_err(|error| SubmissionError::Signing(error.to_string()))?;
+            Ok::<_, SubmissionError>(transaction)
+        };
+        // Simulated at the ceiling, then (by default) sent with a limit
+        // sized to what the simulation used.
+        let mut transaction = build(config.compute_unit_limit)?;
 
         let simulation = self
             .rpc
@@ -356,6 +367,15 @@ impl ChainClient {
                 logs: simulation.value.logs.unwrap_or_default(),
             });
         }
+        if config.size_compute_units
+            && let Some(used) = simulation.value.units_consumed
+        {
+            let limit = sized_compute_unit_limit(used, config.compute_unit_limit);
+            if limit != config.compute_unit_limit {
+                transaction = build(limit)?;
+            }
+        }
+        let signature = transaction.signatures[0];
 
         let send = RpcSendTransactionConfig {
             skip_preflight: true,
@@ -530,6 +550,19 @@ impl ChainClient {
     }
 
     // TODO: account subscription trait with pubsub-ws and yellowstone-geyser backends.
+}
+
+/// Smallest limit [`sized_compute_unit_limit`] requests.
+pub const MIN_SIZED_COMPUTE_UNITS: u32 = 10_000;
+
+/// The CU limit for a transaction whose simulation used `used`: 20% more
+/// (at least [`MIN_SIZED_COMPUTE_UNITS`] more, for state that moves between
+/// simulation and landing), capped at `ceiling`.
+pub fn sized_compute_unit_limit(used: u64, ceiling: u32) -> u32 {
+    let headroom = (used / 5).max(u64::from(MIN_SIZED_COMPUTE_UNITS));
+    u32::try_from(used.saturating_add(headroom))
+        .unwrap_or(u32::MAX)
+        .min(ceiling)
 }
 
 /// How [`ChainClient::deliver`] sends and what it waits for.
