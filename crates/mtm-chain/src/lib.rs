@@ -89,6 +89,13 @@ pub enum SubmissionError {
     /// accepted.
     #[error("transaction submission failed: {0}")]
     Submission(String),
+    /// The RPC answered the send with HTTP 429: the node did not take it.
+    #[error("transaction send rate-limited by the RPC: {0}")]
+    RateLimited(String),
+    /// The send never reached the RPC (connection failed) or the RPC
+    /// answered with another HTTP error status (5xx): not taken.
+    #[error("RPC unavailable for the transaction send: {0}")]
+    Unavailable(String),
     /// Failed on chain, seen at the requested commitment.
     #[error("transaction {signature} failed in slot {slot}: {error}")]
     Execution {
@@ -112,6 +119,8 @@ pub enum SubmissionError {
 pub struct VersionedSendConfig {
     /// Skip the RPC's preflight simulation (when the caller simulated).
     pub skip_preflight: bool,
+    /// Send attempts while the response is lost (same signed bytes).
+    pub max_send_attempts: usize,
     /// Hard cap on the wait. Expiry of the blockhash normally decides first.
     pub confirmation_timeout: Duration,
     /// Give up as ambiguous after this many consecutive failed status reads.
@@ -129,6 +138,7 @@ impl Default for VersionedSendConfig {
     fn default() -> Self {
         Self {
             skip_preflight: false,
+            max_send_attempts: 3,
             confirmation_timeout: Duration::from_secs(90),
             max_status_errors: 5,
             last_valid_block_height: None,
@@ -383,7 +393,10 @@ impl ChainClient {
     ///
     /// Errors are typed for callers that classify outcomes: a preflight
     /// rejection is [`SubmissionError::Simulation`], an RPC rejection of
-    /// the send [`SubmissionError::Submission`], an on-chain failure (at
+    /// the send [`SubmissionError::Submission`] (or, when the node did not
+    /// take it at all, [`SubmissionError::RateLimited`] /
+    /// [`SubmissionError::Unavailable`], with no status polling), an
+    /// on-chain failure (at
     /// the commitment) [`SubmissionError::Execution`], expiry
     /// [`SubmissionError::Expired`], and an unknown status
     /// [`SubmissionError::AmbiguousConfirmation`]. A lost send response is
@@ -409,7 +422,7 @@ impl ChainClient {
                 signature,
                 Delivery {
                     send,
-                    max_send_attempts: 1,
+                    max_send_attempts: config.max_send_attempts,
                     rebroadcast_interval: config.rebroadcast_interval,
                     watch: Watch {
                         signature,
@@ -469,6 +482,12 @@ impl ChainClient {
                 SendFailure::Rejected => {
                     return Err(SubmissionError::Submission(error.to_string()));
                 }
+                SendFailure::RateLimited => {
+                    return Err(SubmissionError::RateLimited(error.to_string()));
+                }
+                SendFailure::Unavailable => {
+                    return Err(SubmissionError::Unavailable(error.to_string()));
+                }
             }
         }
 
@@ -526,6 +545,10 @@ enum SendFailure {
     Preflight { error: String, logs: Vec<String> },
     /// The node answered with an error: not accepted.
     Rejected,
+    /// HTTP 429: the request was refused before the node looked at it.
+    RateLimited,
+    /// The connection failed, or another HTTP error status: not taken.
+    Unavailable,
     /// The request may have reached the node.
     Ambiguous,
 }
@@ -542,6 +565,14 @@ fn classify_send_error(error: &ClientError) -> SendFailure {
                 .map_or_else(|| error.to_string(), |err| format!("{err:?}")),
             logs: result.logs.clone().unwrap_or_default(),
         },
+        RpcErrorKind::Reqwest(error) if error.status().is_some_and(|status| status.as_u16() == 429) => {
+            SendFailure::RateLimited
+        }
+        RpcErrorKind::Reqwest(error) if error.is_status() || error.is_connect() => {
+            SendFailure::Unavailable
+        }
+        // Timeouts, broken bodies and undecodable answers: the request may
+        // have been read.
         RpcErrorKind::Io(_)
         | RpcErrorKind::Reqwest(_)
         | RpcErrorKind::Middleware(_)

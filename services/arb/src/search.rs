@@ -116,6 +116,7 @@ impl<'s> Searcher<'s> {
                 "expired",
                 "ambiguous",
                 "send_failed",
+                "rpc_rejected",
                 "below_floor",
                 "simulation_failed",
                 "quote_failed",
@@ -384,6 +385,9 @@ impl<'s> Searcher<'s> {
                     SubmissionError::Expired { .. } => "expired",
                     SubmissionError::AmbiguousConfirmation { .. } => "ambiguous",
                     SubmissionError::Simulation { .. } => "simulation_failed",
+                    SubmissionError::RateLimited(_) | SubmissionError::Unavailable(_) => {
+                        "rpc_rejected"
+                    }
                     _ => "send_failed",
                 };
                 debug!(%error, route = ?route, "cycle not landed");

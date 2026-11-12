@@ -12,7 +12,7 @@
 //! Every trade ends in one [`Outcome`], exported as the `outcome` label of
 //! `flow_swaps_total` next to the coarse `status` (landed/failed), so market
 //! effects (unaffordable, preflight slippage, landed-failed) can be told
-//! apart from infrastructure faults (expired, ambiguous RPC). Once the router
+//! apart from infrastructure faults (expired, ambiguous or rejecting RPC). Once the router
 //! has quoted a route, `flow_venue_swaps_total` also counts the send's
 //! outcome once per venue the route touches, for per-venue failure rates.
 //!
@@ -263,6 +263,9 @@ enum Outcome {
     PreflightRejected,
     /// the RPC refused the transaction for another reason
     SendFailed,
+    /// the RPC did not take the send at all (HTTP 429/5xx, connection
+    /// failed): never reached the cluster, nothing was polled
+    RpcRejected,
     /// the swap landed and failed on-chain
     LandedFailed,
     /// the blockhash expired with no status observed
@@ -276,27 +279,42 @@ enum Outcome {
 
 impl Outcome {
     /// The outcomes of a quoted swap once it is sent.
-    const SENT: [Self; 6] = [
+    const SENT: [Self; 7] = [
         Self::Landed,
         Self::PreflightRejected,
         Self::SendFailed,
+        Self::RpcRejected,
         Self::LandedFailed,
         Self::Expired,
         Self::RpcAmbiguous,
     ];
 
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Landed,
         Self::Unaffordable,
         Self::NoPrice,
         Self::QuoteFailed,
         Self::PreflightRejected,
         Self::SendFailed,
+        Self::RpcRejected,
         Self::LandedFailed,
         Self::Expired,
         Self::RpcAmbiguous,
         Self::Error,
     ];
+
+    /// How a failed send ended.
+    fn of_send(error: &SubmissionError) -> Self {
+        match error {
+            SubmissionError::Simulation { .. } => Self::PreflightRejected,
+            SubmissionError::Submission(_) => Self::SendFailed,
+            SubmissionError::RateLimited(_) | SubmissionError::Unavailable(_) => Self::RpcRejected,
+            SubmissionError::Execution { .. } => Self::LandedFailed,
+            SubmissionError::Expired { .. } => Self::Expired,
+            SubmissionError::AmbiguousConfirmation { .. } => Self::RpcAmbiguous,
+            _ => Self::Error,
+        }
+    }
 
     fn status(self) -> &'static str {
         if self == Self::Landed {
@@ -314,6 +332,7 @@ impl Outcome {
             Self::QuoteFailed => "quote_failed",
             Self::PreflightRejected => "preflight_rejected",
             Self::SendFailed => "send_failed",
+            Self::RpcRejected => "rpc_rejected",
             Self::LandedFailed => "landed_failed",
             Self::Expired => "expired",
             Self::RpcAmbiguous => "rpc_ambiguous",
@@ -618,17 +637,7 @@ impl Flow<'_> {
             .await
         {
             Ok(outcome) => Ok((outcome.signature, outcome.confirmation_slot)),
-            Err(error) => {
-                let outcome = match &error {
-                    SubmissionError::Simulation { .. } => Outcome::PreflightRejected,
-                    SubmissionError::Submission(_) => Outcome::SendFailed,
-                    SubmissionError::Execution { .. } => Outcome::LandedFailed,
-                    SubmissionError::Expired { .. } => Outcome::Expired,
-                    SubmissionError::AmbiguousConfirmation { .. } => Outcome::RpcAmbiguous,
-                    _ => Outcome::Error,
-                };
-                fail(outcome, error.into())
-            }
+            Err(error) => fail(Outcome::of_send(&error), error.into()),
         }
     }
 
@@ -739,5 +748,27 @@ mod tests {
         assert_eq!(micro_usd(Decimal::new(123_456_789, 7)), 12_345_679);
         assert_eq!(micro_usd(Decimal::new(4, 1)), 400_000);
         assert_eq!(micro_usd(Decimal::new(-1, 0)), 0);
+    }
+
+    #[test]
+    fn sends_the_rpc_did_not_take_are_rpc_rejected() {
+        for error in [
+            SubmissionError::RateLimited("429".to_owned()),
+            SubmissionError::Unavailable("503".to_owned()),
+        ] {
+            assert_eq!(Outcome::of_send(&error).as_str(), "rpc_rejected");
+        }
+        let signature = Signature::default();
+        let ambiguous = SubmissionError::AmbiguousConfirmation {
+            signature,
+            reason: String::new(),
+        };
+        assert_eq!(Outcome::of_send(&ambiguous), Outcome::RpcAmbiguous);
+        assert_eq!(
+            Outcome::of_send(&SubmissionError::Expired { signature }),
+            Outcome::Expired
+        );
+        assert!(Outcome::SENT.contains(&Outcome::RpcRejected));
+        assert!(Outcome::ALL.contains(&Outcome::RpcRejected));
     }
 }

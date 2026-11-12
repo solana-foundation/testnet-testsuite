@@ -485,3 +485,123 @@ async fn the_hard_cap_ends_the_wait() {
         "{error:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn send_versioned_resends_after_a_lost_response() {
+    let sends = AtomicUsize::new(0);
+    let healthy = node(mock::status(9, "confirmed", None));
+    let mock = MockRpc::new(move |method, params| match method {
+        "sendTransaction" if sends.fetch_add(1, Ordering::SeqCst) < 2 => Err(mock::io_error()),
+        _ => healthy(method, params),
+    });
+    client(&mock)
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect("landed");
+    let sent = mock.calls("sendTransaction");
+    assert_eq!(sent.len(), 3);
+    assert!(sent.iter().all(|params| params[0] == sent[0][0]));
+}
+
+/// A local HTTP endpoint answering every request with `status_line` (and
+/// no body); returns its URL and the JSON-RPC methods it was asked.
+async fn http_endpoint(status_line: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&methods);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    // One request: headers, then Content-Length bytes.
+                    let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buffer.len() < end + 4 + length {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let body: Value = serde_json::from_slice(&buffer[end + 4..end + 4 + length])
+                        .unwrap_or_default();
+                    seen.lock()
+                        .expect("methods lock")
+                        .push(body["method"].as_str().unwrap_or_default().to_owned());
+                    buffer.drain(..end + 4 + length);
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    if socket.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (url, methods)
+}
+
+async fn send_over_http(url: &str) -> SubmissionError {
+    ChainClient::new(url, "confirmed")
+        .expect("client")
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect_err("not taken")
+}
+
+#[tokio::test]
+async fn http_429_on_send_is_rate_limited_and_not_polled() {
+    let (url, methods) = http_endpoint("429 Too Many Requests").await;
+    let error = send_over_http(&url).await;
+    assert!(
+        matches!(error, SubmissionError::RateLimited(_)),
+        "{error:?}"
+    );
+    let methods = methods.lock().expect("methods lock");
+    assert!(
+        methods.iter().all(|method| method == "sendTransaction"),
+        "{methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn http_5xx_on_send_is_unavailable_and_not_polled() {
+    let (url, methods) = http_endpoint("503 Service Unavailable").await;
+    let error = send_over_http(&url).await;
+    assert!(
+        matches!(error, SubmissionError::Unavailable(_)),
+        "{error:?}"
+    );
+    assert_eq!(*methods.lock().expect("methods lock"), ["sendTransaction"]);
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_unavailable() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    drop(listener);
+    let error = send_over_http(&url).await;
+    assert!(
+        matches!(error, SubmissionError::Unavailable(_)),
+        "{error:?}"
+    );
+}
