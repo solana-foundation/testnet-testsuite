@@ -16,5 +16,9 @@ jobs:
       - run: rustup toolchain install # picks up rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      - name: scenario dashboard matches its generator
+        run: |
+          python3 bootstrap/scenario/dashboard.py "$RUNNER_TEMP/scenario.json"
+          python3 -c 'import json, sys; a, b = (json.load(open(p)) for p in sys.argv[1:]); sys.exit(a != b and "ops/grafana/dashboards/scenario.json differs from dashboard.py: regenerate it")' "$RUNNER_TEMP/scenario.json" ops/grafana/dashboards/scenario.json
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

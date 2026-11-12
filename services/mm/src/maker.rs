@@ -124,6 +124,21 @@ impl Ctx {
         }
     }
 
+    /// Register this maker's action series at zero: `increase()` cannot see
+    /// the first increment of a series that appears mid-window, so a
+    /// report would miss each maker's first action of every kind.
+    pub fn register_actions(&self) {
+        let actions: &[&'static str] = match self.maker.strategy {
+            Strategy::ClobLadder { .. } => &["requote", "pull"],
+            Strategy::ClmmRange { .. } => &["open", "close"],
+            Strategy::PoolArb { .. } => &["arb_buy", "arb_sell"],
+        };
+        for action in actions {
+            counter!("mm_actions_total", "maker" => self.name(), "venue" => self.maker.venue.as_str(), "action" => *action)
+                .absolute(0);
+        }
+    }
+
     pub fn action(&self, action: &'static str) {
         counter!("mm_actions_total", "maker" => self.name(), "venue" => self.maker.venue.as_str(), "action" => action)
             .increment(1);
@@ -148,6 +163,7 @@ enum State {
 /// retries. A stop request waits for the current tick: a re-centre is never
 /// cut between its transactions.
 pub async fn run(ctx: Ctx, mut stop: tokio::sync::watch::Receiver<bool>) {
+    ctx.register_actions();
     let mut state = loop {
         let built = match &ctx.maker.strategy {
             Strategy::ClobLadder { .. } => clob::Clob::start(&ctx)

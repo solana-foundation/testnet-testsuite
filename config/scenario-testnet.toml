@@ -10,6 +10,11 @@
 [rpc]
 http_url = "https://api.testnet.solana.com"
 ws_url = "wss://api.testnet.solana.com"
+# Per process, and every service on the host shares the public endpoint's
+# per-IP limits (about 40 concurrent connections, 100 requests / 10 s): 8
+# each keeps flow, mm, arb and scenario together under the connection cap.
+# Raise it with a dedicated RPC (MTM_RPC__MAX_IN_FLIGHT).
+max_in_flight = 8
 
 # --- oracle: keyless external prices -------------------------------------------
 # Binance top-of-book for JUP and RAY; USDC pegged. Arrays replace the
@@ -259,3 +264,28 @@ inventory = { JUP = "60000", RAY = "8000", USDC = "25000" }
 sol = "2"
 refill_below_ratio = "0.25"
 rng_seed = 7
+
+# --- cross-venue arbitrage: reacts to pool changes caused by flow -------------
+# Oracle-free: searches 2-leg (same pair, two venues) and 3-leg (triangular)
+# cycles across every pool above whenever a pool account changes.
+
+[arb]
+metrics_addr = "127.0.0.1:9184"
+
+[scenario.arb]
+poll_ms = 5000
+debounce_ms = 250
+# Snapshots, pool subscriptions and the pre-send simulation read at this
+# commitment; cycles still confirm and are accounted at rpc.commitment, and
+# it may not be older than that (no "finalized" over "confirmed").
+# search_commitment = "processed"
+
+[[scenario.arb.bots]]
+name = "searcher"
+start_tokens = ["USDC", "JUP", "RAY"]
+max_legs = 3
+min_profit_usd = "0.50"
+max_trade_usd = "5000"
+leg_slippage_bps = 5
+inventory = { USDC = "20000", JUP = "50000", RAY = "8000" }
+sol = "3"

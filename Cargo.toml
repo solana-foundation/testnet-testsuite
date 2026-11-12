@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "services/arb",
     "crates/mtm-chain",
     "crates/mtm-common",
     "crates/mtm-dex-harness",
@@ -80,6 +81,10 @@ solana-program-error = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 solana-rpc-client = "4.2.1"
+# The HTTP stack under solana-rpc-client's `HttpSender` (mtm-chain hooks each
+# HTTP attempt): keep these on the versions solana-rpc-client uses.
+reqwest-middleware = "0.4.2"
+http = "1"
 solana-commitment-config = "3"
 solana-compute-budget-interface = "3"
 solana-hash = "4"
@@ -93,6 +98,7 @@ solana-signer = "3"
 solana-transaction = "4"
 solana-account = "4.3"
 solana-rpc-client-api = "4.2.1"
+solana-pubsub-client = "4.2.1"
 solana-account-decoder-client-types = "4"
 anchor-lang = "0.32.1"
 spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }

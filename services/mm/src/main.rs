@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use mtm_chain::ChainClient;
+use mtm_chain::{ChainClient, ChainOptions};
 use mtm_common::config::RpcConfig;
 use mtm_scenario::{Scenario, ScenarioConfig};
 use serde::Deserialize;
@@ -57,7 +57,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     mtm_telemetry::init("mm", cfg.mm.metrics_addr)?;
-    let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    let chain = ChainClient::with_options(
+        &cfg.rpc.http_url,
+        &cfg.rpc.commitment,
+        ChainOptions {
+            max_in_flight: cfg.rpc.max_in_flight,
+            ..ChainOptions::default()
+        },
+    )?;
     let scenario = Arc::new(Scenario::resolve(cfg.scenario, &chain).await?);
     std::fs::create_dir_all(&cli.state_dir)?;
 

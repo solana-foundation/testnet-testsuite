@@ -5,6 +5,11 @@
 http_url = "http://127.0.0.1:8899"
 ws_url = "ws://127.0.0.1:8900"
 commitment = "confirmed"
+# RPC requests each service process keeps in flight in total; the rest queue.
+# Per process, not per stack: flow splits it over its shards (one per core),
+# and mm, arb and scenario each have their own 128. Profiles that point at a
+# shared RPC set it lower.
+max_in_flight = 128
 
 # --- oracle service -----------------------------------------------------------
 

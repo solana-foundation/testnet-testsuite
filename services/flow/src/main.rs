@@ -12,7 +12,13 @@
 //! Every trade ends in one [`Outcome`], exported as the `outcome` label of
 //! `flow_swaps_total` next to the coarse `status` (landed/failed), so market
 //! effects (unaffordable, preflight slippage, landed-failed) can be told
-//! apart from infrastructure faults (expired, ambiguous RPC).
+//! apart from infrastructure faults (expired, ambiguous or rejecting RPC). Once the router
+//! has quoted a route, `flow_venue_swaps_total` also counts the send's
+//! outcome once per venue the route touches, for per-venue failure rates.
+//! A taker whose trade the RPC refused (`rpc_rejected`: HTTP 429/5xx or no
+//! connection, on the balance read or the send) skips its refill read and
+//! backs off, doubling up to 30 s with jitter, so a rate-limited RPC is not
+//! hammered by every taker at once.
 //!
 //! Each landed swap is a `debug` line; `info` gets one summary a minute
 //! (outcome counts), so a long run at thousands of swaps per second doesn't
@@ -28,7 +34,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use metrics::{counter, gauge, histogram};
-use mtm_chain::ChainClient;
+use mtm_chain::{ChainClient, ChainOptions, SubmissionError, VersionedSendConfig};
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::signer_from_environment;
 use mtm_scenario::funding::{Funding, LAMPORTS_PER_SOL, top_up, wallet_balances};
@@ -39,16 +45,13 @@ use oracle_client::OracleClient;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Exp, LogNormal, Uniform};
-use router_client::{Execution, QuoteRequest, RouterClient, SwapMode};
+use router_client::{Execution, QuoteRequest, RouteLeg, RouterClient, SwapMode};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use solana_keypair::Keypair;
-use solana_rpc_client_api::client_error::ErrorKind as RpcErrorKind;
-use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_signature::Signature;
 use solana_signer::Signer;
-use solana_transaction::Hash;
 use solana_transaction::versioned::VersionedTransaction;
 use tracing::{debug, error, info, warn};
 
@@ -81,7 +84,14 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     mtm_telemetry::init("flow", cfg.flow.metrics_addr)?;
-    let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    let chain = ChainClient::with_options(
+        &cfg.rpc.http_url,
+        &cfg.rpc.commitment,
+        ChainOptions {
+            max_in_flight: cfg.rpc.max_in_flight,
+            ..ChainOptions::default()
+        },
+    )?;
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let flow = scenario
         .config
@@ -98,6 +108,33 @@ async fn main() -> Result<()> {
             None
         }
     };
+    // Every swap series at zero: `increase()` misses the first increment
+    // of a series that appears mid-window.
+    for (a, b) in &flow.pairs {
+        for size in ["normal", "large"] {
+            for outcome in Outcome::ALL {
+                counter!("flow_swaps_total", "pair" => format!("{a}/{b}"), "status" => outcome.status(), "outcome" => outcome.as_str(), "size" => size)
+                    .absolute(0);
+            }
+        }
+    }
+    let mut venues: Vec<&str> = scenario
+        .config
+        .pools
+        .iter()
+        .map(|pool| pool.venue.as_str())
+        .collect();
+    venues.sort_unstable();
+    venues.dedup();
+    for venue in venues {
+        for outcome in Outcome::SENT {
+            counter!("flow_venue_swaps_total", "venue" => venue, "status" => outcome.status(), "outcome" => outcome.as_str())
+                .absolute(0);
+        }
+    }
+    for name in ["flow_rpc_backoffs_total", "flow_refill_errors_total"] {
+        counter!(name).absolute(0);
+    }
     let takers: Vec<Keypair> = (0..flow.takers).map(|i| scenario.taker_wallet(i)).collect();
     anyhow::ensure!(!takers.is_empty(), "the flow needs at least one taker");
     // Takers are sharded over OS threads, each with its own single-threaded
@@ -109,9 +146,15 @@ async fn main() -> Result<()> {
     let shards = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(takers.len());
+    // `rpc.max_in_flight` bounds the whole process: each shard's client
+    // gets its share, so the load on the RPC does not grow with the core
+    // count.
+    let shard_in_flight = per_shard(cfg.rpc.max_in_flight, shards);
     info!(
         takers = takers.len(),
         shards,
+        max_in_flight = cfg.rpc.max_in_flight,
+        shard_in_flight,
         rate_per_min = flow.rate_per_min,
         "flow started"
     );
@@ -133,7 +176,14 @@ async fn main() -> Result<()> {
                             let engine = Flow {
                                 router: RouterClient::new(&scenario.config.router_url),
                                 oracle: OracleClient::new(&scenario.config.oracle_url),
-                                chain: ChainClient::new(&rpc.http_url, &rpc.commitment)?,
+                                chain: ChainClient::with_options(
+                                    &rpc.http_url,
+                                    &rpc.commitment,
+                                    ChainOptions {
+                                        max_in_flight: shard_in_flight,
+                                        ..ChainOptions::default()
+                                    },
+                                )?,
                                 scenario,
                                 flow,
                                 refill,
@@ -226,18 +276,79 @@ enum Outcome {
     PreflightRejected,
     /// the RPC refused the transaction for another reason
     SendFailed,
+    /// the RPC refused a request of this trade (HTTP 429/5xx, connection
+    /// failed), the balance read before the quote or the send: the swap
+    /// never reached the cluster, nothing was polled
+    RpcRejected,
     /// the swap landed and failed on-chain
     LandedFailed,
     /// the blockhash expired with no status observed
     Expired,
     /// the status could not be determined (RPC errors or the deadline):
-    /// the swap may or may not have landed
+    /// the swap may or may not have landed; also a balance read before the
+    /// quote that the RPC served but that failed (timeout, bad answer)
     RpcAmbiguous,
     /// anything else (decode, signing, local errors)
     Error,
 }
 
 impl Outcome {
+    /// The outcomes of a quoted swap once it is sent.
+    const SENT: [Self; 7] = [
+        Self::Landed,
+        Self::PreflightRejected,
+        Self::SendFailed,
+        Self::RpcRejected,
+        Self::LandedFailed,
+        Self::Expired,
+        Self::RpcAmbiguous,
+    ];
+
+    const ALL: [Self; 11] = [
+        Self::Landed,
+        Self::Unaffordable,
+        Self::NoPrice,
+        Self::QuoteFailed,
+        Self::PreflightRejected,
+        Self::SendFailed,
+        Self::RpcRejected,
+        Self::LandedFailed,
+        Self::Expired,
+        Self::RpcAmbiguous,
+        Self::Error,
+    ];
+
+    /// How a failed send ended.
+    fn of_send(error: &SubmissionError) -> Self {
+        match error {
+            SubmissionError::Simulation { .. } => Self::PreflightRejected,
+            SubmissionError::Submission(_) => Self::SendFailed,
+            SubmissionError::RateLimited(_) | SubmissionError::Unavailable(_) => Self::RpcRejected,
+            SubmissionError::Execution { .. } => Self::LandedFailed,
+            SubmissionError::Expired { .. } => Self::Expired,
+            SubmissionError::AmbiguousConfirmation { .. } => Self::RpcAmbiguous,
+            _ => Self::Error,
+        }
+    }
+
+    /// How a failed RPC read before the send ended: a refusal is the same
+    /// fault as a refused send.
+    fn of_read(error: &anyhow::Error) -> Self {
+        if mtm_chain::refused_by_rpc(error) {
+            Self::RpcRejected
+        } else {
+            Self::RpcAmbiguous
+        }
+    }
+
+    fn status(self) -> &'static str {
+        if self == Self::Landed {
+            "landed"
+        } else {
+            "failed"
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Landed => "landed",
@@ -246,6 +357,7 @@ impl Outcome {
             Self::QuoteFailed => "quote_failed",
             Self::PreflightRejected => "preflight_rejected",
             Self::SendFailed => "send_failed",
+            Self::RpcRejected => "rpc_rejected",
             Self::LandedFailed => "landed_failed",
             Self::Expired => "expired",
             Self::RpcAmbiguous => "rpc_ambiguous",
@@ -281,21 +393,20 @@ impl<T> OutcomeContext<T> for Option<T> {
     }
 }
 
+/// Each venue a route touches, once, in route order.
+fn route_venues(route: &[RouteLeg]) -> Vec<&str> {
+    let mut venues: Vec<&str> = Vec::with_capacity(route.len());
+    for leg in route {
+        if !venues.contains(&leg.venue.as_str()) {
+            venues.push(&leg.venue);
+        }
+    }
+    venues
+}
+
 fn fail<T>(outcome: Outcome, error: anyhow::Error) -> std::result::Result<T, TradeError> {
     Err(TradeError { outcome, error })
 }
-
-/// How long to poll a sent swap's status, and how often. Expiry normally
-/// ends the wait first; the deadline is a backstop for an RPC that keeps
-/// failing the expiry check or a stalled chain. It sits well above the ~60 s
-/// a blockhash lives at 400 ms blocks, so a slow chain still reports
-/// `expired` rather than `rpc_ambiguous`.
-const CONFIRM_DEADLINE: Duration = Duration::from_secs(180);
-const STATUS_POLL: Duration = Duration::from_millis(400);
-/// Check for expiry every this many status polls.
-const BLOCKHASH_CHECK_EVERY: u32 = 5;
-/// A status RPC failing this many polls in a row ends the wait.
-const MAX_STATUS_ERRORS: u32 = 5;
 
 impl Flow<'_> {
     /// Every taker is an independent Poisson process at `rate / takers`
@@ -339,6 +450,12 @@ impl Flow<'_> {
         let size = LogNormal::new(self.flow.median_usd.ln(), self.flow.sigma).context("sigma")?;
         let unit = Uniform::new(0.0_f64, 1.0).context("uniform")?;
         let pairs = self.flow.pairs.len();
+        // Backoff jitter has its own stream, so rejections (which depend on
+        // the RPC, not the seed) do not shift the replayable trade sequence.
+        let mut jitter = ChaCha8Rng::seed_from_u64(
+            self.flow.rng_seed.wrapping_add(index as u64) ^ JITTER_STREAM,
+        );
+        let mut backoff = Backoff::default();
         loop {
             // The 10-minute cap only bites at very low per-taker rates; it
             // keeps a single unlucky draw from idling a taker for hours.
@@ -367,8 +484,8 @@ impl Flow<'_> {
             };
             let label = format!("{}/{}", pair.0, pair.1);
             let size_label = if large { "large" } else { "normal" };
-            let (status, outcome) = match self.trade(taker, &trade).await {
-                Ok(()) => ("landed", Outcome::Landed),
+            let outcome = match self.trade(taker, &trade).await {
+                Ok(()) => Outcome::Landed,
                 Err(TradeError { outcome, error }) => {
                     // Routine market outcomes are metrics, not log lines: at
                     // high rates a warn per failed trade floods the logs.
@@ -377,20 +494,30 @@ impl Flow<'_> {
                     } else {
                         debug!(taker = index, %label, outcome = outcome.as_str(), error = %format!("{error:#}"), "trade failed");
                     }
-                    ("failed", outcome)
+                    outcome
                 }
             };
             self.tally.add(outcome.as_str());
             counter!(
                 "flow_swaps_total",
                 "pair" => label,
-                "status" => status,
+                "status" => outcome.status(),
                 "outcome" => outcome.as_str(),
                 "size" => size_label
             )
             .increment(1);
+            // A refused RPC is not asked again at once: no refill read,
+            // and a pause before the next arrival.
+            if let Some(pause) = backoff.after(outcome, unit.sample(&mut jitter)) {
+                counter!("flow_rpc_backoffs_total").increment(1);
+                tokio::time::sleep(pause).await;
+                continue;
+            }
             if let Err(error) = self.refill(taker).await {
-                warn!(taker = index, error = %format!("{error:#}"), "refill failed");
+                // Counted, not warned: in an RPC outage every trade's refill
+                // read fails.
+                counter!("flow_refill_errors_total").increment(1);
+                debug!(taker = index, error = %format!("{error:#}"), "refill failed");
             }
         }
     }
@@ -407,9 +534,11 @@ impl Flow<'_> {
         // One read of both sides, before the quote: it decides the
         // direction and is the baseline for the fill, and nothing sits
         // between the quote and the send.
-        let before = wallet_balances(&self.chain, &owner, &[trade.input, trade.output], None)
-            .await
-            .outcome(Outcome::RpcAmbiguous)?;
+        let before =
+            match wallet_balances(&self.chain, &owner, &[trade.input, trade.output], None).await {
+                Ok(before) => before,
+                Err(error) => return fail(Outcome::of_read(&error), error),
+            };
         let notional = trade.notional;
         let affordable = |token: &Token, balance: u64| -> std::result::Result<bool, TradeError> {
             Ok(
@@ -477,9 +606,17 @@ impl Flow<'_> {
             wincode::deserialize(&bytes).outcome(Outcome::Error)?;
         let signed =
             VersionedTransaction::try_new(unsigned.message, &[taker]).outcome(Outcome::Error)?;
-        let (signature, slot) = self
+        let sent = self
             .send_and_confirm(&signed, quote.last_valid_block_height)
-            .await?;
+            .await;
+        let outcome = sent
+            .as_ref()
+            .map_or_else(|error| error.outcome, |_| Outcome::Landed);
+        for venue in route_venues(&quote.route) {
+            counter!("flow_venue_swaps_total", "venue" => venue.to_owned(), "status" => outcome.status(), "outcome" => outcome.as_str())
+                .increment(1);
+        }
+        let (signature, slot) = sent?;
 
         // Pinned to the confirmation slot: a lagging node cannot hand back
         // the pre-swap balances and record a phantom 100% slippage.
@@ -529,45 +666,23 @@ impl Flow<'_> {
     }
 
     /// Sends with preflight (the RPC's simulation catches stale quotes
-    /// before they cost a fee) and polls the status until the client's
-    /// commitment. Returns the signature and the slot it landed in.
-    /// `last_valid_block_height` is the router's expiry for the
-    /// transaction's blockhash; without it (older routers) expiry is asked
-    /// of the RPC (`isBlockhashValid`).
+    /// before they cost a fee) and waits for the client's commitment.
+    /// Returns the signature and the slot it landed in.
+    /// `last_valid_block_height` is the router's expiry for the transaction's
+    /// blockhash (older routers don't send it).
     async fn send_and_confirm(
         &self,
         transaction: &VersionedTransaction,
         last_valid_block_height: Option<u64>,
     ) -> std::result::Result<(Signature, u64), TradeError> {
-        let rpc = self.chain.rpc();
-        let commitment = rpc.commitment();
-        let signature = transaction.signatures[0];
-        match rpc
-            .send_transaction_with_config(
-                transaction,
-                RpcSendTransactionConfig {
-                    preflight_commitment: Some(commitment.commitment),
-                    ..RpcSendTransactionConfig::default()
-                },
-            )
+        match self
+            .chain
+            .send_versioned(transaction, send_config(last_valid_block_height))
             .await
         {
-            Ok(_) => {}
-            Err(error) if error.kind().get_transaction_error().is_some() => {
-                return fail(Outcome::PreflightRejected, error.into());
-            }
-            // The request may have reached the node: wait for a status
-            // rather than calling it failed.
-            Err(error) if is_transport_error(error.kind()) => {
-                debug!(%signature, error = %error, "send response lost; polling status");
-            }
-            Err(error) => return fail(Outcome::SendFailed, error.into()),
+            Ok(outcome) => Ok((outcome.signature, outcome.confirmation_slot)),
+            Err(error) => fail(Outcome::of_send(&error), error.into()),
         }
-        let expiry = match last_valid_block_height {
-            Some(height) => Expiry::Height(height),
-            None => Expiry::Blockhash(*transaction.message.recent_blockhash()),
-        };
-        await_status(&self.chain, signature, expiry).await
     }
 
     async fn refill(&self, taker: &Keypair) -> Result<()> {
@@ -609,135 +724,55 @@ impl Flow<'_> {
     }
 }
 
-/// When a sent swap can no longer land.
-#[derive(Clone, Copy, Debug)]
-enum Expiry {
-    /// The router's `last_valid_block_height`: expired once the block
-    /// height at our commitment is past it.
-    Height(u64),
-    /// Routers that predate the field: expired once the RPC says the
-    /// blockhash is no longer valid.
-    Blockhash(Hash),
+/// One shard's share of the process-wide request bound (at least 1, so a
+/// bound below the shard count still lets every shard trade).
+fn per_shard(max_in_flight: usize, shards: usize) -> usize {
+    (max_in_flight / shards.max(1)).max(1)
 }
 
-/// A sent swap's status, as far as the confirmation wait needs it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SeenStatus {
-    /// landed and failed on-chain
-    Failed { slot: u64, error: String },
-    /// landed; `confirmed` once it satisfies our commitment
-    Landed { slot: u64, confirmed: bool },
+/// Salt for each taker's backoff jitter stream.
+const JITTER_STREAM: u64 = 0x6a69_7474_6572;
+/// First pause after the RPC refuses a taker's trade.
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Longest pause, however many trades in a row were refused.
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// A taker's pause after `rpc_rejected` trades: doubles per refusal in a
+/// row from [`BACKOFF_BASE`] up to [`BACKOFF_MAX`], scaled by a jitter in
+/// [0.5, 1) so a shard's takers do not come back in lockstep. Any other
+/// outcome resets it.
+#[derive(Debug, Default)]
+struct Backoff {
+    refused: u32,
 }
 
-/// The reads the confirmation wait makes (the chain client in production).
-trait StatusReader {
-    async fn status(&self, signature: &Signature) -> anyhow::Result<Option<SeenStatus>>;
-    async fn expired(&self, expiry: Expiry) -> anyhow::Result<bool>;
-}
-
-impl StatusReader for ChainClient {
-    async fn status(&self, signature: &Signature) -> anyhow::Result<Option<SeenStatus>> {
-        let rpc = self.rpc();
-        let response = rpc.get_signature_statuses(&[*signature]).await?;
-        Ok(response
-            .value
-            .into_iter()
-            .next()
-            .flatten()
-            .map(|status| match &status.err {
-                Some(error) => SeenStatus::Failed {
-                    slot: status.slot,
-                    error: format!("{error:?}"),
-                },
-                None => SeenStatus::Landed {
-                    slot: status.slot,
-                    confirmed: status.satisfies_commitment(rpc.commitment()),
-                },
-            }))
-    }
-
-    async fn expired(&self, expiry: Expiry) -> anyhow::Result<bool> {
-        let rpc = self.rpc();
-        Ok(match expiry {
-            Expiry::Height(last_valid) => {
-                rpc.get_block_height_with_commitment(rpc.commitment())
-                    .await?
-                    > last_valid
-            }
-            Expiry::Blockhash(blockhash) => {
-                !rpc.is_blockhash_valid(&blockhash, rpc.commitment()).await?
-            }
-        })
+impl Backoff {
+    /// The pause after `outcome` (`jitter` uniform in [0, 1)), `None` when
+    /// the RPC served the trade.
+    fn after(&mut self, outcome: Outcome, jitter: f64) -> Option<Duration> {
+        if outcome != Outcome::RpcRejected {
+            self.refused = 0;
+            return None;
+        }
+        self.refused = self.refused.saturating_add(1);
+        let doubled = BACKOFF_BASE.saturating_mul(1 << (self.refused - 1).min(16));
+        Some(
+            doubled
+                .min(BACKOFF_MAX)
+                .mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0)),
+        )
     }
 }
 
-/// Poll `signature` until it lands at our commitment, fails, or expires.
-async fn await_status(
-    reader: &impl StatusReader,
-    signature: Signature,
-    expiry: Expiry,
-) -> std::result::Result<(Signature, u64), TradeError> {
-    let started = tokio::time::Instant::now();
-    let (mut polls, mut errors) = (0_u32, 0_u32);
-    loop {
-        tokio::time::sleep(STATUS_POLL).await;
-        polls += 1;
-        if started.elapsed() >= CONFIRM_DEADLINE {
-            return fail(
-                Outcome::RpcAmbiguous,
-                anyhow::anyhow!("{signature}: no confirmation within {CONFIRM_DEADLINE:?}"),
-            );
-        }
-        match reader.status(&signature).await {
-            Ok(status) => {
-                errors = 0;
-                match status {
-                    Some(SeenStatus::Failed { slot, error }) => {
-                        return fail(
-                            Outcome::LandedFailed,
-                            anyhow::anyhow!("{signature} failed in slot {slot}: {error}"),
-                        );
-                    }
-                    Some(SeenStatus::Landed {
-                        slot,
-                        confirmed: true,
-                    }) => {
-                        return Ok((signature, slot));
-                    }
-                    // Seen but not yet at our commitment: it cannot expire
-                    // any more, so skip the expiry check.
-                    Some(SeenStatus::Landed { .. }) => continue,
-                    None => {}
-                }
-            }
-            Err(error) => {
-                errors += 1;
-                if errors >= MAX_STATUS_ERRORS {
-                    return fail(Outcome::RpcAmbiguous, error);
-                }
-            }
-        }
-        if polls.is_multiple_of(BLOCKHASH_CHECK_EVERY)
-            && let Ok(true) = reader.expired(expiry).await
-        {
-            // One last look: it may have landed just before expiry, in which
-            // case the next poll classifies it.
-            if let Ok(Some(_)) = reader.status(&signature).await {
-                continue;
-            }
-            return fail(
-                Outcome::Expired,
-                anyhow::anyhow!("{signature}: blockhash expired with no status ({expiry:?})"),
-            );
-        }
+/// The send settings for a routed swap. With the router's
+/// `last_valid_block_height` a dropped swap is `expired` as soon as the chain
+/// passes it; without it the client estimates expiry from the first height it
+/// reads, which can leave a slow chain's swap `rpc_ambiguous` at the cap.
+fn send_config(last_valid_block_height: Option<u64>) -> VersionedSendConfig {
+    VersionedSendConfig {
+        last_valid_block_height,
+        ..VersionedSendConfig::default()
     }
-}
-
-fn is_transport_error(error: &RpcErrorKind) -> bool {
-    matches!(
-        error,
-        RpcErrorKind::Io(_) | RpcErrorKind::Reqwest(_) | RpcErrorKind::Middleware(_)
-    )
 }
 
 /// USD to whole micro-USD for the notional counter (counters are integers;
@@ -773,6 +808,27 @@ mod tests {
 
     use super::*;
 
+    fn leg(venue: &str) -> RouteLeg {
+        RouteLeg {
+            venue: venue.to_owned(),
+            pool: String::new(),
+            input_mint: String::new(),
+            output_mint: String::new(),
+            in_amount: 0,
+            out_amount: 0,
+            fee_amount: 0,
+            price_impact_bps: 0,
+            cu_estimate: 0,
+        }
+    }
+
+    #[test]
+    fn route_venues_counts_each_venue_once() {
+        let route = [leg("manifest"), leg("raydium-clmm"), leg("manifest")];
+        assert_eq!(route_venues(&route), ["manifest", "raydium-clmm"]);
+        assert!(route_venues(&[]).is_empty());
+    }
+
     #[test]
     fn slippage_is_normalised_by_the_quote() {
         // exact-in: quoted 1000 out, received 990 -> 100 bps worse
@@ -782,69 +838,14 @@ mod tests {
         assert!(ratio_bps(0, 5).abs() < 1e-9);
     }
 
-    /// A chain that adds a block every `block_time` and never reports the
-    /// signature: what a dropped swap looks like.
-    struct DroppedSwap {
-        started: tokio::time::Instant,
-        block_time: Duration,
-        /// the blockhash is valid through this height
-        last_valid: u64,
-    }
-
-    impl DroppedSwap {
-        fn height(&self) -> u64 {
-            (self.started.elapsed().as_millis() / self.block_time.as_millis()) as u64
-        }
-    }
-
-    impl StatusReader for DroppedSwap {
-        async fn status(&self, _signature: &Signature) -> anyhow::Result<Option<SeenStatus>> {
-            Ok(None)
-        }
-
-        async fn expired(&self, expiry: Expiry) -> anyhow::Result<bool> {
-            Ok(match expiry {
-                Expiry::Height(last_valid) => self.height() > last_valid,
-                Expiry::Blockhash(_) => self.height() > self.last_valid,
-            })
-        }
-    }
-
-    /// R2-FLOWARB-2: on a slow chain (600 ms blocks) a dropped swap's
-    /// blockhash lives ~91 s, longer than the old 90 s deadline, which
-    /// labelled it `rpc_ambiguous`. With the router's
-    /// `last_valid_block_height` it is `expired`, once the height passes it.
-    #[tokio::test(start_paused = true)]
-    async fn a_dropped_swap_on_a_slow_chain_expires() {
-        let chain = DroppedSwap {
-            started: tokio::time::Instant::now(),
-            block_time: Duration::from_millis(600),
-            last_valid: 151,
-        };
-        let started = tokio::time::Instant::now();
-        let outcome = await_status(&chain, Signature::default(), Expiry::Height(151))
-            .await
-            .expect_err("never lands");
-        assert_eq!(outcome.outcome, Outcome::Expired, "{:#}", outcome.error);
-        let waited = started.elapsed();
-        assert!(chain.height() > 151, "expired early: {waited:?}");
-        assert!(
-            waited <= Duration::from_millis(152 * 600) + STATUS_POLL * BLOCKHASH_CHECK_EVERY,
-            "{waited:?}"
+    /// R2-FLOWARB-2: the router's expiry reaches the client.
+    #[test]
+    fn the_routers_expiry_is_passed_to_the_send() {
+        assert_eq!(
+            send_config(Some(1_234)).last_valid_block_height,
+            Some(1_234)
         );
-        // Routers without the field: the RPC's blockhash check, same answer.
-        let chain = DroppedSwap {
-            started: tokio::time::Instant::now(),
-            ..chain
-        };
-        let outcome = await_status(
-            &chain,
-            Signature::default(),
-            Expiry::Blockhash(Hash::default()),
-        )
-        .await
-        .expect_err("never lands");
-        assert_eq!(outcome.outcome, Outcome::Expired, "{:#}", outcome.error);
+        assert_eq!(send_config(None).last_valid_block_height, None);
     }
 
     #[test]
@@ -852,5 +853,80 @@ mod tests {
         assert_eq!(micro_usd(Decimal::new(123_456_789, 7)), 12_345_679);
         assert_eq!(micro_usd(Decimal::new(4, 1)), 400_000);
         assert_eq!(micro_usd(Decimal::new(-1, 0)), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_balance_read_is_rpc_rejected() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        drop(listener);
+        let chain = ChainClient::new(&url, "confirmed").expect("client");
+        let Err(error) = wallet_balances(&chain, &Keypair::new().pubkey(), &[], None).await else {
+            panic!("a closed port serves nothing");
+        };
+        assert_eq!(Outcome::of_read(&error), Outcome::RpcRejected);
+        assert_eq!(
+            Outcome::of_read(&anyhow::anyhow!("timed out")),
+            Outcome::RpcAmbiguous
+        );
+    }
+
+    #[test]
+    fn the_request_bound_is_split_over_the_shards() {
+        assert_eq!(per_shard(128, 16), 8);
+        assert_eq!(per_shard(128, 1), 128);
+        assert_eq!(per_shard(100, 16), 6);
+        assert!(per_shard(100, 16) * 16 <= 100);
+        assert_eq!(per_shard(8, 16), 1);
+        assert_eq!(per_shard(8, 0), 8);
+    }
+
+    #[test]
+    fn refused_trades_back_off_bounded_and_skip_the_refill() {
+        let mut backoff = Backoff::default();
+        assert_eq!(backoff.after(Outcome::Landed, 0.0), None);
+        assert_eq!(backoff.after(Outcome::Expired, 0.9), None);
+        let pauses: Vec<Duration> = (0..12)
+            .map(|_| {
+                backoff
+                    .after(Outcome::RpcRejected, 0.999_999)
+                    .expect("a refused trade pauses")
+            })
+            .collect();
+        assert!((pauses[0].as_secs_f64() - 0.5).abs() < 1e-3, "{pauses:?}");
+        assert!(pauses.windows(2).all(|w| w[0] <= w[1]), "{pauses:?}");
+        assert!(pauses.iter().all(|p| *p <= BACKOFF_MAX), "{pauses:?}");
+        assert!(pauses[11] > BACKOFF_MAX.mul_f64(0.99), "{pauses:?}");
+        // Jitter scales into [0.5, 1) of the step.
+        let low = backoff.after(Outcome::RpcRejected, 0.0).expect("pause");
+        assert_eq!(low, BACKOFF_MAX / 2);
+        // A served trade resets the streak.
+        assert_eq!(backoff.after(Outcome::Landed, 0.5), None);
+        assert_eq!(
+            backoff.after(Outcome::RpcRejected, 0.0),
+            Some(BACKOFF_BASE / 2)
+        );
+    }
+
+    #[test]
+    fn sends_the_rpc_did_not_take_are_rpc_rejected() {
+        for error in [
+            SubmissionError::RateLimited("429".to_owned()),
+            SubmissionError::Unavailable("503".to_owned()),
+        ] {
+            assert_eq!(Outcome::of_send(&error).as_str(), "rpc_rejected");
+        }
+        let signature = Signature::default();
+        let ambiguous = SubmissionError::AmbiguousConfirmation {
+            signature,
+            reason: String::new(),
+        };
+        assert_eq!(Outcome::of_send(&ambiguous), Outcome::RpcAmbiguous);
+        assert_eq!(
+            Outcome::of_send(&SubmissionError::Expired { signature }),
+            Outcome::Expired
+        );
+        assert!(Outcome::SENT.contains(&Outcome::RpcRejected));
+        assert!(Outcome::ALL.contains(&Outcome::RpcRejected));
     }
 }

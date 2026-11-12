@@ -49,6 +49,37 @@ impl Programs {
     }
 }
 
+/// One scenario wallet and what it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Participant {
+    /// `maker/<name>`, `arb/<bot>` or `taker/<index>` (also the wallet label).
+    pub role: String,
+    pub kind: ParticipantKind,
+    pub wallet: Pubkey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ParticipantKind {
+    ClobMaker,
+    LiquidityProvider,
+    OracleArbitrageur,
+    CycleArbitrageur,
+    Taker,
+}
+
+impl ParticipantKind {
+    /// Human label used in snapshots and reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClobMaker => "market maker (clob)",
+            Self::LiquidityProvider => "liquidity provider",
+            Self::OracleArbitrageur => "oracle arbitrageur",
+            Self::CycleArbitrageur => "cross-venue arbitrage",
+            Self::Taker => "uninformed taker",
+        }
+    }
+}
+
 /// Config with every name resolved to an address.
 #[derive(Debug, Clone)]
 pub struct Scenario {
@@ -156,6 +187,14 @@ impl Scenario {
                 );
             }
         }
+        if let Some(arb) = &self.config.arb {
+            arb.validate()?;
+            for bot in &arb.bots {
+                for name in bot.start_tokens.iter().chain(bot.inventory.keys()) {
+                    self.token(name)?;
+                }
+            }
+        }
         if let Some(flow) = &self.config.flow {
             flow.validate()?;
             for (a, b) in &flow.pairs {
@@ -188,8 +227,47 @@ impl Scenario {
         self.wallet(&format!("maker/{maker}"))
     }
 
+    pub fn arb_wallet(&self, bot: &str) -> Keypair {
+        self.wallet(&format!("arb/{bot}"))
+    }
+
     pub fn taker_wallet(&self, index: u32) -> Keypair {
         self.wallet(&format!("taker/{index}"))
+    }
+
+    /// Every scenario wallet: makers, then arb bots, then takers. The one
+    /// enumeration snapshots, status and teardown share, so a new role
+    /// cannot be missed by one of them.
+    pub fn participants(&self) -> Vec<Participant> {
+        let mut out: Vec<Participant> = self
+            .config
+            .makers
+            .iter()
+            .map(|maker| Participant {
+                role: format!("maker/{}", maker.name),
+                kind: match maker.strategy {
+                    Strategy::ClobLadder { .. } => ParticipantKind::ClobMaker,
+                    Strategy::ClmmRange { .. } => ParticipantKind::LiquidityProvider,
+                    Strategy::PoolArb { .. } => ParticipantKind::OracleArbitrageur,
+                },
+                wallet: self.maker_wallet(&maker.name).pubkey(),
+            })
+            .collect();
+        if let Some(arb) = &self.config.arb {
+            out.extend(arb.bots.iter().map(|bot| Participant {
+                role: format!("arb/{}", bot.name),
+                kind: ParticipantKind::CycleArbitrageur,
+                wallet: self.arb_wallet(&bot.name).pubkey(),
+            }));
+        }
+        if let Some(flow) = &self.config.flow {
+            out.extend((0..flow.takers).map(|index| Participant {
+                role: format!("taker/{index}"),
+                kind: ParticipantKind::Taker,
+                wallet: self.taker_wallet(index).pubkey(),
+            }));
+        }
+        out
     }
 
     /// Address of a configured pool. Manifest markets are keypair accounts,

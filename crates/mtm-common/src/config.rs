@@ -18,10 +18,20 @@ pub struct RpcConfig {
     pub ws_url: String,
     #[serde(default = "default_commitment")]
     pub commitment: String,
+    /// RPC requests one service process keeps in flight at once, the rest
+    /// queue. Per process: flow divides it over its shards, every other
+    /// service has one client with the whole bound.
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight: usize,
 }
 
 fn default_commitment() -> String {
     "confirmed".to_string()
+}
+
+/// `mtm_chain::DEFAULT_MAX_IN_FLIGHT`.
+fn default_max_in_flight() -> usize {
+    128
 }
 
 pub fn load<T: for<'de> Deserialize<'de>>() -> Result<T, Box<figment::Error>> {
@@ -64,5 +74,31 @@ mod tests {
             .extract()
             .expect("config should parse");
         assert_eq!(cfg.rpc.commitment, "confirmed");
+    }
+
+    fn profile_rpc(profile: &str) -> RpcConfig {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        Figment::new()
+            .merge(Toml::file(root.join("default.toml")))
+            .merge(Toml::file(root.join(format!("{profile}.toml"))))
+            .extract::<TestConfig>()
+            .unwrap_or_else(|error| panic!("{profile}: {error}"))
+            .rpc
+    }
+
+    #[test]
+    fn shared_rpc_profiles_bound_requests_below_the_default() {
+        // The public testnet endpoint allows ~40 connections per IP for
+        // every service on the host together.
+        for profile in ["testnet", "scenario-testnet"] {
+            let rpc = profile_rpc(profile);
+            assert!(rpc.http_url.contains("testnet"), "{profile}");
+            assert!(
+                (1..=10).contains(&rpc.max_in_flight),
+                "{profile}: {}",
+                rpc.max_in_flight
+            );
+        }
+        assert_eq!(profile_rpc("local").max_in_flight, default_max_in_flight());
     }
 }

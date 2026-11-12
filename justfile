@@ -29,7 +29,17 @@ test:
 deny:
     cargo deny check
 
-ci: fmt-check lint test
+ci: fmt-check lint test dashboard-check
+
+# The scenario dashboard is generated: fail when the JSON drifted from
+# bootstrap/scenario/dashboard.py (compared as JSON, so formatting is free).
+dashboard-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    generated="$(mktemp)"
+    trap 'rm -f "$generated"' EXIT
+    python3 bootstrap/scenario/dashboard.py "$generated" >/dev/null
+    python3 -c 'import json, sys; a, b = (json.load(open(p)) for p in sys.argv[1:]); sys.exit(a != b and "ops/grafana/dashboards/scenario.json differs from dashboard.py: regenerate it")' "$generated" ops/grafana/dashboards/scenario.json
 
 # --- run services (profile = local | testnet) ----------------------------------
 

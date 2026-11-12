@@ -9,6 +9,9 @@
 [rpc]
 http_url = "http://127.0.0.1:8899"
 ws_url = "ws://127.0.0.1:8900"
+# Per process (flow splits it over its shards): 2048 is the 128 per shard
+# the x2000 runs had on a 16-core host. A local validator takes it.
+max_in_flight = 2048
 
 # --- oracle: keyless external prices -------------------------------------------
 # Binance top-of-book for JUP and RAY; USDC pegged. Arrays replace the
@@ -260,3 +263,28 @@ inventory = { JUP = "60000", RAY = "8000", USDC = "25000" }
 sol = "2"
 refill_below_ratio = "0.25"
 rng_seed = 7
+
+# --- cross-venue arbitrage: reacts to pool changes caused by flow -------------
+# Oracle-free: searches 2-leg (same pair, two venues) and 3-leg (triangular)
+# cycles across every pool above whenever a pool account changes.
+
+[arb]
+metrics_addr = "127.0.0.1:9184"
+
+[scenario.arb]
+poll_ms = 5000
+debounce_ms = 250
+# Snapshots, pool subscriptions and the pre-send simulation read at this
+# commitment; cycles still confirm and are accounted at rpc.commitment, and
+# it may not be older than that (no "finalized" over "confirmed").
+# search_commitment = "processed"
+
+[[scenario.arb.bots]]
+name = "searcher"
+start_tokens = ["USDC", "JUP", "RAY"]
+max_legs = 3
+min_profit_usd = "0.50"
+max_trade_usd = "5000"
+leg_slippage_bps = 5
+inventory = { USDC = "20000", JUP = "50000", RAY = "8000" }
+sol = "3"
