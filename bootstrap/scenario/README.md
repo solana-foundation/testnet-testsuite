@@ -362,7 +362,9 @@ the scale `up` recorded unless `SCENARIO_SCALE` names it:
    (`SCENARIO_SWEEP_OPERATORS=1`), where those keys are shared;
 6. writes `.scenario/teardown.json` (what moved) and
    `.scenario/leftovers.json` (`scenario leftovers`: the rent still locked,
-   by owner program and account type).
+   by owner program and account type; scenario-mint token accounts are
+   read at known addresses, the pool and market vaults as the janitor finds
+   them plus every participant's and operator's associated token accounts).
 
 Every step is idempotent, so a teardown can be re-run after a partial
 failure; `scenario leftovers` can also be run on its own at any time.
@@ -408,12 +410,17 @@ unwind, which still needs the real code) and runs `scenario janitor`, which:
    read as one of its own instructions), then waits until the cluster is
    past the upgrade slot (an upgraded program runs its new code from the
    next slot);
-2. closes the vaults: it lists every token account of the scenario mints
-   and matches each owner against the venues' vault authorities (Orca: the
-   whirlpool `["whirlpool", config, mint_a, mint_b, tick_spacing]`; Raydium:
-   the pool `["pool", amm_config, mint_0, mint_1]` or the vault
-   `["pool_vault", pool, mint]`; Manifest: the vault itself, `["vault",
-market, mint]`); token accounts held by anyone else are left alone;
+2. closes the vaults, without scanning the token programs (a
+   `getProgramAccounts` over Token does not finish on a large cluster): it
+   reads the vault addresses from every Whirlpool and PoolState account on
+   the program IDs and derives Manifest's, `["vault", market, mint]` for
+   every market and scenario mint, then matches each vault's owner against
+   the venue's vault authority, re-derived from the pool's own seeds (Orca:
+   the whirlpool `["whirlpool", config, mint_a, mint_b, tick_spacing_seed]`;
+   Raydium: the pool `["pool", amm_config, mint_0, mint_1(, seed_index)]`
+   or the vault `["pool_vault", pool, mint]`; Manifest: the vault itself);
+   vaults held by anyone else are left alone and counted
+   (`vaultsNotHeldByTheVenue`);
 3. closes every account the programs own.
 
 It then upgrades the forks back, empty: `bootstrap` re-creates configs, pools and
