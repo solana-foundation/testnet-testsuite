@@ -4,6 +4,7 @@ mod confirm;
 pub mod keys;
 #[cfg(any(test, feature = "test-util"))]
 pub mod mock;
+pub mod tag;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -304,8 +305,25 @@ impl ChainClient {
     /// Every send (transport retries and rebroadcasts) reuses the exact
     /// signed bytes; the blockhash is never refreshed. The transaction is
     /// rebroadcast until it lands or its blockhash expires
-    /// ([`SubmissionError::Expired`]).
+    /// ([`SubmissionError::Expired`]). Counted in `chain_tx_*` under the
+    /// current [`tag`].
     pub async fn submit(
+        &self,
+        instructions: Vec<Instruction>,
+        payer: &dyn Signer,
+        additional_signers: &[&dyn Signer],
+        config: SubmissionConfig,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let started = Instant::now();
+        tag::record_submitted(tag::Path::Submit);
+        let result = self
+            .submit_inner(instructions, payer, additional_signers, config)
+            .await;
+        tag::record_outcome(&result, started.elapsed());
+        result
+    }
+
+    async fn submit_inner(
         &self,
         instructions: Vec<Instruction>,
         payer: &dyn Signer,
@@ -419,8 +437,21 @@ impl ChainClient {
     /// the commitment) [`SubmissionError::Execution`], expiry
     /// [`SubmissionError::Expired`], and an unknown status
     /// [`SubmissionError::AmbiguousConfirmation`]. A lost send response is
-    /// not an error by itself: the status decides.
+    /// not an error by itself: the status decides. Counted in `chain_tx_*`
+    /// under the current [`tag`].
     pub async fn send_versioned(
+        &self,
+        transaction: &VersionedTransaction,
+        config: VersionedSendConfig,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let started = Instant::now();
+        tag::record_submitted(tag::Path::Versioned);
+        let result = self.send_versioned_inner(transaction, config).await;
+        tag::record_outcome(&result, started.elapsed());
+        result
+    }
+
+    async fn send_versioned_inner(
         &self,
         transaction: &VersionedTransaction,
         config: VersionedSendConfig,
@@ -487,6 +518,7 @@ impl ChainClient {
                     maybe_delivered = true;
                     if attempt < attempts {
                         warn!(attempt, %signature, error = %error, "transaction transport retry");
+                        tag::record_retry();
                         sleep(Duration::from_millis(200 * attempt as u64)).await;
                     } else {
                         debug!(%signature, error = %error, "send response lost; waiting for status");

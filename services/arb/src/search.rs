@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use metrics::counter;
+use mtm_chain::tag::TxTag;
 use mtm_chain::{ChainClient, SubmissionError, VersionedSendConfig};
 use mtm_scenario::funding::{WalletBalances, balances, wallet_balances};
 use mtm_scenario::pricing::PriceBook;
@@ -396,7 +397,9 @@ impl<'s> Searcher<'s> {
             last_valid_block_height: Some(last_valid_block_height),
             ..VersionedSendConfig::default()
         };
-        let (signature, slot) = match self.chain.send_versioned(&tx, send).await {
+        let tag = TxTag::new(bot.config.name.clone(), "arb", "multi");
+        let send = mtm_chain::tag::scope(tag, self.chain.send_versioned(&tx, send));
+        let (signature, slot) = match send.await {
             Ok(outcome) => (outcome.signature, outcome.confirmation_slot),
             Err(SubmissionError::Execution {
                 signature,
