@@ -277,14 +277,18 @@ pub fn events(conn: &Connection, after: i64, limit: u32) -> Result<Vec<Event>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-pub fn slots(conn: &Connection, from: u64, to: u64) -> Result<Vec<SlotRecord>> {
+/// Recorded slots in `from..=to`, oldest first, at most `limit` of them.
+/// The range may hold holes (before the first row, or a dropped gap).
+pub fn slots(conn: &Connection, from: u64, to: u64, limit: u32) -> Result<Vec<SlotRecord>> {
     let mut stmt = conn.prepare(
         "SELECT slot, leader, leader_client, leader_version, status, block_time, block_height,
                 tx_total, tx_vote, tx_failed, tx_ours, tx_ours_failed, cu_consumed, cost_units,
                 fees_lamports, prio_p50, prio_p90, prio_max, observed_at_us
-         FROM slots WHERE slot BETWEEN ?1 AND ?2 ORDER BY slot",
+         FROM slots WHERE slot BETWEEN ?1 AND ?2 ORDER BY slot LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![from, to], |row| {
+    // SQLite integers are i64.
+    let clamp = |slot: u64| slot.min(i64::MAX as u64);
+    let rows = stmt.query_map(params![clamp(from), clamp(to), limit], |row| {
         let status: String = row.get(4)?;
         Ok(SlotRecord {
             slot: row.get(0)?,
@@ -430,7 +434,7 @@ mod tests {
         let (slots, features, events, txs) = store
             .read(|conn| {
                 Ok((
-                    slots(conn, 0, 10)?,
+                    slots(conn, 0, 10, 100)?,
                     features(conn)?,
                     events(conn, 0, 10)?,
                     txs(conn, 7)?,
@@ -445,6 +449,62 @@ mod tests {
         assert_eq!(features[0].activated_slot, Some(10));
         assert_eq!(features[0].first_seen_pending_us, Some(5));
         assert_eq!(events[0].id, id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn slots_from_skip_holes_and_respect_the_limit() {
+        let dir = std::env::temp_dir().join(format!("chain-watch-holes-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir, &[]).expect("open");
+        let row = |slot| SlotRecord {
+            slot,
+            leader: None,
+            leader_client: None,
+            leader_version: None,
+            status: SlotStatus::Skipped,
+            block_time: None,
+            block_height: None,
+            tx_total: 0,
+            tx_vote: 0,
+            tx_failed: 0,
+            tx_ours: 0,
+            tx_ours_failed: 0,
+            cu_consumed: None,
+            cost_units: None,
+            fees_lamports: 0,
+            prio_p50: None,
+            prio_p90: None,
+            prio_max: None,
+            observed_at_us: 0,
+        };
+        // Rows from 300_000_000, a 5_000-slot hole, then more.
+        for slot in (300_000_000..300_000_010).chain(300_005_010..300_005_020) {
+            store.write(Write::Slot(row(slot)));
+        }
+        store.flush(Duration::from_secs(5));
+        let read = |from, to, limit| {
+            store.read(move |conn| {
+                Ok(slots(conn, from, to, limit)?
+                    .into_iter()
+                    .map(|s| s.slot)
+                    .collect::<Vec<_>>())
+            })
+        };
+        // A start well before the first row finds it.
+        assert_eq!(
+            read(299_997_000, u64::MAX, 3).await.expect("read"),
+            vec![300_000_000, 300_000_001, 300_000_002]
+        );
+        // A start inside the hole finds the rows after it.
+        assert_eq!(
+            read(300_000_010, u64::MAX, 2).await.expect("read"),
+            vec![300_005_010, 300_005_011]
+        );
+        assert_eq!(
+            read(300_000_010, 300_005_000, 10).await.expect("read"),
+            Vec::<u64>::new()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

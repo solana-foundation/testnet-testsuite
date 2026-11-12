@@ -16,7 +16,7 @@ use crate::App;
 /// Slots kept for a new client: 10 min at 200 ms.
 const SLOT_BUFFER: usize = 3_000;
 /// Slots fetched per chain-watch call.
-const SLOT_BATCH: u64 = 2_000;
+const SLOT_BATCH: u32 = 2_000;
 
 pub struct Hub {
     tx: broadcast::Sender<Live>,
@@ -124,17 +124,13 @@ pub async fn pump_chain(app: Arc<App>) {
             last_event = 0;
         }
         app.set_chain_health(Some(health.clone()));
-        // The cursor is the next slot chain-watch will record.
-        let recorded = health.cursor_slot.saturating_sub(1);
-        if health.cursor_slot > 0 && recorded >= next_slot {
-            let to = recorded.min(next_slot + SLOT_BATCH - 1);
-            match app.chain.slots(next_slot, to).await {
-                Ok(slots) => {
-                    next_slot = next_after(next_slot, &slots);
-                    app.hub.push_slots(slots);
-                }
-                Err(error) => warn!(error = %error, "reading slots from chain-watch failed"),
-            }
+        let pulled = pull_slots(&mut next_slot, health.cursor_slot, |from, limit| {
+            app.chain.slots_from(from, limit)
+        })
+        .await;
+        match pulled {
+            Ok(slots) => app.hub.push_slots(slots),
+            Err(error) => warn!(error = %error, "reading slots from chain-watch failed"),
         }
         match app.chain.events(last_event).await {
             Ok(events) => {
@@ -146,6 +142,31 @@ pub async fn pump_chain(app: Arc<App>) {
             Err(error) => warn!(error = %error, "reading events from chain-watch failed"),
         }
     }
+}
+
+/// One read of the slots chain-watch recorded at or after `next_slot`
+/// (`fetch(from, limit)` is [`ChainWatchClient::slots_from`]), advancing
+/// `next_slot` past them. Reading "from, limit" rather than a fixed window
+/// steps over holes: the start of a run (rows begin at chain-watch's first
+/// slot, after `next_slot`) and gaps chain-watch dropped, of any width.
+///
+/// [`ChainWatchClient::slots_from`]: chain_watch_client::ChainWatchClient::slots_from
+async fn pull_slots<F, Fut, E>(
+    next_slot: &mut u64,
+    cursor_slot: u64,
+    fetch: F,
+) -> Result<Vec<SlotRecord>, E>
+where
+    F: FnOnce(u64, u32) -> Fut,
+    Fut: Future<Output = Result<Vec<SlotRecord>, E>>,
+{
+    // The cursor is the next slot chain-watch will record.
+    if cursor_slot <= *next_slot {
+        return Ok(Vec::new());
+    }
+    let slots = fetch(*next_slot, SLOT_BATCH).await?;
+    *next_slot = next_after(*next_slot, &slots);
+    Ok(slots)
 }
 
 /// The next slot to ask for after a `/slots` reply. chain-watch commits in
@@ -207,5 +228,60 @@ mod tests {
         assert_eq!(next_after(100, &returned), 105);
         // Nothing committed yet: ask again from the same slot.
         assert_eq!(next_after(105, &[]), 105);
+    }
+
+    /// chain-watch's store as `/slots?from=&limit=` reads it.
+    fn store(rows: &[u64]) -> impl Fn(u64, u32) -> std::future::Ready<Result<Vec<SlotRecord>, ()>> {
+        let rows = rows.to_vec();
+        move |from, limit| {
+            std::future::ready(Ok(rows
+                .iter()
+                .filter(|s| **s >= from)
+                .take(limit as usize)
+                .map(|s| slot(*s))
+                .collect()))
+        }
+    }
+
+    /// Pull until caught up with `cursor`; every slot published, in order.
+    async fn follow(next_slot: &mut u64, cursor: u64, rows: &[u64]) -> Vec<u64> {
+        let fetch = store(rows);
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            let slots = pull_slots(next_slot, cursor, &fetch).await.expect("fake");
+            if slots.is_empty() {
+                break;
+            }
+            seen.extend(slots.iter().map(|s| s.slot));
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_new_run_on_a_high_slot_chain_is_followed() {
+        // chain-watch started at 300_000_000 and has recorded 5 slots;
+        // control starts SLOT_BUFFER before its cursor, wholly before them.
+        let start = 300_000_000;
+        let rows: Vec<u64> = (start..start + 5).collect();
+        let cursor = start + 5;
+        let mut next_slot = cursor - SLOT_BUFFER as u64;
+        assert_eq!(follow(&mut next_slot, cursor, &rows).await, rows);
+        assert_eq!(next_slot, cursor);
+        // Caught up: no call until the cursor moves.
+        let none = pull_slots(&mut next_slot, cursor, |_, _| async {
+            Err::<Vec<SlotRecord>, _>("must not be called")
+        })
+        .await;
+        assert_eq!(none.map(|s| s.len()), Ok(0));
+    }
+
+    #[tokio::test]
+    async fn a_gap_wider_than_the_batch_is_stepped_over() {
+        let hole = u64::from(SLOT_BATCH) + 1_001;
+        let rows: Vec<u64> = (1_000..1_100).chain(1_100 + hole..1_200 + hole).collect();
+        let mut next_slot = 1_000;
+        let seen = follow(&mut next_slot, 1_200 + hole, &rows).await;
+        assert_eq!(seen, rows);
+        assert_eq!(next_slot, 1_200 + hole);
     }
 }

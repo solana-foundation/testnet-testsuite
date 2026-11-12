@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::state::Shared;
 use crate::store;
 
-/// Widest `/slots` span: an hour at 200 ms slots.
+/// Widest `/slots` span, and most rows per reply: an hour at 200 ms slots.
 const MAX_SLOT_SPAN: u64 = 18_000;
 
 pub fn router(shared: Arc<Shared>) -> Router {
@@ -87,26 +87,38 @@ async fn events(
     ))
 }
 
+/// `from` + `to`: the rows in `from..=to`. `from` + `limit` (no `to`): the
+/// first `limit` rows at or after `from`, whatever holes lie between, so a
+/// follower can always advance past the last row it got.
 #[derive(Deserialize)]
 struct SlotsQuery {
     from: u64,
-    to: u64,
+    to: Option<u64>,
+    limit: Option<u32>,
 }
 
 async fn slots(
     State(shared): State<Arc<Shared>>,
     Query(query): Query<SlotsQuery>,
 ) -> Result<Response, ApiError> {
-    if query.to < query.from || query.to - query.from > MAX_SLOT_SPAN {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            format!("from..=to must be ordered and span at most {MAX_SLOT_SPAN} slots"),
-        )
-            .into_response());
-    }
+    let (to, limit) = match (query.to, query.limit) {
+        (Some(to), _) if to < query.from || to - query.from > MAX_SLOT_SPAN => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                format!("from..=to must be ordered and span at most {MAX_SLOT_SPAN} slots"),
+            )
+                .into_response());
+        }
+        (Some(to), limit) => (to, limit.unwrap_or(u32::MAX)),
+        (None, None) => {
+            return Ok((StatusCode::BAD_REQUEST, "give `to` or `limit`").into_response());
+        }
+        (None, Some(limit)) => (u64::MAX, limit),
+    };
+    let limit = limit.min(MAX_SLOT_SPAN as u32);
     let rows = shared
         .store
-        .read(move |conn| store::slots(conn, query.from, query.to))
+        .read(move |conn| store::slots(conn, query.from, to, limit))
         .await?;
     Ok(Json(rows).into_response())
 }

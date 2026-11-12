@@ -196,11 +196,24 @@ impl ChainWatchClient {
         self.get("/events", &[("after", after.to_string())]).await
     }
 
-    /// Slots in `from..=to` (the server caps the span).
+    /// Recorded slots in `from..=to` (the server caps the span). The range
+    /// can be empty although later slots exist: to follow the store, use
+    /// [`Self::slots_from`].
     pub async fn slots(&self, from: u64, to: u64) -> Result<Vec<SlotRecord>, Error> {
         self.get(
             "/slots",
             &[("from", from.to_string()), ("to", to.to_string())],
+        )
+        .await
+    }
+
+    /// The first `limit` recorded slots at or after `from`, oldest first,
+    /// across any holes (the server caps `limit`). Empty means nothing is
+    /// recorded at or after `from` yet.
+    pub async fn slots_from(&self, from: u64, limit: u32) -> Result<Vec<SlotRecord>, Error> {
+        self.get(
+            "/slots",
+            &[("from", from.to_string()), ("limit", limit.to_string())],
         )
         .await
     }

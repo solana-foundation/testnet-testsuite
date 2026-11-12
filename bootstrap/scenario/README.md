@@ -215,6 +215,7 @@ are ours: their outcome, error, failing program, CU and fees are kept.
   pruned automatically.
   `SCENARIO_RUN_ID` names the run (default `<target>-<UTC time>`).
 - API on :8183: `/health`, `/features`, `/events?after=<id>`,
+  `/slots?from=&limit=` (the next recorded slots, across holes) or
   `/slots?from=&to=` (types in `crates/chain-watch-client`).
 
 Full blocks at testnet's 5 slots/s need the dedicated provider: against a
