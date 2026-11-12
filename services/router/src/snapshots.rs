@@ -3,7 +3,8 @@
 //! A pool's snapshot is fresh for `ttl` after its load *completed*. Past that
 //! the next caller starts a background refresh and every caller keeps getting
 //! the last good snapshot until it is `max_age` old; only then do callers wait
-//! for the refresh, and each waits at most its own bound. Loads run in their
+//! for the refresh, and each waits at most its own bound, unless the pool's
+//! last load failed: then they get that failure at once. Loads run in their
 //! own task, so a caller that is cancelled (request timeout, client gone)
 //! never cancels the load others are waiting on. Every load is bounded by
 //! `load_timeout`, and a failed load is cached for one `ttl` so a dead pool
@@ -114,8 +115,10 @@ impl<V: Clone + Send + Sync + 'static> SnapshotCache<V> {
     }
 
     /// The pool's snapshot: fresh or stale-but-usable at once, otherwise the
-    /// in-flight load, waited on for at most `wait`. The returned snapshot
-    /// may be up to `max_age` old; callers check age again at use.
+    /// in-flight load, waited on for at most `wait` (only if the pool's last
+    /// load did not fail; a failed pool answers its failure at once). The
+    /// returned snapshot may be up to `max_age` old; callers check age again
+    /// at use.
     pub async fn get(&self, entry: &Entry, wait: Duration) -> Result<Loaded<V>, String> {
         let inflight = match self.next(entry) {
             Next::Ready(result) => return result,
@@ -152,9 +155,14 @@ impl<V: Clone + Send + Sync + 'static> SnapshotCache<V> {
             return Next::Ready(Ok(good.clone()));
         }
         metrics::counter!("router_snapshot_cache_total", "result" => "miss").increment(1);
-        match (&pool.refresh, &pool.failure) {
-            (Some(inflight), _) => Next::Wait(inflight.clone()),
-            (None, Some((_, error))) => Next::Ready(Err(error.clone())),
+        // Wait only while the pool's last load did not fail (its first load,
+        // or a refresh after an idle gap). Once a load has failed, callers get
+        // that failure at once while the retry runs in the background:
+        // otherwise a pool whose loads keep hanging delays every quote on its
+        // pairs by the full wait, on every retry.
+        match (&pool.failure, &pool.refresh) {
+            (Some((_, error)), _) => Next::Ready(Err(error.clone())),
+            (None, Some(inflight)) => Next::Wait(inflight.clone()),
             (None, None) => Next::Ready(Err("no snapshot".to_owned())),
         }
     }
@@ -365,8 +373,33 @@ mod tests {
         assert!(cache.get(&entry(), wait).await.is_err());
         assert_eq!(fake.calls(), 1, "the failure was reused");
         tokio::time::sleep(TTL).await;
+        // The retry starts; the failed pool answers its failure meanwhile.
+        assert!(cache.get(&entry(), wait).await.is_err());
+        assert_eq!(fake.calls(), 2);
+        tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(cache.get(&entry(), wait).await.expect("retried").value, 1);
         assert_eq!(fake.calls(), 2);
+    }
+
+    /// R2-ROUTER-1: a pool whose loads keep hanging delays only the quotes
+    /// that arrive before its first load gives up. Once that load has
+    /// failed, callers get the failure at once, also while the retry runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_pool_does_not_make_callers_wait_again() {
+        let (fake, cache) = Fake::cache(|_| Duration::from_secs(60), never);
+        let wait = Duration::from_secs(1);
+        let before = Instant::now();
+        assert!(cache.get(&entry(), wait).await.is_err());
+        assert_eq!(before.elapsed(), wait, "the first load is waited on");
+        // Load 0 times out at LOAD_TIMEOUT; the retry starts one TTL later.
+        tokio::time::sleep(LOAD_TIMEOUT + TTL).await;
+        for _ in 0..5 {
+            let before = Instant::now();
+            let error = cache.get(&entry(), wait).await.expect_err("still failing");
+            assert!(error.contains("timed out"), "{error}");
+            assert_eq!(before.elapsed(), Duration::ZERO, "no wait on a failed pool");
+        }
+        assert_eq!(fake.calls(), 2, "the retry is in flight");
     }
 
     /// ROU-3 (a): a load slower than the TTL is fresh for a full TTL after
@@ -429,12 +462,13 @@ mod tests {
         // Load 1 starts at TTL and hangs; the stale snapshot is served...
         tokio::time::sleep(TTL).await;
         assert!(cache.get(&entry(), Duration::ZERO).await.is_ok());
-        // ...until it is `max_age` old; then the bounded wait gives up.
+        // ...until it is `max_age` old. Load 1 has timed out by then, so
+        // the pool answers that failure (without waiting).
         tokio::time::sleep(MAX_AGE - TTL).await;
         let before = Instant::now();
         let result = cache.get(&entry(), Duration::from_millis(250)).await;
         assert!(result.is_err(), "{result:?}");
-        assert_eq!(before.elapsed(), Duration::from_millis(250));
+        assert_eq!(before.elapsed(), Duration::ZERO);
     }
 
     /// A failed refresh keeps the last good snapshot until it ages out.

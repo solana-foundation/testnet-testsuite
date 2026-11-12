@@ -50,7 +50,8 @@ What changed relative to the design below:
   request that triggered them, are bounded by `snapshot_load_timeout_ms`
   (2 s, also the quote-path RPC client's HTTP timeout), and a failure is
   reused for one TTL; a quote waits at most `snapshot_wait_ms` (1 s) for a
-  pool with no usable snapshot. The slot (`state_slot`) and the blockhash
+  pool with no usable snapshot, and not at all for one whose last load
+  failed (it is left out until a background retry succeeds). The slot (`state_slot`) and the blockhash
   come from a background refresher (`chain_tip_refresh_ms`, 400 ms); once
   that value is older than `chain_tip_max_age_ms` (5 s) quotes answer 502.
   No quote issues an RPC call of its own. The book holds `Arc` references.

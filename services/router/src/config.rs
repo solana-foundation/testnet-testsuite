@@ -57,8 +57,10 @@ pub struct RouterConfig {
     /// `request_timeout_ms`.
     #[serde(default = "default_snapshot_load_timeout_ms")]
     pub snapshot_load_timeout_ms: u64,
-    /// Longest a quote waits for a pool with no usable snapshot; the pool
-    /// is left out of that quote after it (its load keeps running).
+    /// Longest a quote waits for a pool with no usable snapshot (its first
+    /// load, or a refresh after an idle gap); the pool is left out of that
+    /// quote after it (its load keeps running). A pool whose last load
+    /// failed is left out at once, without waiting, until a load succeeds.
     #[serde(default = "default_snapshot_wait_ms")]
     pub snapshot_wait_ms: u64,
     /// How often the background task refreshes the slot and blockhash that
