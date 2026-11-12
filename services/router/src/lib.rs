@@ -37,7 +37,7 @@ pub struct AppState {
     pub snapshots: SnapshotCache,
     /// Slot and blockhash, refreshed in the background (never fetched per quote).
     pub tip: TipCell,
-    /// Quote-path client (short request timeout): snapshot loads and the tip.
+    /// Quote-path client (short request timeout): snapshot loads.
     pub chain: ChainClient,
     pub cfg: config::RouterConfig,
     pub bridge_mints: Vec<Pubkey>,
@@ -52,9 +52,14 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
     let load_timeout = Duration::from_millis(cfg.router.snapshot_load_timeout_ms);
     let quote_chain =
         ChainClient::with_timeout(&cfg.rpc.http_url, &cfg.rpc.commitment, load_timeout)?;
+    // The tip gets a client of its own, so snapshot loads cannot queue
+    // ahead of it.
+    let tip_timeout = Duration::from_millis(cfg.router.chain_tip_timeout_ms);
+    let tip_chain = ChainClient::with_timeout(&cfg.rpc.http_url, &cfg.rpc.commitment, tip_timeout)?;
     let tip = tip::spawn_refresher(
-        quote_chain.clone(),
+        tip::chain_fetch(tip_chain),
         Duration::from_millis(cfg.router.chain_tip_refresh_ms.max(1)),
+        tip_timeout,
         Duration::from_millis(cfg.router.chain_tip_max_age_ms),
     );
     let programs = Programs::from_config(&cfg.router)?;

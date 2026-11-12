@@ -1,8 +1,11 @@
 //! The chain tip (slot and latest blockhash), refreshed in the background so
 //! quotes never wait on RPC for it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use mtm_chain::ChainClient;
 use solana_hash::Hash;
 use tokio::sync::watch;
@@ -48,10 +51,41 @@ impl TipCell {
     }
 }
 
-/// Refresh the tip every `interval`. Each refresh is bounded by the
-/// client's request timeout; failures keep the previous tip, which
-/// [`TipCell::current`] stops handing out once it is too old.
-pub fn spawn_refresher(chain: ChainClient, interval: Duration, max_age: Duration) -> TipCell {
+/// Fetches the slot and latest blockhash once. Production fetches go
+/// through [`chain_fetch`]; tests inject fakes.
+pub type TipFetch = Arc<dyn Fn() -> BoxFuture<'static, Result<(u64, Hash), String>> + Send + Sync>;
+
+/// The production fetch: `getSlot` and `getLatestBlockhash` over `chain`,
+/// concurrently. Give it a client of its own (not the snapshot loaders'),
+/// so loads cannot queue ahead of it.
+pub fn chain_fetch(chain: ChainClient) -> TipFetch {
+    Arc::new(move || {
+        let chain = chain.clone();
+        async move {
+            let (slot, blockhash) =
+                tokio::join!(chain.current_slot(), chain.rpc().get_latest_blockhash());
+            match (slot, blockhash) {
+                (Ok(slot), Ok(blockhash)) => Ok((slot, blockhash)),
+                (Err(error), _) => Err(format!("{error:#}")),
+                (_, Err(error)) => Err(format!("get_latest_blockhash failed: {error}")),
+            }
+        }
+        .boxed()
+    })
+}
+
+/// Refresh the tip every `interval`. Each refresh is abandoned after
+/// `timeout`: the HTTP timeout covers one attempt only, and the RPC client
+/// sleeps between its 429 retries (up to `Retry-After`, ~2 min), so a single
+/// rate-limited call could otherwise stall the refresher until the tip
+/// expires. Failures keep the previous tip, which [`TipCell::current`]
+/// stops handing out once it is too old.
+pub fn spawn_refresher(
+    fetch: TipFetch,
+    interval: Duration,
+    timeout: Duration,
+    max_age: Duration,
+) -> TipCell {
     let (tx, cell) = TipCell::new(max_age);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -59,12 +93,9 @@ pub fn spawn_refresher(chain: ChainClient, interval: Duration, max_age: Duration
         let mut failing = false;
         loop {
             ticker.tick().await;
-            let (slot, blockhash) =
-                tokio::join!(chain.current_slot(), chain.rpc().get_latest_blockhash());
-            let fetched = match (slot, blockhash) {
-                (Ok(slot), Ok(blockhash)) => Ok((slot, blockhash)),
-                (Err(error), _) => Err(format!("{error:#}")),
-                (_, Err(error)) => Err(format!("get_latest_blockhash failed: {error}")),
+            let fetched = match tokio::time::timeout(timeout, fetch()).await {
+                Ok(fetched) => fetched,
+                Err(_) => Err(format!("chain tip refresh timed out after {timeout:?}")),
             };
             match fetched {
                 Ok((slot, blockhash)) => {
@@ -95,7 +126,37 @@ pub fn spawn_refresher(chain: ChainClient, interval: Duration, max_age: Duration
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    /// R2-ROUTER-2: a fetch stuck far past the tip's max age (a 429 retry
+    /// sleep inside the RPC client) is abandoned at `timeout`; the next tick
+    /// refreshes the tip.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_refresh_does_not_stall_the_tip() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let fetch: TipFetch = Arc::new(move || {
+            let call = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                Ok((call as u64, Hash::new_from_array([1; 32])))
+            }
+            .boxed()
+        });
+        let cell = spawn_refresher(
+            fetch,
+            Duration::from_millis(400),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        );
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let tip = cell.current().expect("refreshed after the stuck fetch");
+        assert!(tip.slot >= 1, "fetched after the stuck call: {}", tip.slot);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn tip_is_refused_once_too_old() {

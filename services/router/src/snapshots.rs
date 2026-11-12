@@ -550,7 +550,12 @@ mod tests {
         let window = Duration::from_secs(1);
         let started = Instant::now();
         while started.elapsed() < window {
-            assert!(cache.get(&entry(), Duration::from_millis(10)).await.is_err());
+            assert!(
+                cache
+                    .get(&entry(), Duration::from_millis(10))
+                    .await
+                    .is_err()
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let most = (window.as_millis() / MIN_FAILURE_BACKOFF.as_millis()) as usize + 1;

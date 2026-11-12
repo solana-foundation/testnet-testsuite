@@ -73,6 +73,10 @@ pub struct RouterConfig {
     /// quotes report and transactions are built on.
     #[serde(default = "default_chain_tip_refresh_ms")]
     pub chain_tip_refresh_ms: u64,
+    /// Each tip refresh is abandoned after this long (also the HTTP timeout
+    /// of the tip's own RPC client) and retried on the next tick.
+    #[serde(default = "default_chain_tip_timeout_ms")]
+    pub chain_tip_timeout_ms: u64,
     /// Quotes needing the slot or blockhash answer 502 once the cached
     /// value is older than this (the refresher keeps failing).
     #[serde(default = "default_chain_tip_max_age_ms")]
@@ -158,6 +162,9 @@ fn default_snapshot_wait_ms() -> u64 {
 }
 fn default_chain_tip_refresh_ms() -> u64 {
     400
+}
+fn default_chain_tip_timeout_ms() -> u64 {
+    1_000
 }
 fn default_chain_tip_max_age_ms() -> u64 {
     5_000

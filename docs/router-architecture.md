@@ -53,7 +53,8 @@ What changed relative to the design below:
   reused for one TTL (at least 200 ms, also with a TTL of 0); a quote waits at most `snapshot_wait_ms` (1 s) for a
   pool with no usable snapshot, and not at all for one whose last load
   failed (it is left out until a background retry succeeds). The slot (`state_slot`) and the blockhash
-  come from a background refresher (`chain_tip_refresh_ms`, 400 ms); once
+  come from a background refresher (`chain_tip_refresh_ms`, 400 ms, on its
+  own RPC client, each refresh abandoned after `chain_tip_timeout_ms`, 1 s); once
   that value is older than `chain_tip_max_age_ms` (5 s) quotes answer 502.
   No quote issues an RPC call of its own. The book holds `Arc` references.
 - **Venue trait (§3)** is `mtm_venues::PoolSnapshot` (enum dispatch over the

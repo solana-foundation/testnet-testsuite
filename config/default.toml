@@ -163,6 +163,7 @@ bridge_mints = []
 # snapshot_load_timeout_ms = 2000  # per load, and quote-path RPC timeout
 # snapshot_wait_ms = 1000          # max wait for a pool with no snapshot
 # chain_tip_refresh_ms = 400       # background slot/blockhash refresh
+# chain_tip_timeout_ms = 1000      # per refresh, and the tip client's timeout
 # chain_tip_max_age_ms = 5000      # 502 once the cached tip is older
 
 # Program IDs of the deployed DEX forks. Set per environment, e.g.
