@@ -2,7 +2,9 @@
 
     python3 bootstrap/scenario/dashboard.py ops/grafana/dashboards/scenario.json
 
-Edit panels here rather than in the JSON, so layout and IDs stay consistent.
+Edit panels here rather than in the JSON, so layout and IDs stay consistent,
+then format the output with prettier. `just dashboard-check` (and CI) fail
+when the JSON no longer matches this generator.
 Histograms are Prometheus summaries (metrics-exporter-prometheus default),
 hence the `quantile` label selectors.
 """
@@ -74,7 +76,7 @@ nl(8)
 row("Uninformed flow + router")
 ts("Routed swaps / min", [("sum by (pair, status, size) (rate(flow_swaps_total[5m])) * 60", "{{pair}} {{status}} {{size}}")], x=0)
 ts("Swap outcomes / min", [("sum by (outcome) (rate(flow_swaps_total[5m])) * 60", "{{outcome}}")], x=12,
-   desc="landed, or why not: unaffordable / no_price / quote_failed / preflight_rejected / send_failed / landed_failed / expired / rpc_ambiguous / error")
+   desc="landed, or why not: unaffordable / no_price / quote_failed / preflight_rejected / send_failed / rpc_rejected / landed_failed / expired / rpc_ambiguous / error. rpc_rejected = the RPC refused the balance read or the send (429/5xx, no connection): nothing reached the cluster")
 nl(8)
 ts("Cost vs oracle (bps)", [
     ('flow_cost_vs_oracle_bps{quantile="0.5"}', "p50 {{pair}}"),
@@ -103,6 +105,11 @@ ts("Router snapshot skips and tip failures / min", [
     ("sum(rate(router_chain_tip_refresh_failures_total[5m])) * 60", "tip refresh failures")], x=12,
    desc="pools left out of a quote (too_old / unavailable), and failed slot+blockhash refreshes (quotes answer 502 once the tip is chain_tip_max_age_ms old)")
 nl(8)
+ts("Taker RPC backoffs and refill errors / min", [
+    ("sum(rate(flow_rpc_backoffs_total[5m])) * 60", "backoffs"),
+    ("sum(rate(flow_refill_errors_total[5m])) * 60", "refill errors")], x=0,
+   desc="a taker whose trade the RPC refused (rpc_rejected) skips its refill and pauses 0.5–30 s; refill failures are counted, not logged")
+nl(8)
 
 row("Cross-venue arbitrage")
 ts("Arb trades / min", [
@@ -125,6 +132,9 @@ ts("Arb fees (lamports / 5m) and cycles in flight", [
     ("sum by (bot) (increase(arb_fees_lamports_total[5m]))", "fees {{bot}}"),
     ("arb_in_flight", "in flight")], x=0,
    desc="fees include reverted cycles (lost races still pay) and first-use ATA rent")
+ts("Arb cycles not accounted / 5m", [
+    ("sum by (bot, status) (increase(arb_unaccounted_total[5m]))", "{{bot}} {{status}}")], x=12,
+   desc="landed or reverted cycles whose pinned balance read failed: counted in Arb trades, but their PnL and fee are missing")
 nl(8)
 
 dash = {"uid": "mtm-scenario", "title": "mtm — market-making scenario", "tags": ["mtm"], "timezone": "browser",

@@ -274,6 +274,10 @@ metrics_addr = "127.0.0.1:9184"
 [scenario.arb]
 poll_ms = 5000
 debounce_ms = 250
+# Snapshots, pool subscriptions and the pre-send simulation read at this
+# commitment; cycles still confirm and are accounted at rpc.commitment, and
+# it may not be older than that (no "finalized" over "confirmed").
+# search_commitment = "processed"
 
 [[scenario.arb.bots]]
 name = "searcher"

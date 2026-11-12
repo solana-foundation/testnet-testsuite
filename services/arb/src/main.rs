@@ -77,6 +77,7 @@ async fn main() -> Result<()> {
         .arb
         .clone()
         .context("the profile has no [scenario.arb] section")?;
+    arb.check_search_commitment(&cfg.rpc.commitment)?;
 
     let mut pools = Vec::new();
     for pool in &scenario.config.pools {

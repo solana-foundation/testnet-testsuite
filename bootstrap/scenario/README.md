@@ -50,13 +50,28 @@ Binance ──▶ oracle ──▶ mm (12 makers) ──▶ Manifest / Orca / Ra
   never looks at the oracle to trade (only to value profit). Bots race on
   each snapshot; `priority_fee_lamports` and `latency_ms` per bot make them
   differ. A bot with a cycle confirming sits out later scans, and scans
-  never wait for confirmations.
+  never wait for confirmations. `search_commitment` (default `processed`)
+  is the view snapshots, subscriptions and the simulation use; confirmation
+  and accounting stay at `rpc.commitment`, and the search may not be older
+  than it. A cycle is valued at the prices it was sent on, so a slow
+  confirmation is still accounted (`arb_unaccounted_total` counts the ones
+  whose balance read failed).
 
 Uninformed flow: Poisson arrivals at `rate_per_min`, lognormal notionals
 around `median_usd`, a `large_probability` share of blocks at
 `large_multiplier`×, random pairs (JUP/RAY has no direct Manifest market, so
 large JUP↔RAY flow also exercises bridging), `exact_out_probability` exact-out
 trades. The RNG is seeded (`rng_seed`), so the trade sequence replays.
+Each trade ends in one `outcome` of `flow_swaps_total`: `landed`,
+`unaffordable`, `no_price`, `quote_failed`, `preflight_rejected`,
+`send_failed`, `rpc_rejected` (the RPC refused the balance read or the send:
+HTTP 429/5xx or no connection; nothing reached the cluster), `landed_failed`,
+`expired`, `rpc_ambiguous` (status unknown: the swap may have landed) or
+`error`. Swaps are sent without the router's `last_valid_block_height`, so a
+dropped one is `expired` after 150 + 32 blocks past the first height read
+(about 73 s at 400 ms blocks), or `rpc_ambiguous` when the client's 90 s cap
+comes first. A taker whose trade was `rpc_rejected` skips its refill and
+backs off (0.5 s doubling to 30 s, jittered).
 
 ## Replay
 
@@ -172,6 +187,7 @@ any happened in the window); for a clean window run flow with
 | `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                              | maker                       | skew, arbitrage volume (µUSD), tick latency                                                                                   |
 | `flow_swaps_total`                                                                             | pair, status, outcome, size | routed swaps landed/failed, why, normal/large                                                                                 |
 | `flow_venue_swaps_total`                                                                       | venue, status, outcome      | quoted swaps' send outcomes, once per venue the route touches                                                                 |
+| `flow_rpc_backoffs_total`, `flow_refill_errors_total`                                          | —                           | taker pauses after `rpc_rejected`; failed refill reads or top-ups                                                             |
 | `flow_fee_lamports_total`, `flow_fill_read_errors_total`                                       | —                           | fees paid by takers; landed swaps with unread fills                                                                           |
 | `flow_takers_alive`, `flow_taker_restarts_total`                                               | —                           | taker loops running / restarted after an error                                                                                |
 | `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                                 | pair                        | cost to uninformed flow vs oracle; landed vs quoted                                                                           |

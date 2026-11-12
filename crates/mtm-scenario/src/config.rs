@@ -257,6 +257,28 @@ impl ArbConfig {
             .map_err(|error| anyhow::anyhow!("arb search_commitment: {error}"))?;
         Ok(())
     }
+
+    /// The search view must be at least as fresh as `rpc_commitment` (the
+    /// one cycles confirm at): a `finalized` search plans on gaps closed
+    /// some 30 slots ago.
+    pub fn check_search_commitment(&self, rpc_commitment: &str) -> anyhow::Result<()> {
+        let rank = |level: &str| -> anyhow::Result<u8> {
+            let commitment = mtm_chain::parse_commitment(level)?;
+            Ok(if commitment.is_finalized() {
+                2
+            } else if commitment.is_confirmed() {
+                1
+            } else {
+                0
+            })
+        };
+        anyhow::ensure!(
+            rank(&self.search_commitment)? <= rank(rpc_commitment)?,
+            "arb search_commitment {} is older than rpc.commitment {rpc_commitment}",
+            self.search_commitment
+        );
+        Ok(())
+    }
 }
 
 fn default_arb_poll_ms() -> u64 {
@@ -473,6 +495,29 @@ mod tests {
         let mut view = arb(vec![bot("a")]);
         view.search_commitment = "tip".to_owned();
         assert!(view.validate().is_err());
+    }
+
+    #[test]
+    fn the_arb_search_is_never_older_than_confirmations() {
+        let arb = |search: &str| ArbConfig {
+            bots: Vec::new(),
+            poll_ms: 5_000,
+            debounce_ms: 250,
+            search_commitment: search.to_owned(),
+        };
+        for (search, rpc, ok) in [
+            ("processed", "confirmed", true),
+            ("confirmed", "confirmed", true),
+            ("finalized", "confirmed", false),
+            ("confirmed", "processed", false),
+            ("finalized", "finalized", true),
+        ] {
+            assert_eq!(
+                arb(search).check_search_commitment(rpc).is_ok(),
+                ok,
+                "{search} over {rpc}"
+            );
+        }
     }
 
     #[test]

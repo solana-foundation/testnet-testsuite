@@ -798,7 +798,7 @@
     {
       "type": "timeseries",
       "title": "Swap outcomes / min",
-      "description": "landed, or why not: unaffordable / no_price / quote_failed / preflight_rejected / send_failed / landed_failed / expired / rpc_ambiguous / error",
+      "description": "landed, or why not: unaffordable / no_price / quote_failed / preflight_rejected / send_failed / rpc_rejected / landed_failed / expired / rpc_ambiguous / error. rpc_rejected = the RPC refused the balance read or the send (429/5xx, no connection): nothing reached the cluster",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1187,6 +1187,50 @@
       "id": 33
     },
     {
+      "type": "timeseries",
+      "title": "Taker RPC backoffs and refill errors / min",
+      "description": "a taker whose trade the RPC refused (rpc_rejected) skips its refill and pauses 0.5\u201330 s; refill failures are counted, not logged",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 101
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(flow_rpc_backoffs_total[5m])) * 60",
+          "legendFormat": "backoffs"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(flow_refill_errors_total[5m])) * 60",
+          "legendFormat": "refill errors"
+        }
+      ],
+      "id": 34
+    },
+    {
       "type": "row",
       "title": "Cross-venue arbitrage",
       "collapsed": false,
@@ -1194,10 +1238,10 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 101
+        "y": 109
       },
       "panels": [],
-      "id": 34
+      "id": 35
     },
     {
       "type": "timeseries",
@@ -1211,7 +1255,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 102
+        "y": 110
       },
       "fieldConfig": {
         "defaults": {
@@ -1241,7 +1285,7 @@
           "legendFormat": "opportunities {{bot}} {{legs}}-leg"
         }
       ],
-      "id": 35
+      "id": 36
     },
     {
       "type": "timeseries",
@@ -1255,7 +1299,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 102
+        "y": 110
       },
       "fieldConfig": {
         "defaults": {
@@ -1290,7 +1334,7 @@
           "legendFormat": "last trade {{bot}}"
         }
       ],
-      "id": 36
+      "id": 37
     },
     {
       "type": "timeseries",
@@ -1304,7 +1348,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 110
+        "y": 118
       },
       "fieldConfig": {
         "defaults": {
@@ -1339,7 +1383,7 @@
           "legendFormat": "errors"
         }
       ],
-      "id": 37
+      "id": 38
     },
     {
       "type": "timeseries",
@@ -1353,7 +1397,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 110
+        "y": 118
       },
       "fieldConfig": {
         "defaults": {
@@ -1383,7 +1427,7 @@
           "legendFormat": "p95"
         }
       ],
-      "id": 38
+      "id": 39
     },
     {
       "type": "timeseries",
@@ -1397,7 +1441,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 118
+        "y": 126
       },
       "fieldConfig": {
         "defaults": {
@@ -1427,7 +1471,46 @@
           "legendFormat": "in flight"
         }
       ],
-      "id": 39
+      "id": 40
+    },
+    {
+      "type": "timeseries",
+      "title": "Arb cycles not accounted / 5m",
+      "description": "landed or reverted cycles whose pinned balance read failed: counted in Arb trades, but their PnL and fee are missing",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 126
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (bot, status) (increase(arb_unaccounted_total[5m]))",
+          "legendFormat": "{{bot}} {{status}}"
+        }
+      ],
+      "id": 41
     }
   ]
 }
