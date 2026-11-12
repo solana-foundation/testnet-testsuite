@@ -3,10 +3,15 @@
     python3 bootstrap/scenario/sample.py --seconds 600 --out .scenario/runs/x10-load.json
 
 Every `--interval` seconds it records, per scenario process (oracle, router,
-mm, flow, arb, surfpool, prometheus, grafana): CPU (% of one core, from
+mm, flow, arb, surfpool or solana-test-validator, prometheus, grafana): CPU (% of one core, from
 /proc/<pid>/stat deltas) and RSS; machine CPU and available memory; and the
 validator: landed transactions (getTransactionCount delta → TPS), slot
-rate, and RPC latency (getLatestBlockhash round trip). The output keeps
+rate, and RPC latency (getLatestBlockhash round trip). A real validator
+(solana-test-validator) also lands one consensus vote per slot, which
+Surfpool does not: TPS excludes them (getTransactionCount counts them).
+Under Alpenglow (e.g. a test validator with testnet's cloned feature set)
+votes are not transactions, so nothing is subtracted.
+The output keeps
 every sample plus a summary (mean / p95 / max).
 
 TPS is getTransactionCount over time: against a local validator that is the
@@ -14,10 +19,12 @@ scenario's own traffic; against a shared cluster (testnet) it counts every
 user's transactions and votes, so the summary labels it `tpsScope` and the
 participant-level counts in the report are the ones to use.
 """
-import argparse, json, os, statistics, time, urllib.parse, urllib.request
+import argparse, base64, json, os, statistics, time, urllib.parse, urllib.request
 
-SERVICES = ["oracle", "router", "mm", "flow", "arb", "surfpool", "prometheus", "grafana"]
+SERVICES = ["oracle", "router", "mm", "flow", "arb", "prometheus", "grafana"]
+VALIDATORS = {"surfpool", "solana-test-validator"}
 TICK = os.sysconf("SC_CLK_TCK")
+ALPENGLOW = "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS"
 PID_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".scenario", "pids")
 
 
@@ -32,7 +39,7 @@ def rpc(url, method, params=None):
 
 def processes():
     """name -> pids: scenario services from scenario.sh pid files (so other
-    stacks' processes with the same names are ignored), plus surfpool."""
+    stacks' processes with the same names are ignored), plus the validator."""
     out = {}
     for name in SERVICES:
         try:
@@ -46,8 +53,9 @@ def processes():
             argv0 = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")[0]
         except OSError:
             continue
-        if os.path.basename(argv0.decode(errors="replace")) == "surfpool" and pid not in out.get("surfpool", []):
-            out.setdefault("surfpool", []).append(pid)
+        name = os.path.basename(argv0.decode(errors="replace"))
+        if name in VALIDATORS:
+            out.setdefault(name, []).append(pid)
     return out
 
 
@@ -79,6 +87,15 @@ def summarize(values):
     }
 
 
+def feature_active(url, feature):
+    """A feature account exists once activation is scheduled; byte 0 is the Some tag of activated_at."""
+    try:
+        value = rpc(url, "getAccountInfo", [feature, {"encoding": "base64"}])[0]["value"]
+    except Exception:  # noqa: BLE001 - unknown means assume legacy voting
+        return False
+    return bool(value) and base64.b64decode(value["data"][0])[:1] == b"\x01"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=float, default=600)
@@ -87,6 +104,7 @@ def main():
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
+    tower_votes = not feature_active(args.rpc, ALPENGLOW)
     samples = []
     previous = None
     deadline = time.monotonic() + args.seconds
@@ -102,6 +120,7 @@ def main():
         except Exception as error:  # noqa: BLE001 - a stalled validator is a data point
             tx_count = slot = latency = None
             print("rpc sample failed:", error)
+        votes_per_slot = 1 if tower_votes and "solana-test-validator" in pids else 0
         current = {"t": now, "proc": per_proc, "total": total, "idle": idle, "tx": tx_count, "slot": slot}
         if previous:
             dt = now - previous["t"]
@@ -110,7 +129,8 @@ def main():
                 "machineCpuPct": round(100 * (1 - (idle - previous["idle"]) / max(1, total - previous["total"])), 1),
                 "memAvailableGiB": round(available / 2**30, 2),
                 "rpcLatencyMs": round(latency, 1) if latency is not None else None,
-                "tps": round((tx_count - previous["tx"]) / dt, 2) if tx_count is not None and previous["tx"] is not None else None,
+                "tps": round((tx_count - previous["tx"] - votes_per_slot * (slot - previous["slot"])) / dt, 2)
+                if tx_count is not None and previous["tx"] is not None else None,
                 "slotsPerSec": round((slot - previous["slot"]) / dt, 2) if slot is not None and previous["slot"] is not None else None,
                 "services": {},
             }

@@ -1,0 +1,98 @@
+# Review: Orca Whirlpool client and orchestrators
+
+Scope: `crates/orca-whirlpool-client`, `crates/orca-whirlpool-orchestrator`,
+`services/orca-whirlpool-orchestrator`.
+
+Reviewed 2026-10-14 at `bc96670`, read-only. Severity is
+Critical/High/Medium/Low. Priority runs from P0 (now), P1 (next) and P2
+(later) to P3 (nice to have). Client #1 was re-verified while compiling this
+report: `Cargo.lock` resolves `orca_whirlpools_macros 1.0.5`, whose `LICENSE`
+is the Orca License, effective 2025-02-27.
+
+## orca-whirlpool-client
+
+**Purpose and boundary.** Wraps the self-deployed Whirlpool program: account
+decoding, quoting through `orca_whirlpools_core`, and config, pool, tick-array,
+position and swap instructions. Solana 2.x types are bridged through a private
+adapter (`adapter.rs`). `SwapSnapshot` is the read-only quoting surface. The
+boundary is right; the problems are licensing, RPC fan-out and slippage
+semantics.
+
+| #   | Severity | Category    | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Recommendation                                                                                                                                                                                                          | Priority | Impact                                                  |
+| --- | -------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------------------------------------- |
+| 1   | Critical | licensing   | **The build links Orca-License code.** `Cargo.lock:2997-2999` resolves `orca_whirlpools_macros = 1.0.5`, published 2025-02-28 under the Orca License. `orca_whirlpools_core 1.0.4` declares a caret requirement on macros `1.0.4`. The `=` pins in `Cargo.toml:15-16` don't cover the macros crate, `docs/dex-forks.md` doesn't mention it, and the deny job was removed from CI (`5bfabb0`).                                                               | Pin `orca_whirlpools_macros = "=1.0.4"` directly, with a comment; list it in dex-forks.md; restore a license-only `cargo deny check licenses` gate.                                                                     | P0       | Breaks the documented "Apache-2.0 only" policy.         |
+| 2   | High     | correctness | **Root cause of Custom 6017/6018 on LP operations.** Core 1.0.4's `token_max`/`token_min` are `est × (1 ± bps)` at the _current_ sqrt price (`quote/liquidity.rs:245-248`). The client uses them for open/increase (`lib.rs:1111-1148,1173-1177`) and decrease (`:493-502,531-532`), with a 50 bps default. A small price move shifts the A:B ratio far more than 50 bps on an in-range position. For an out-of-range start, the missing side's bound is 0. | Bounds over a sqrt-price band `[sqrt·√(1−s), sqrt·√(1+s)]`: max over both ends for increase, min for decrease. Write it independently (the later upstream fix is post-relicense). Re-quote and retry once on 6017/6018. | P1       | Position flows fail under arb/mm traffic.               |
+| 3   | High     | correctness | **`position_value` is not slot-consistent.** The pool comes from `load_pool` (`lib.rs:614`); the tick arrays come from a later RPC (`:631`). A tick crossing in between makes `wrapping_sub` produce roughly 2^128 growth, `mul_shr_64` saturates, and `u64::MAX` flows into `amount_a/b` (`:676-683`).                                                                                                                                                     | Read position, pool and both tick arrays in one `getMultipleAccounts`; treat inside growth > global as an inconsistent read (an error, not saturation).                                                                 | P1       | PnL can report absurd values.                           |
+| 4   | Medium   | correctness | **`position_value` doesn't validate its tick arrays** (`whirlpool`, `start_tick_index`). A bad offset is clamped with `unwrap_or(0)` and `.min(len-1)` (`lib.rs:643-644`).                                                                                                                                                                                                                                                                                  | Validate as `load_swap_tick_arrays` does (`:1288-1295`); error on an out-of-range offset.                                                                                                                               | P2       | Fee value can be silently wrong.                        |
+| 5   | High     | perf        | **`load_swap_snapshot` makes 5 serial RPCs:** pool (`:920`), mints and vaults (`:946`), `get_epoch_info` (`:961`), user ATAs (`:972`), then pool plus 5 tick arrays (`:1265`). Router and arb use a `NullSigner(Pubkey::default())`, so the ATA fetch is wasted. Immutable metadata is re-validated on every call.                                                                                                                                          | A cached `PoolStatic` (mints, programs, decimals, vaults, fee config) plus one per-call `getMultipleAccounts` (pool, 5 arrays, Clock sysvar for the epoch). Skip ATAs in read-only mode.                                | P1       | About 5× fewer RPCs per quote; less staleness.          |
+| 6   | Medium   | perf        | **Write operations add RPCs before submitting.** Each also runs `load_pool` (4 RPCs), plus tick-array checks (`:409,460,510,571`). Each RPC widens the quote-to-land gap that feeds #2.                                                                                                                                                                                                                                                                     | Batch the arrays into the pool fetch; quote last, right before submit.                                                                                                                                                  | P2       | Fewer 6017/6018; lower latency.                         |
+| 7   | Medium   | ops/perf    | **The CU limit is fixed at 1.4M.** `simulated_compute_units` (mtm-chain `lib.rs:148`) is never used. The swap quote exposes no crossings, so the router uses a flat 100k + 50k against p50 64k / p99 76k.                                                                                                                                                                                                                                                   | Return initialized ticks crossed from `bounded_swap_quote`; `cu = base + k·crossings`; optionally simulated × 1.15.                                                                                                     | P2       | Over-requested CU hurts per-pool packing and fees.      |
+| 8   | Low      | correctness | **`decrease_liquidity(Some(amount))` uses the increase quote** (`lib.rs:480-484`), which uses reverse transfer-fee and deposit rounding.                                                                                                                                                                                                                                                                                                                    | `core::decrease_liquidity_quote_a/b`.                                                                                                                                                                                   | P3       | Small mis-sizing with transfer fees.                    |
+| 9   | Low      | correctness | **`position_value` adds pre-transfer-fee amounts** and leaves out rewards (`lib.rs:676-683`).                                                                                                                                                                                                                                                                                                                                                               | Apply the transfer fee; document or add rewards.                                                                                                                                                                        | P3       | Slight overstatement.                                   |
+| 10  | Low      | correctness | **Swap tick arrays near the price limits.** They are always `start ± 2·span` (`lib.rs:1255-1261`), which is invalid near MIN/MAX tick.                                                                                                                                                                                                                                                                                                                      | Clamp to valid starts.                                                                                                                                                                                                  | P3       | Edge prices only.                                       |
+| 11  | Low      | correctness | **Unsupported position shapes fail confusingly.** Only Token-2022 positions in the payer's ATA work (`lib.rs:1025-1046`), and transfer-hook mints fail (`remaining_accounts_info: None`).                                                                                                                                                                                                                                                                   | Document; return a typed "unsupported" error.                                                                                                                                                                           | P3       | Confusing errors.                                       |
+| 12  | Low      | standards   | **Hygiene.** Two doc comments are merged into one, and the first is stale (`lib.rs:1237-1245`). Read paths emit no metrics. Discriminators are hashed and formatted on every decode (`:2311`). The mint data is cloned on every load (`:2010`).                                                                                                                                                                                                             | Fix the doc; instrument the reads; `const`/`LazyLock` discriminators.                                                                                                                                                   | P3       | Hygiene plus a hot-path allocation.                     |
+| 13  | Medium   | testing     | **Thin tests (4).** Nothing covers `position_value` or fee wraparound, liquidity bounds, `price_range_to_ticks` edge cases, the transfer-fee helpers, or tick-array mismatch.                                                                                                                                                                                                                                                                               | Pure tests on synthetic bundles, plus a license-pin test for #1.                                                                                                                                                        | P2       | Money-math regressions go unnoticed.                    |
+| 14  | Medium   | boundary    | **Duplicated with `raydium-clmm-client`:** `run`/`submit`/error mapping, `price_to_sqrt_x64` (Raydium lacks the bounds check), `ensure_positive`, `ui_to_raw`, `require_account`, the vault and token-account validators, `pda`, `ordered_mints`, transfer-fee helpers, and the `PositionValue` shape.                                                                                                                                                      | Shared plumbing in harness/mtm-math (see the cross-cutting notes).                                                                                                                                                      | P2       | Every fix lands twice, and the copies already disagree. |
+
+**Verified correct:** the PDA seeds (whirlpool, fee_tier, token_badge,
+position, oracle, tick_array); SwapV2 transfer-fee semantics (tested);
+sparse-swap use of uninitialized arrays and the `bounded_swap_quote` guard;
+the fee-growth-inside formula and its wrapping; `mul_shr_64`; tick rounding;
+the discriminator and owner checks.
+
+**Design recommendations**
+
+- **Static/dynamic snapshot split (M):** cache pool metadata; refresh pool,
+  arrays and Clock in one RPC; read positions atomically (#3, #5, #6).
+- **Price-band slippage bounds and one retry on 6017/6018 (S-M),** written
+  independently to stay clear of the license.
+- **CU from the quote (S):** `ticks_crossed` and `cu_estimate` on `SwapQuote`.
+- **Shared CLMM plumbing with one shared test suite (M).**
+
+## orca-whirlpool-orchestrator (library)
+
+**Purpose and boundary.** Sequencing on top of the client: admin config and
+fee tier, pool creation plus tick-array seeding, and a scripted user
+lifecycle with test-token funding. Thin and correctly layered. However,
+`services/scenario` depends on it directly (`services/scenario/Cargo.toml:21`),
+against the literal "only `*-client` crates" rule.
+
+| #   | Severity | Category      | Finding                                                                                                                                                                                                                      | Recommendation                                                                  | Priority | Impact                            |
+| --- | -------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | -------- | --------------------------------- |
+| 1   | Medium   | standards/ops | **Span guards held across `.await`** (`lib.rs:246,287`) misattribute spans under concurrency and make the futures `!Send`.                                                                                                   | `.instrument(span)`; enable the `await_holding_span_guard` lint workspace-wide. | P2       | Misleading traces.                |
+| 2   | Medium   | ops           | **Every transaction requests 1.4M CU** (`lib.rs:108,199-217`).                                                                                                                                                               | A per-action default (~200k) or simulation-derived.                             | P2       | Packing and fees.                 |
+| 3   | Low      | correctness   | **The flow always deposits `mint_a`** (`lib.rs:310-324`), which fails once the price is above the range.                                                                                                                     | Choose the input mint from the price's position relative to the range.          | P3       | Spurious failures after drift.    |
+| 4   | Low      | boundary      | **Price order is split across layers.** The client normalizes the pool price, but the range is normalized here (`lib.rs:420-436`). `validate_program` duplicates the client's check. Validators are duplicated with Raydium. | Normalize in one layer (the client); move validators to the harness.            | P3       | Inverted ranges are easy to pass. |
+| 5   | Low      | testing       | One test.                                                                                                                                                                                                                    | Validation tests plus an ignored test-validator integration test.               | P3       |                                   |
+
+**Design recommendations:**
+
+- Make the orchestrator generic over a `ClmmVenue` trait shared with Raydium,
+  since the user flows are structurally identical (M).
+- Retry once on 6017/6018 and blockhash expiry, with retry-reason metrics (S).
+
+## services/orca-whirlpool-orchestrator (CLI)
+
+**Purpose and boundary.** A clap binary with `admin`, `create-pools` and
+`user-flow`, built on the library and the harness. The boundary is correct.
+
+| #   | Severity | Category  | Finding                                                                                                                  | Recommendation                                          | Priority | Impact                            |
+| --- | -------- | --------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- | -------- | --------------------------------- |
+| 1   | Medium   | ops       | **Oversized CU defaults:** 1.4M (`main.rs:313-320`), and 400k for admin.                                                 | A lower default, or "auto" from simulation.             | P2       |                                   |
+| 2   | Low      | standards | **Single-line `json!` blobs** (`main.rs:345-354`) defeat rustfmt.                                                        | `Serialize` output structs shared with the Raydium CLI. | P3       | Output drift between CLIs.        |
+| 3   | Low      | security  | **More secrets than needed.** `user-flow` needs the WhirlpoolsConfig _secret_ only to derive a pubkey (`main.rs:70-76`). | `--whirlpools-config` or a pubkey env var.              | P3       | Exposes more secrets than needed. |
+| 4   | Low      | testing   | No CLI tests.                                                                                                            | `Cli::command().debug_assert()`.                        | P3       |                                   |
+
+**Design recommendation:** fold the three DEX CLIs into shared harness
+subcommand builders (M).
+
+## Cross-cutting notes
+
+- **The licensing fix is P0.** `orca_whirlpools_client 2.0.2` also pulls in
+  `solana-program` 2.x. That is an accepted exception to the granular-crates
+  rule (isolated in `adapter.rs`) and should be documented.
+- **Contention failures (6017/6018)** come from single-point slippage bounds
+  plus a quote-to-land gap of 4-6 RPCs. Fix both.
+- **The router and arb hot path pays about 5 RPCs per Orca snapshot;** the
+  static/dynamic split cuts that to 1.
