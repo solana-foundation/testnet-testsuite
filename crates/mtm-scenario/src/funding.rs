@@ -104,6 +104,37 @@ pub async fn wallet_balances(
     })
 }
 
+/// Data of `keys` (`None` for a missing account), read in one
+/// `getMultipleAccounts` at the client's commitment and a context slot of at
+/// least `min_context_slot`: a read pinned to a confirmation slot cannot
+/// come from a node that has not seen that transaction.
+pub async fn account_data(
+    chain: &ChainClient,
+    keys: &[Pubkey],
+    min_context_slot: Option<u64>,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let config = RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::Base64),
+        commitment: Some(chain.rpc().commitment()),
+        min_context_slot,
+        ..RpcAccountInfoConfig::default()
+    };
+    let response = chain
+        .rpc()
+        .get_multiple_ui_accounts_with_config(keys, config)
+        .await
+        .context("reading accounts")?;
+    response
+        .value
+        .into_iter()
+        .map(|account| {
+            account
+                .map(|account| account.data.decode().context("account data is not base64"))
+                .transpose()
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletBalances {
     /// context slot the accounts were read at

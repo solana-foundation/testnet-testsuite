@@ -26,6 +26,10 @@ struct Position {
     mint: String,
     /// Centre price (quote per base) the range was opened around.
     center: Decimal,
+    /// Slot the open confirmed in: position reads must reach it. Absent
+    /// from state files written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opened_slot: Option<u64>,
 }
 
 enum Lp {
@@ -45,7 +49,8 @@ enum OpenError {
 }
 
 impl Lp {
-    /// Open a position in pool-order prices with `amount` of `mint`.
+    /// Open a position in pool-order prices with `amount` of `mint`;
+    /// returns the position mint and the slot the open confirmed in.
     async fn open(
         &self,
         pool: Pubkey,
@@ -53,7 +58,7 @@ impl Lp {
         upper: Decimal,
         mint: Pubkey,
         amount: Decimal,
-    ) -> std::result::Result<Pubkey, OpenError> {
+    ) -> std::result::Result<(Pubkey, u64), OpenError> {
         let opened = self
             .retry_on_slippage("open", || self.open_inner(pool, lower, upper, mint, amount))
             .await;
@@ -94,10 +99,10 @@ impl Lp {
         upper: Decimal,
         mint: Pubkey,
         amount: Decimal,
-    ) -> Result<Pubkey> {
+    ) -> Result<(Pubkey, u64)> {
         Ok(match self {
             Lp::Orca(client) => {
-                client
+                let opened = client
                     .open_position(orca_whirlpool_client::OpenPositionParams {
                         pool,
                         lower_price: lower,
@@ -105,12 +110,14 @@ impl Lp {
                         input: orca_whirlpool_client::TokenAmount { mint, amount },
                         with_metadata: false,
                     })
-                    .await?
-                    .accounts
-                    .position_mint
+                    .await?;
+                (
+                    opened.accounts.position_mint,
+                    opened.transaction.confirmation_slot,
+                )
             }
             Lp::Raydium(client) => {
-                client
+                let opened = client
                     .open_position(raydium_clmm_client::OpenPositionParams {
                         pool,
                         lower_price: lower,
@@ -118,9 +125,11 @@ impl Lp {
                         input: raydium_clmm_client::TokenAmount { mint, amount },
                         with_metadata: false,
                     })
-                    .await?
-                    .accounts
-                    .position_nft_mint
+                    .await?;
+                (
+                    opened.accounts.position_nft_mint,
+                    opened.transaction.confirmation_slot,
+                )
             }
         })
     }
@@ -231,22 +240,52 @@ fn is_slippage(error: &anyhow::Error, codes: &[u32]) -> bool {
         .any(|code| text.contains(&format!("Custom({code}))")))
 }
 
-/// Whether `owner` still holds the position NFT `mint` (in its classic or
-/// Token-2022 ATA). Closing a position burns it, so a missing NFT means the
-/// close already landed.
-async fn holds_position(ctx: &Ctx, mint: Pubkey) -> Result<bool> {
-    let owner = ctx.wallet_pubkey();
-    let keys = [spl::TOKEN_PROGRAM_ID, spl::TOKEN_2022_PROGRAM_ID]
-        .map(|program| spl::associated_token_address(&owner, &mint, &program));
-    let accounts = ctx
-        .chain
-        .rpc()
-        .get_multiple_accounts(&keys)
+/// Whether a recorded position is still open.
+#[derive(Debug, PartialEq, Eq)]
+enum Holding {
+    Held,
+    /// The close landed (but may not have been recorded: crash, timeout).
+    Closed,
+}
+
+/// Accounts that show whether the wallet `owner` still has position `mint`:
+/// the NFT's classic and Token-2022 ATAs, and the position account (Orca
+/// and Raydium both derive it as `["position", mint]` under their program).
+fn holding_keys(owner: Pubkey, mint: Pubkey, program: Pubkey) -> [Pubkey; 3] {
+    [
+        spl::associated_token_address(&owner, &mint, &spl::TOKEN_PROGRAM_ID),
+        spl::associated_token_address(&owner, &mint, &spl::TOKEN_2022_PROGRAM_ID),
+        Pubkey::find_program_address(&[b"position", mint.as_ref()], &program).0,
+    ]
+}
+
+/// Read [`holding_keys`] through `read` (keys, minimum context slot) at no
+/// earlier than the open's slot, so a lagging node cannot serve the state
+/// from before the open. Closing burns the NFT and closes the position
+/// account in one instruction, so only both gone means closed; an NFT gone
+/// while its position account remains is an error, never a cleared state.
+async fn holding<R, Fut>(read: R, keys: [Pubkey; 3], opened_slot: Option<u64>) -> Result<Holding>
+where
+    R: FnOnce([Pubkey; 3], Option<u64>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Option<Vec<u8>>>>>,
+{
+    let accounts = read(keys, opened_slot)
         .await
-        .context("reading position NFT accounts")?;
-    Ok(accounts.iter().flatten().any(|account| {
-        spl::decode_token_account(&account.data).is_some_and(|state| state.amount > 0)
-    }))
+        .context("reading the position NFT and account")?;
+    let nft = accounts
+        .iter()
+        .take(2)
+        .flatten()
+        .any(|data| spl::decode_token_account(data).is_some_and(|state| state.amount > 0));
+    let position = accounts.get(2).is_some_and(Option::is_some);
+    match (nft, position) {
+        (true, _) => Ok(Holding::Held),
+        (false, false) => Ok(Holding::Closed),
+        (false, true) => anyhow::bail!(
+            "position account {} exists but its NFT is not in the wallet; keeping the state",
+            keys[2]
+        ),
+    }
 }
 
 pub struct Clmm {
@@ -355,7 +394,15 @@ impl Clmm {
         if let Some(position) = &self.position {
             let mint = Pubkey::from_str(&position.mint)?;
             let drift = deviation_bps(center, position.center).abs();
-            if !holds_position(ctx, mint).await? {
+            let keys = holding_keys(
+                ctx.wallet_pubkey(),
+                mint,
+                ctx.scenario.programs.of(ctx.maker.venue),
+            );
+            let read = |keys: [Pubkey; 3], min_context_slot| async move {
+                mtm_scenario::funding::account_data(&ctx.chain, &keys, min_context_slot).await
+            };
+            if holding(read, keys, position.opened_slot).await? == Holding::Closed {
                 // The close landed but was not recorded (crash, timeout).
                 info!(maker = %ctx.maker.name, %mint, "position already closed");
             } else {
@@ -425,13 +472,13 @@ impl Clmm {
         };
         let (lower, upper) = (lower.round_dp(10), upper.round_dp(10));
         let mut retried = false;
-        let mint = loop {
+        let (mint, opened_slot) = loop {
             match self
                 .lp
                 .open(ctx.pool, lower, upper, ctx.base.mint, amount)
                 .await
             {
-                Ok(mint) => break mint,
+                Ok(opened) => break opened,
                 // The venue snaps the range to its tick spacing, which can
                 // shift the split further: shrink to what it asked for, once.
                 Err(OpenError::Short {
@@ -462,6 +509,7 @@ impl Clmm {
         self.position = Some(Position {
             mint: mint.to_string(),
             center,
+            opened_slot: Some(opened_slot),
         });
         self.save()?;
         ctx.action("open");
@@ -522,6 +570,89 @@ mod tests {
 
     fn d(s: &str) -> Decimal {
         Decimal::from_str(s).expect("decimal")
+    }
+
+    #[test]
+    fn state_files_without_an_open_slot_still_load() {
+        let old: Position =
+            serde_json::from_str(r#"{"mint":"11111111111111111111111111111111","center":"1.5"}"#)
+                .expect("old state file");
+        assert_eq!(old.opened_slot, None);
+        let new = Position {
+            opened_slot: Some(42),
+            ..old
+        };
+        let json = serde_json::to_string(&new).expect("serialize");
+        let back: Position = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back.opened_slot, Some(42));
+    }
+
+    /// An NFT token account (SPL layout: mint, owner, amount, ...).
+    fn nft_account(amount: u64) -> Vec<u8> {
+        let mut data = vec![0_u8; 165];
+        data[64..72].copy_from_slice(&amount.to_le_bytes());
+        data[108] = 1; // initialized
+        data
+    }
+
+    type Accounts = Result<Vec<Option<Vec<u8>>>>;
+
+    /// A load-balanced RPC whose node is at `node_slot` and still serves
+    /// the state from before an open in a later slot.
+    fn lagging_node(
+        node_slot: u64,
+    ) -> impl FnOnce([Pubkey; 3], Option<u64>) -> std::future::Ready<Accounts> {
+        move |_, min_context_slot| {
+            std::future::ready(match min_context_slot {
+                Some(slot) if slot > node_slot => {
+                    Err(anyhow::anyhow!("Minimum context slot has not been reached"))
+                }
+                _ => Ok(vec![None, None, None]),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_from_before_the_open_never_clears_the_position() {
+        let keys = holding_keys(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        // Pinned to the open's slot, the lagging node refuses: the tick
+        // fails and the state file survives.
+        assert!(holding(lagging_node(90), keys, Some(100)).await.is_err());
+        // Unpinned (state files from before the slot was recorded), the
+        // pre-open read looks closed: what the pin protects against.
+        assert_eq!(
+            holding(lagging_node(90), keys, None).await.expect("read"),
+            Holding::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_gone_nft_and_position_account_mean_closed() {
+        let keys = holding_keys(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let serve = |accounts: Vec<Option<Vec<u8>>>| {
+            move |_: [Pubkey; 3], _: Option<u64>| std::future::ready(Ok(accounts))
+        };
+        let held = serve(vec![None, Some(nft_account(1)), Some(vec![0; 216])]);
+        assert_eq!(
+            holding(held, keys, Some(1)).await.expect("read"),
+            Holding::Held
+        );
+        let closed = serve(vec![None, None, None]);
+        assert_eq!(
+            holding(closed, keys, Some(1)).await.expect("read"),
+            Holding::Closed
+        );
+        // An emptied NFT account with the position still open: not closed.
+        let inconsistent = serve(vec![Some(nft_account(0)), None, Some(vec![0; 216])]);
+        assert!(holding(inconsistent, keys, Some(1)).await.is_err());
     }
 
     #[test]
