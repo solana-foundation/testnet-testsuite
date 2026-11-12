@@ -649,6 +649,23 @@ fn classify_send_error(error: &ClientError) -> SendFailure {
     }
 }
 
+/// Whether the RPC refused a request without serving it: an HTTP error
+/// status (429, 5xx; after `HttpSender`'s own 429 retries) or a failed
+/// connection. Looks through `anyhow` context for the [`ClientError`], so it
+/// works on any read wrapped by the caller. A read has no side effects, so
+/// any of these is a refusal. Sends are stricter (see `classify_send_error`):
+/// a gateway 5xx other than 503 may follow a send the node took, so it is
+/// ambiguous there, not refused.
+pub fn refused_by_rpc(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ClientError>().is_some_and(is_refusal))
+}
+
+fn is_refusal(error: &ClientError) -> bool {
+    matches!(error.kind(), RpcErrorKind::Reqwest(error) if error.is_status() || error.is_connect())
+}
+
 /// `processed` / `confirmed` / `finalized`.
 pub fn parse_commitment(s: &str) -> anyhow::Result<CommitmentConfig> {
     match s {

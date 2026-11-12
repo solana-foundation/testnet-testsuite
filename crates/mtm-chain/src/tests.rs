@@ -719,6 +719,36 @@ async fn a_refused_connection_is_unavailable() {
     );
 }
 
+/// A wrapped balance read against `url`, as a service would make it.
+async fn read_over_http(url: &str) -> anyhow::Error {
+    use anyhow::Context;
+    ChainClient::new(url, "confirmed")
+        .expect("client")
+        .rpc()
+        .get_balance(&Keypair::new().pubkey())
+        .await
+        .context("reading wallet balances")
+        .expect_err("not served")
+}
+
+#[tokio::test]
+async fn reads_the_rpc_refused_are_told_apart() {
+    for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+        let (url, _) = http_endpoint(status).await;
+        let error = read_over_http(&url).await;
+        assert!(crate::refused_by_rpc(&error), "{status}: {error:#}");
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    drop(listener);
+    assert!(crate::refused_by_rpc(&read_over_http(&url).await));
+    // Served, but the answer is unreadable: not a refusal.
+    let (url, _) = http_endpoint("200 OK").await;
+    let error = read_over_http(&url).await;
+    assert!(!crate::refused_by_rpc(&error), "{error:#}");
+    assert!(!crate::refused_by_rpc(&anyhow::anyhow!("other")));
+}
+
 /// Whether a base64 wire transaction (first param) carries
 /// `SetComputeUnitLimit(limit)`: data length 5, tag 2, the limit LE.
 fn has_compute_unit_limit(params: &Value, limit: u32) -> bool {

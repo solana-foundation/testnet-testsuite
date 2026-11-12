@@ -15,6 +15,10 @@
 //! apart from infrastructure faults (expired, ambiguous or rejecting RPC). Once the router
 //! has quoted a route, `flow_venue_swaps_total` also counts the send's
 //! outcome once per venue the route touches, for per-venue failure rates.
+//! A taker whose trade the RPC refused (`rpc_rejected`: HTTP 429/5xx or no
+//! connection, on the balance read or the send) skips its refill read and
+//! backs off, doubling up to 30 s with jitter, so a rate-limited RPC is not
+//! hammered by every taker at once.
 //!
 //! Each landed swap is a `debug` line; `info` gets one summary a minute
 //! (outcome counts), so a long run at thousands of swaps per second doesn't
@@ -127,6 +131,9 @@ async fn main() -> Result<()> {
             counter!("flow_venue_swaps_total", "venue" => venue, "status" => outcome.status(), "outcome" => outcome.as_str())
                 .absolute(0);
         }
+    }
+    for name in ["flow_rpc_backoffs_total", "flow_refill_errors_total"] {
+        counter!(name).absolute(0);
     }
     let takers: Vec<Keypair> = (0..flow.takers).map(|i| scenario.taker_wallet(i)).collect();
     anyhow::ensure!(!takers.is_empty(), "the flow needs at least one taker");
@@ -263,15 +270,17 @@ enum Outcome {
     PreflightRejected,
     /// the RPC refused the transaction for another reason
     SendFailed,
-    /// the RPC did not take the send at all (HTTP 429/5xx, connection
-    /// failed): never reached the cluster, nothing was polled
+    /// the RPC refused a request of this trade (HTTP 429/5xx, connection
+    /// failed), the balance read before the quote or the send: the swap
+    /// never reached the cluster, nothing was polled
     RpcRejected,
     /// the swap landed and failed on-chain
     LandedFailed,
     /// the blockhash expired with no status observed
     Expired,
     /// the status could not be determined (RPC errors or the deadline):
-    /// the swap may or may not have landed
+    /// the swap may or may not have landed; also a balance read before the
+    /// quote that the RPC served but that failed (timeout, bad answer)
     RpcAmbiguous,
     /// anything else (decode, signing, local errors)
     Error,
@@ -313,6 +322,16 @@ impl Outcome {
             SubmissionError::Expired { .. } => Self::Expired,
             SubmissionError::AmbiguousConfirmation { .. } => Self::RpcAmbiguous,
             _ => Self::Error,
+        }
+    }
+
+    /// How a failed RPC read before the send ended: a refusal is the same
+    /// fault as a refused send.
+    fn of_read(error: &anyhow::Error) -> Self {
+        if mtm_chain::refused_by_rpc(error) {
+            Self::RpcRejected
+        } else {
+            Self::RpcAmbiguous
         }
     }
 
@@ -425,6 +444,12 @@ impl Flow<'_> {
         let size = LogNormal::new(self.flow.median_usd.ln(), self.flow.sigma).context("sigma")?;
         let unit = Uniform::new(0.0_f64, 1.0).context("uniform")?;
         let pairs = self.flow.pairs.len();
+        // Backoff jitter has its own stream, so rejections (which depend on
+        // the RPC, not the seed) do not shift the replayable trade sequence.
+        let mut jitter = ChaCha8Rng::seed_from_u64(
+            self.flow.rng_seed.wrapping_add(index as u64) ^ JITTER_STREAM,
+        );
+        let mut backoff = Backoff::default();
         loop {
             // The 10-minute cap only bites at very low per-taker rates; it
             // keeps a single unlucky draw from idling a taker for hours.
@@ -475,8 +500,18 @@ impl Flow<'_> {
                 "size" => size_label
             )
             .increment(1);
+            // A refused RPC is not asked again at once: no refill read,
+            // and a pause before the next arrival.
+            if let Some(pause) = backoff.after(outcome, unit.sample(&mut jitter)) {
+                counter!("flow_rpc_backoffs_total").increment(1);
+                tokio::time::sleep(pause).await;
+                continue;
+            }
             if let Err(error) = self.refill(taker).await {
-                warn!(taker = index, error = %format!("{error:#}"), "refill failed");
+                // Counted, not warned: in an RPC outage every trade's refill
+                // read fails.
+                counter!("flow_refill_errors_total").increment(1);
+                debug!(taker = index, error = %format!("{error:#}"), "refill failed");
             }
         }
     }
@@ -493,9 +528,11 @@ impl Flow<'_> {
         // One read of both sides, before the quote: it decides the
         // direction and is the baseline for the fill, and nothing sits
         // between the quote and the send.
-        let before = wallet_balances(&self.chain, &owner, &[trade.input, trade.output], None)
-            .await
-            .outcome(Outcome::RpcAmbiguous)?;
+        let before =
+            match wallet_balances(&self.chain, &owner, &[trade.input, trade.output], None).await {
+                Ok(before) => before,
+                Err(error) => return fail(Outcome::of_read(&error), error),
+            };
         let notional = trade.notional;
         let affordable = |token: &Token, balance: u64| -> std::result::Result<bool, TradeError> {
             Ok(
@@ -680,6 +717,40 @@ impl Flow<'_> {
     }
 }
 
+/// Salt for each taker's backoff jitter stream.
+const JITTER_STREAM: u64 = 0x6a69_7474_6572;
+/// First pause after the RPC refuses a taker's trade.
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Longest pause, however many trades in a row were refused.
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// A taker's pause after `rpc_rejected` trades: doubles per refusal in a
+/// row from [`BACKOFF_BASE`] up to [`BACKOFF_MAX`], scaled by a jitter in
+/// [0.5, 1) so a shard's takers do not come back in lockstep. Any other
+/// outcome resets it.
+#[derive(Debug, Default)]
+struct Backoff {
+    refused: u32,
+}
+
+impl Backoff {
+    /// The pause after `outcome` (`jitter` uniform in [0, 1)), `None` when
+    /// the RPC served the trade.
+    fn after(&mut self, outcome: Outcome, jitter: f64) -> Option<Duration> {
+        if outcome != Outcome::RpcRejected {
+            self.refused = 0;
+            return None;
+        }
+        self.refused = self.refused.saturating_add(1);
+        let doubled = BACKOFF_BASE.saturating_mul(1 << (self.refused - 1).min(16));
+        Some(
+            doubled
+                .min(BACKOFF_MAX)
+                .mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0)),
+        )
+    }
+}
+
 /// USD to whole micro-USD for the notional counter (counters are integers;
 /// whole USD would drop most of a small trade's volume).
 fn micro_usd(usd: Decimal) -> u64 {
@@ -748,6 +819,49 @@ mod tests {
         assert_eq!(micro_usd(Decimal::new(123_456_789, 7)), 12_345_679);
         assert_eq!(micro_usd(Decimal::new(4, 1)), 400_000);
         assert_eq!(micro_usd(Decimal::new(-1, 0)), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_balance_read_is_rpc_rejected() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        drop(listener);
+        let chain = ChainClient::new(&url, "confirmed").expect("client");
+        let Err(error) = wallet_balances(&chain, &Keypair::new().pubkey(), &[], None).await else {
+            panic!("a closed port serves nothing");
+        };
+        assert_eq!(Outcome::of_read(&error), Outcome::RpcRejected);
+        assert_eq!(
+            Outcome::of_read(&anyhow::anyhow!("timed out")),
+            Outcome::RpcAmbiguous
+        );
+    }
+
+    #[test]
+    fn refused_trades_back_off_bounded_and_skip_the_refill() {
+        let mut backoff = Backoff::default();
+        assert_eq!(backoff.after(Outcome::Landed, 0.0), None);
+        assert_eq!(backoff.after(Outcome::Expired, 0.9), None);
+        let pauses: Vec<Duration> = (0..12)
+            .map(|_| {
+                backoff
+                    .after(Outcome::RpcRejected, 0.999_999)
+                    .expect("a refused trade pauses")
+            })
+            .collect();
+        assert!((pauses[0].as_secs_f64() - 0.5).abs() < 1e-3, "{pauses:?}");
+        assert!(pauses.windows(2).all(|w| w[0] <= w[1]), "{pauses:?}");
+        assert!(pauses.iter().all(|p| *p <= BACKOFF_MAX), "{pauses:?}");
+        assert!(pauses[11] > BACKOFF_MAX.mul_f64(0.99), "{pauses:?}");
+        // Jitter scales into [0.5, 1) of the step.
+        let low = backoff.after(Outcome::RpcRejected, 0.0).expect("pause");
+        assert_eq!(low, BACKOFF_MAX / 2);
+        // A served trade resets the streak.
+        assert_eq!(backoff.after(Outcome::Landed, 0.5), None);
+        assert_eq!(
+            backoff.after(Outcome::RpcRejected, 0.0),
+            Some(BACKOFF_BASE / 2)
+        );
     }
 
     #[test]
