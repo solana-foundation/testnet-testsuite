@@ -474,6 +474,7 @@ fn build_response<S: QuoteSource>(
         cu_estimate: route_cu_estimate(segments, request.execution, request.jupiter_overhead_cu),
         compute_unit_limit: None,
         tx_base64: None,
+        last_valid_block_height: None,
     }
 }
 

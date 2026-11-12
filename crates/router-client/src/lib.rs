@@ -96,6 +96,11 @@ pub struct QuoteResponse {
     /// `user` was given); the compute budget is in the message config
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_base64: Option<String>,
+    /// last block height at which `tx_base64`'s blockhash is valid: once
+    /// the chain is past it, an unconfirmed transaction can no longer land
+    /// (present with `tx_base64`, absent from routers that predate it)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_valid_block_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,9 +230,29 @@ mod tests {
         .expect("older response");
         assert_eq!(response.max_in_amount, 0);
         assert!(response.compute_unit_limit.is_none() && response.tx_base64.is_none());
+        assert!(response.last_valid_block_height.is_none());
         let round_trip: QuoteResponse =
             serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
                 .expect("deserialize");
         assert_eq!(round_trip.out_amount, 2);
+    }
+
+    #[test]
+    fn last_valid_block_height_round_trips() {
+        let response: QuoteResponse = serde_json::from_str(
+            r#"{"execution":"direct","in_amount":1,"out_amount":2,"min_out_amount":2,
+                "price_impact_bps":0,"route":[],"state_slot":3,"cu_estimate":4,
+                "tx_base64":"AA==","last_valid_block_height":350}"#,
+        )
+        .expect("response");
+        assert_eq!(response.last_valid_block_height, Some(350));
+        let json = serde_json::to_value(&response).expect("serialize");
+        assert_eq!(json["last_valid_block_height"], 350);
+        let without = QuoteResponse {
+            last_valid_block_height: None,
+            ..response
+        };
+        let json = serde_json::to_value(&without).expect("serialize");
+        assert!(json.get("last_valid_block_height").is_none(), "{json}");
     }
 }

@@ -161,7 +161,14 @@ async fn fitted(
     state: &AppState,
     req: &QuoteRequest,
     user: &Pubkey,
-) -> Result<(PlannedRoute<crate::Snapshot>, assemble::Assembled, String), (StatusCode, String)> {
+) -> Result<
+    (
+        PlannedRoute<crate::Snapshot>,
+        assemble::Assembled,
+        assemble::RouteTx,
+    ),
+    (StatusCode, String),
+> {
     let (mut request, mut planned, book, state_slot) = planned(state, req).await?;
     loop {
         let assembled = assemble::route_instructions(
@@ -245,7 +252,8 @@ async fn quote_inner(
     let mut response = planned.response;
     response.compute_unit_limit =
         Some(assemble::Budget::for_route(state, &assembled).compute_unit_limit);
-    response.tx_base64 = Some(tx);
+    response.tx_base64 = Some(tx.tx_base64);
+    response.last_valid_block_height = Some(tx.last_valid_block_height);
     Ok(Json(response))
 }
 

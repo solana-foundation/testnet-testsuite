@@ -16,6 +16,9 @@ use tracing::{info, warn};
 pub struct ChainTip {
     pub slot: u64,
     pub blockhash: Hash,
+    /// Last block height at which `blockhash` is valid (from
+    /// `getLatestBlockhash`), so takers can tell expiry from a slow chain.
+    pub last_valid_block_height: u64,
     pub fetched_at: Instant,
 }
 
@@ -53,7 +56,7 @@ impl TipCell {
 
 /// Fetches the slot and latest blockhash once. Production fetches go
 /// through [`chain_fetch`]; tests inject fakes.
-pub type TipFetch = Arc<dyn Fn() -> BoxFuture<'static, Result<(u64, Hash), String>> + Send + Sync>;
+pub type TipFetch = Arc<dyn Fn() -> BoxFuture<'static, Result<ChainTip, String>> + Send + Sync>;
 
 /// The production fetch: `getSlot` and `getLatestBlockhash` over `chain`,
 /// concurrently. Give it a client of its own (not the snapshot loaders'),
@@ -62,10 +65,18 @@ pub fn chain_fetch(chain: ChainClient) -> TipFetch {
     Arc::new(move || {
         let chain = chain.clone();
         async move {
-            let (slot, blockhash) =
-                tokio::join!(chain.current_slot(), chain.rpc().get_latest_blockhash());
+            let rpc = chain.rpc();
+            let (slot, blockhash) = tokio::join!(
+                chain.current_slot(),
+                rpc.get_latest_blockhash_with_commitment(rpc.commitment())
+            );
             match (slot, blockhash) {
-                (Ok(slot), Ok(blockhash)) => Ok((slot, blockhash)),
+                (Ok(slot), Ok((blockhash, last_valid_block_height))) => Ok(ChainTip {
+                    slot,
+                    blockhash,
+                    last_valid_block_height,
+                    fetched_at: Instant::now(),
+                }),
                 (Err(error), _) => Err(format!("{error:#}")),
                 (_, Err(error)) => Err(format!("get_latest_blockhash failed: {error}")),
             }
@@ -98,16 +109,12 @@ pub fn spawn_refresher(
                 Err(_) => Err(format!("chain tip refresh timed out after {timeout:?}")),
             };
             match fetched {
-                Ok((slot, blockhash)) => {
+                Ok(tip) => {
                     if failing {
-                        info!(slot, "chain tip refresh recovered");
+                        info!(slot = tip.slot, "chain tip refresh recovered");
                         failing = false;
                     }
-                    tx.send_replace(Some(ChainTip {
-                        slot,
-                        blockhash,
-                        fetched_at: Instant::now(),
-                    }));
+                    tx.send_replace(Some(tip));
                 }
                 Err(error) => {
                     metrics::counter!("router_chain_tip_refresh_failures_total").increment(1);
@@ -143,7 +150,12 @@ mod tests {
                 if call == 0 {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
-                Ok((call as u64, Hash::new_from_array([1; 32])))
+                Ok(ChainTip {
+                    slot: call as u64,
+                    blockhash: Hash::new_from_array([1; 32]),
+                    last_valid_block_height: 150,
+                    fetched_at: Instant::now(),
+                })
             }
             .boxed()
         });
@@ -165,6 +177,7 @@ mod tests {
         tx.send_replace(Some(ChainTip {
             slot: 7,
             blockhash: Hash::new_from_array([9; 32]),
+            last_valid_block_height: 157,
             fetched_at: Instant::now(),
         }));
         assert_eq!(cell.current().expect("fresh").slot, 7);

@@ -311,23 +311,34 @@ pub fn check_fits(state: &AppState, user: &Pubkey, assembled: &Assembled) -> any
     .map(|_| ())
 }
 
-/// Full unsigned v1 transaction (wincode wire format, base64): the route's
-/// instructions with the compute budget in the message config, on the
-/// cached blockhash (no RPC; 502 when the cache is too old).
-pub fn route_tx(state: &AppState, user: &Pubkey, assembled: &Assembled) -> anyhow::Result<String> {
-    let blockhash = state
+/// An unsigned route transaction and the expiry of its blockhash.
+#[derive(Debug, Clone)]
+pub struct RouteTx {
+    /// wincode wire format, base64
+    pub tx_base64: String,
+    /// last block height at which the transaction's blockhash is valid
+    pub last_valid_block_height: u64,
+}
+
+/// Full unsigned v1 transaction: the route's instructions with the compute
+/// budget in the message config, on the cached blockhash (no RPC; 502 when
+/// the cache is too old), with that blockhash's last valid block height.
+pub fn route_tx(state: &AppState, user: &Pubkey, assembled: &Assembled) -> anyhow::Result<RouteTx> {
+    let tip = state
         .tip
         .current()
-        .map_err(|error| AssemblyFault::Rpc(format!("blockhash: {error}")))?
-        .blockhash;
+        .map_err(|error| AssemblyFault::Rpc(format!("blockhash: {error}")))?;
     let tx = compile_v1(
         user,
         &assembled.instructions,
         Budget::for_route(state, assembled),
-        blockhash,
+        tip.blockhash,
     )?;
     let bytes = wincode::serialize(&tx).context("serializing transaction")?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    Ok(RouteTx {
+        tx_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        last_valid_block_height: tip.last_valid_block_height,
+    })
 }
 
 #[cfg(test)]

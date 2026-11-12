@@ -287,6 +287,7 @@ mod tests {
         Some(ChainTip {
             slot: 42,
             blockhash: Hash::new_from_array([7; 32]),
+            last_valid_block_height: 192,
             fetched_at: tokio::time::Instant::now(),
         })
     }
@@ -333,7 +334,10 @@ mod tests {
             cu_estimate: 10_000,
         };
         for _ in 0..32 {
-            assemble::route_tx(&state, &mint(11), &assembled).expect("built on the cached hash");
+            let tx = assemble::route_tx(&state, &mint(11), &assembled)
+                .expect("built on the cached hash");
+            // R2-FLOWARB-2: the expiry of the blockhash the tx was built on.
+            assert_eq!(tx.last_valid_block_height, 192);
         }
         assert_eq!(connections.load(Ordering::SeqCst), 0);
     }

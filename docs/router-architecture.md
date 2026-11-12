@@ -125,7 +125,9 @@ As built: one-shot only (`user` on `/v1/quote`, or `/v1/instructions`).
 There is no `quote_id`, `/v1/swap`, `/v1/venues`, `oracle_divergence_bps`, or
 per-venue staleness bound yet, and `price_impact_bps` is always 0. The
 response adds `max_in_amount` (the most input the route may debit),
-`cu_estimate`, and with a `user`, `compute_unit_limit` and `tx_base64`.
+`cu_estimate`, and on `/v1/quote` with a `user`, `compute_unit_limit`,
+`tx_base64` and `last_valid_block_height` (the tx blockhash's expiry, from
+the cached tip; `/v1/instructions` returns `compute_unit_limit` only).
 Errors: 400 bad request, 404 no route, 408 timeout, 422 a route that cannot
 be built, 502 RPC failure (including every candidate pool failing to load).
 
