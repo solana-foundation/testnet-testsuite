@@ -2,7 +2,8 @@
 //!
 //! A pool's snapshot is fresh for `ttl` after its load *completed*. Past that
 //! the next caller starts a background refresh and every caller keeps getting
-//! the last good snapshot until it is `max_age` old; only then do callers wait
+//! the last good snapshot until it is `max_age` old, counted from when its
+//! load *started* (the data is that old); only then do callers wait
 //! for the refresh, and each waits at most its own bound, unless the pool's
 //! last load failed: then they get that failure at once. Loads run in their
 //! own task, so a caller that is cancelled (request timeout, client gone)
@@ -47,21 +48,31 @@ pub fn chain_loader(chain: ChainClient) -> Loader<Snapshot> {
 pub struct CacheTimings {
     /// A snapshot younger than this is served without a refresh.
     pub ttl: Duration,
-    /// A snapshot older than this is never served.
+    /// A snapshot whose load started longer ago than this is never served.
     pub max_age: Duration,
     /// Each load is abandoned (and counted as failed) after this long.
     pub load_timeout: Duration,
 }
 
-/// A snapshot and when its load completed.
+/// A snapshot, when its load started (its data is no older) and when it
+/// completed.
 #[derive(Debug, Clone)]
 pub struct Loaded<V> {
     pub value: V,
+    pub started_at: Instant,
     pub loaded_at: Instant,
 }
 
 impl<V> Loaded<V> {
+    /// Age of the data: counted from the load's start, since its first RPC
+    /// read may be that old. `max_age` and the age metric use this.
     pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.started_at)
+    }
+
+    /// Time since the load completed: the TTL counts from here, so a slow
+    /// load is not already due for a refresh when it lands.
+    pub fn since_loaded(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.loaded_at)
     }
 }
@@ -136,7 +147,7 @@ impl<V: Clone + Send + Sync + 'static> SnapshotCache<V> {
         let now = Instant::now();
         let pool = entries.entry(entry.pool).or_default();
         if let Some(good) = &pool.good
-            && good.age(now) < ttl
+            && good.since_loaded(now) < ttl
         {
             metrics::counter!("router_snapshot_cache_total", "result" => "hit").increment(1);
             return Next::Ready(Ok(good.clone()));
@@ -171,17 +182,18 @@ impl<V: Clone + Send + Sync + 'static> SnapshotCache<V> {
     /// await (or drop) without affecting it. Called with the lock held, so
     /// the write-back cannot run before the handle is stored.
     fn spawn_load(&self, entry: Entry) -> InFlight<V> {
+        let started = Instant::now();
         let load = tokio::spawn((self.loader)(entry));
         let entries = Arc::clone(&self.entries);
         let load_timeout = self.timings.load_timeout;
         // The outer task owns the write-back, so it happens even if the load
         // panics or times out, and the pool can be retried after one `ttl`.
         let task = tokio::spawn(async move {
-            let started = Instant::now();
             let mut load = load;
             let result = match tokio::time::timeout(load_timeout, &mut load).await {
                 Ok(Ok(Ok(value))) => Ok(Loaded {
                     value,
+                    started_at: started,
                     loaded_at: Instant::now(),
                 }),
                 Ok(Ok(Err(error))) => Err(error),
@@ -469,6 +481,37 @@ mod tests {
         let result = cache.get(&entry(), Duration::from_millis(250)).await;
         assert!(result.is_err(), "{result:?}");
         assert_eq!(before.elapsed(), Duration::ZERO);
+    }
+
+    /// R2-ROUTER-3: `max_age` counts from the load's start. A 1.5 s load
+    /// lands with data already 1.5 s old; it stops being served 3 s after
+    /// the load started, not 3 s after it completed.
+    #[tokio::test(start_paused = true)]
+    async fn max_age_counts_from_load_start() {
+        let load = Duration::from_millis(1_500);
+        let (_fake, cache) = Fake::cache(
+            move |call| {
+                if call == 0 {
+                    load
+                } else {
+                    Duration::from_secs(60)
+                }
+            },
+            never,
+        );
+        let started = Instant::now();
+        let loaded = cache
+            .get(&entry(), Duration::from_secs(2))
+            .await
+            .expect("loaded");
+        assert_eq!(loaded.age(Instant::now()), load);
+        // Refresh 1 starts one TTL after completion and hangs.
+        tokio::time::sleep(MAX_AGE - load - Duration::from_millis(1)).await;
+        assert!(cache.get(&entry(), Duration::ZERO).await.is_ok(), "stale");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(started.elapsed() > MAX_AGE);
+        let result = cache.get(&entry(), Duration::ZERO).await;
+        assert!(result.is_err(), "served past max age: {result:?}");
     }
 
     /// A failed refresh keeps the last good snapshot until it ages out.

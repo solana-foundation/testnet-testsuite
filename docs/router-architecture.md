@@ -45,7 +45,8 @@ What changed relative to the design below:
   is parked until then. Meanwhile snapshots are cached and shared: a pool's
   snapshot is fresh for `snapshot_ttl_ms` (default 400 ms) after its load
   completes; past that, quotes keep using it while one background refresh
-  runs (stale-while-revalidate), up to `snapshot_max_age_ms` (3 s), beyond
+  runs (stale-while-revalidate), up to `snapshot_max_age_ms` (3 s, counted
+  from the start of the load, since the data is that old), beyond
   which the pool is left out of the quote. Loads run detached from the
   request that triggered them, are bounded by `snapshot_load_timeout_ms`
   (2 s, also the quote-path RPC client's HTTP timeout), and a failure is

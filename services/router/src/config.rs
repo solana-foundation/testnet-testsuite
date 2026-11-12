@@ -46,8 +46,10 @@ pub struct RouterConfig {
     /// averaged 5 s per quote in load tests.
     #[serde(default = "default_snapshot_ttl_ms")]
     pub snapshot_ttl_ms: u64,
-    /// Hard bound on snapshot age when a quote is planned: an older pool is
-    /// left out of that quote. Keep it above `snapshot_ttl_ms +
+    /// Hard bound on snapshot age when a quote is planned, counted from the
+    /// start of the snapshot's load (its data is that old): an older pool is
+    /// left out of that quote. `router_snapshot_age_seconds` uses the same
+    /// age. Keep it above `snapshot_ttl_ms +
     /// snapshot_load_timeout_ms` so a slow refresh does not drop pools.
     #[serde(default = "default_snapshot_max_age_ms")]
     pub snapshot_max_age_ms: u64,
