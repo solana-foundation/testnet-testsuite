@@ -81,7 +81,8 @@ enum Command {
         /// cannot be read.
         #[arg(long, default_value_t = 0)]
         settle_s: u64,
-        /// Fail if `--settle-blocks` blocks have not passed after this long.
+        /// Stop waiting for `--settle-blocks` after this long; the snapshot
+        /// is still taken, marked `timedOut` (and `report` warns).
         #[arg(long, default_value_t = settle::DEFAULT_TIMEOUT.as_secs())]
         settle_timeout_s: u64,
     },
@@ -166,13 +167,16 @@ async fn main() -> Result<()> {
                 settle::POLL,
             )
             .await?;
-            let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
+            let mut snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
+            // Kept even after a timeout: the window it closes has run, and
+            // `report` warns about a snapshot that did not settle as asked.
+            snapshot.settle = Some(settled.into());
             // Compact: at tens of thousands of participants a pretty
             // snapshot is several MB of whitespace.
             std::fs::write(&out, serde_json::to_vec(&snapshot)?)?;
             json!({
                 "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len(),
-                "settle": { "blocks": settled.blocks, "waitedMs": settled.waited.as_millis() as u64 },
+                "settle": snapshot.settle,
             })
         }
         Command::Report {

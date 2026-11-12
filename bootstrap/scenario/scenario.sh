@@ -364,8 +364,9 @@ case "$cmd" in
     # Let in-flight transactions land before reading. A local validator
     # settles in a slot or two; a remote RPC node keeps rebroadcasting until
     # the blockhash expires, 150 blocks on: wait for those blocks (however
-    # long a slow cluster takes, up to SCENARIO_SETTLE_TIMEOUT_S), with
-    # SCENARIO_SETTLE_S of wall-clock time as the fallback.
+    # long a slow cluster takes, up to SCENARIO_SETTLE_TIMEOUT_S, after which
+    # the snapshot is taken and marked timedOut), with SCENARIO_SETTLE_S of
+    # wall-clock time as the fallback when the height is never readable.
     remote=$([[ "$target" == local ]] && echo false || echo true)
     settle_s="${SCENARIO_SETTLE_S:-$($remote && echo 90 || echo 3)}"
     settle_blocks="${SCENARIO_SETTLE_BLOCKS:-$($remote && echo 150 || echo 0)}"

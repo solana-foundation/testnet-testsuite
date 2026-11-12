@@ -216,9 +216,12 @@ holdings both come after the wait) it lets in-flight transactions land:
 3 s (`SCENARIO_SETTLE_S`) locally; on a remote cluster, where the RPC node
 rebroadcasts until the blockhash expires, until the block height has
 advanced `SCENARIO_SETTLE_BLOCKS` (150, a blockhash's lifetime) however
-long that takes, failing after `SCENARIO_SETTLE_TIMEOUT_S` (300) and
-falling back to `SCENARIO_SETTLE_S` (90) of wall-clock time when the block
-height cannot be read. They stay frozen through the report, whose block scan would otherwise compete
+long that takes (a failed height read is retried). After
+`SCENARIO_SETTLE_TIMEOUT_S` (300) the snapshot is taken anyway; if the
+height is never readable, `SCENARIO_SETTLE_S` (90) of wall-clock time is
+the fallback. Each snapshot records how it settled (`settle.mode`:
+`blocks`, `wallClock`, `fallback` or `timedOut`), and the report warns
+about a `fallback` or `timedOut` side. They stay frozen through the report, whose block scan would otherwise compete
 with flow for connections. `sample.py` records per-service CPU/RSS (from
 `.scenario/pids`), machine CPU, validator TPS (`getTransactionCount`), slot
 rate, and RPC latency; against a shared cluster that TPS is network-wide
