@@ -35,10 +35,10 @@ pub type Snapshot = Arc<PoolSnapshot>;
 pub struct AppState {
     pub registry: Arc<Registry>,
     pub snapshots: SnapshotCache,
-    /// Slot and blockhash, refreshed in the background (never fetched per quote).
+    /// Slot and blockhash, refreshed in the background (never fetched per
+    /// quote). The state holds no RPC client: the quote path reaches the
+    /// chain only through the snapshot loader and this cell.
     pub tip: TipCell,
-    /// Quote-path client (short request timeout): snapshot loads.
-    pub chain: ChainClient,
     pub cfg: config::RouterConfig,
     pub bridge_mints: Vec<Pubkey>,
     pub jupiter_program: Option<Pubkey>,
@@ -103,10 +103,9 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
         registry,
         snapshots: SnapshotCache::new(
             CacheTimings::from_config(&cfg.router),
-            snapshots::chain_loader(quote_chain.clone()),
+            snapshots::chain_loader(quote_chain),
         ),
         tip,
-        chain: quote_chain,
         jupiter_overhead_cu: cfg.router.jupiter.overhead_cu,
         cfg: cfg.router.clone(),
         bridge_mints,
@@ -204,33 +203,13 @@ mod tests {
     use crate::registry::{Entry, Tier};
     use crate::tip::ChainTip;
 
-    /// An "RPC node" that counts connections and never answers.
-    async fn counting_rpc() -> (String, Arc<AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let url = format!("http://{}", listener.local_addr().expect("addr"));
-        let connections = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&connections);
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((socket, _)) = listener.accept().await {
-                counter.fetch_add(1, Ordering::SeqCst);
-                held.push(socket);
-            }
-        });
-        (url, connections)
-    }
-
     fn mint(byte: u8) -> Pubkey {
         Pubkey::new_from_array([byte; 32])
     }
 
-    /// State over `rpc_url` with one curated pool (mints 3/4) whose loader
-    /// always fails, counting loads.
-    async fn state(
-        rpc_url: &str,
-    ) -> (
+    /// State with one curated pool (mints 3/4) whose loader always fails,
+    /// counting loads.
+    async fn state() -> (
         AppState,
         tokio::sync::watch::Sender<Option<ChainTip>>,
         Arc<AtomicUsize>,
@@ -238,8 +217,6 @@ mod tests {
         let cfg: config::RouterConfig =
             serde_json::from_value(serde_json::json!({ "listen_addr": "127.0.0.1:0" }))
                 .expect("router config");
-        let chain = ChainClient::with_timeout(rpc_url, "confirmed", Duration::from_secs(1))
-            .expect("client");
         let registry = Registry::new();
         registry
             .insert(Entry {
@@ -261,7 +238,6 @@ mod tests {
             registry,
             snapshots: SnapshotCache::new(CacheTimings::from_config(&cfg), loader),
             tip,
-            chain,
             cfg,
             bridge_mints: Vec::new(),
             jupiter_program: None,
@@ -296,21 +272,20 @@ mod tests {
     /// the tip (empty here, which would be a 502) or any load is consulted.
     #[tokio::test]
     async fn registry_lookup_comes_before_any_io() {
-        let (url, connections) = counting_rpc().await;
-        let (state, _tip, loads) = state(&url).await;
+        let (state, _tip, loads) = state().await;
         let result = load_book(&state, &request(5, 6)).await;
         assert!(matches!(result, Err(EngineError::NoRoute)));
         assert_eq!(loads.load(Ordering::SeqCst), 0);
-        assert_eq!(connections.load(Ordering::SeqCst), 0);
     }
 
-    /// ROU-1: concurrent quotes and transaction builds make no RPC calls:
-    /// the slot and blockhash come from the cached tip, snapshot loads from
-    /// the cache (one load shared by all, failure reused).
-    #[tokio::test]
-    async fn quote_path_makes_no_rpc_calls() {
-        let (url, connections) = counting_rpc().await;
-        let (state, tip, loads) = state(&url).await;
+    /// ROU-1: concurrent quotes share one snapshot load (its failure is
+    /// reused) and transactions are built on the cached tip. `AppState`
+    /// holds no RPC client, so the loader and the tip cell are the only way
+    /// to the chain; the paused clock keeps every quote inside one failure
+    /// backoff, so exactly one load is expected.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_quotes_share_one_load() {
+        let (state, tip, loads) = state().await;
         tip.send_replace(fresh_tip());
         let state = Arc::new(state);
         let quotes = (0..32).map(|_| {
@@ -339,15 +314,13 @@ mod tests {
             // R2-FLOWARB-2: the expiry of the blockhash the tx was built on.
             assert_eq!(tx.last_valid_block_height, 192);
         }
-        assert_eq!(connections.load(Ordering::SeqCst), 0);
     }
 
     /// ROU-1: a tip older than `chain_tip_max_age_ms` is a 502 (RPC fault),
     /// not a transaction on an expiring blockhash.
     #[tokio::test(start_paused = true)]
     async fn stale_tip_is_an_upstream_error() {
-        let (url, _connections) = counting_rpc().await;
-        let (state, tip, _loads) = state(&url).await;
+        let (state, tip, _loads) = state().await;
         tip.send_replace(fresh_tip());
         tokio::time::sleep(Duration::from_millis(state.cfg.chain_tip_max_age_ms + 1)).await;
         let assembled = assemble::Assembled {

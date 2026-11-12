@@ -341,51 +341,41 @@ mod tests {
         false
     }
 
-    /// ROU-2: the first load hangs far past any request timeout. Callers
-    /// keep arriving and giving up after 100 ms (as a request timeout would
-    /// cancel them). The load is abandoned at `load_timeout`, the failure is
-    /// cached for one TTL, and the next load (fast) serves everyone: the
-    /// cache recovers instead of restarting a doomed load per caller.
+    /// ROU-2: every load takes 150 ms and every caller gives up after
+    /// 100 ms (as a request timeout would cancel it), several at a time.
+    /// Detached loads still complete and serve later callers; a load tied
+    /// to the caller that started it would be cancelled every time and no
+    /// caller would ever succeed.
     #[tokio::test(start_paused = true)]
     async fn cancelled_callers_do_not_livelock_a_slow_load() {
-        let (fake, cache) = Fake::cache(
-            |call| {
-                if call == 0 {
-                    Duration::from_secs(60)
-                } else {
-                    Duration::from_millis(50)
-                }
-            },
-            never,
-        );
+        let (fake, cache) = Fake::cache(|_| Duration::from_millis(150), never);
         let cache = Arc::new(cache);
         let started = Instant::now();
-        let mut recovered = None;
-        while started.elapsed() < Duration::from_secs(10) {
-            let cache = Arc::clone(&cache);
-            // A request that is cancelled after 100 ms, like the 408 layer.
-            let request = tokio::spawn(async move {
-                tokio::time::timeout(
-                    Duration::from_millis(100),
-                    cache.get(&entry(), Duration::from_secs(60)),
-                )
-                .await
-            });
-            if let Ok(Ok(Ok(loaded))) = request.await {
-                recovered.get_or_insert((started.elapsed(), loaded.value));
+        let mut requests = Vec::new();
+        while started.elapsed() < Duration::from_secs(2) {
+            for _ in 0..4 {
+                let cache = Arc::clone(&cache);
+                // A request that is cancelled after 100 ms, like the 408 layer.
+                requests.push(tokio::spawn(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_millis(100),
+                        cache.get(&entry(), Duration::from_secs(60)),
+                    )
+                    .await;
+                    matches!(result, Ok(Ok(_))).then(|| started.elapsed())
+                }));
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let (at, value) = recovered.expect("the cache recovered");
-        // Load 0 times out at 2 s; its failure is cached for one TTL; load 1
-        // takes 50 ms.
-        assert!(
-            at <= LOAD_TIMEOUT + TTL + Duration::from_millis(200),
-            "{at:?}"
-        );
-        assert_eq!(value, 1);
-        // One load per TTL at most once recovered, not one per caller.
-        assert!(fake.calls() <= 2 + (10_000 / 400) + 1, "{}", fake.calls());
+        let mut served = Vec::new();
+        for request in requests {
+            served.extend(request.await.expect("task"));
+        }
+        let first = served.iter().min().expect("some caller was served");
+        assert!(*first <= Duration::from_millis(200), "{first:?}");
+        assert!(served.len() > 300, "{} served", served.len());
+        // One load per TTL at most, not one per caller.
+        assert!(fake.calls() <= 2_000 / 400 + 1, "{}", fake.calls());
     }
 
     /// ROU-2: a caller dropped mid-load does not cancel the load.
