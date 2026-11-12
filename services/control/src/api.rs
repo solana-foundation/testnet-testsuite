@@ -10,13 +10,13 @@ use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use control_client::{JobRequest, Live};
+use control_client::{ComposeRequest, EstimateRequest, JobRequest, Live};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::jobs::{self, Rejected};
-use crate::{App, processes};
+use crate::{App, compose as composer, processes};
 
 pub fn router(app: Arc<App>) -> Router {
     let ui = &app.cfg.ui_dir;
@@ -31,6 +31,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/chain/{*path}", get(chain_proxy))
         .route("/api/prom/{endpoint}", get(prom_proxy))
         .route("/api/live", get(live))
+        .route("/api/compose", get(compose_info).post(compose))
+        .route("/api/compose/estimate", post(estimate))
         .with_state(app.clone());
     if index.is_file() {
         api.fallback_service(ServeDir::new(ui).fallback(ServeFile::new(index)))
@@ -50,6 +52,21 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
 
 async fn status(State(app): State<Arc<App>>) -> Json<control_client::Status> {
     Json(app.status().await)
+}
+
+async fn compose_info(State(app): State<Arc<App>>) -> Json<control_client::ComposeInfo> {
+    Json(composer::info(&app.cfg.config_dir, &app.cfg.target))
+}
+
+async fn estimate(Json(request): Json<EstimateRequest>) -> Json<control_client::EstimateResponse> {
+    Json(composer::estimate_for(request))
+}
+
+async fn compose(State(app): State<Arc<App>>, Json(request): Json<ComposeRequest>) -> Response {
+    match composer::compose(&app.http, &app.cfg.config_dir, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(message) => error(StatusCode::BAD_REQUEST, message),
+    }
 }
 
 async fn list_jobs(State(app): State<Arc<App>>) -> Response {

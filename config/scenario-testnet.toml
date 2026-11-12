@@ -70,7 +70,7 @@ metrics_addr = "127.0.0.1:9183"
 seed_env = "SCENARIO_SEED"
 oracle_url = "http://127.0.0.1:8180"
 router_url = "http://127.0.0.1:8181"
-max_price_age_ms = 60000
+max_price_age_ms = 15000
 
 [scenario.programs]
 raydium_clmm = "KEYPAIR_RAYDIUM_CLMM"

@@ -9,6 +9,7 @@
 //!
 //! `snapshot` and `report` account for every participant (see `pnl`).
 
+mod compose;
 mod janitor;
 mod pnl;
 mod rpc;
@@ -167,6 +168,12 @@ enum Command {
     /// What `janitor` would close (vaults by holder and mint, accounts per
     /// program), read without changing anything: run before the upgrade.
     JanitorPlan,
+    /// Write scale overlays (`config/scale-<name>.toml`) from a preset or a
+    /// spec; every preset when given neither. Offline (prices from Binance
+    /// or SCALE_PRICES).
+    Overlay(compose::OverlayArgs),
+    /// Estimate the load a preset, spec or overlay offers. Offline.
+    Estimate(compose::EstimateArgs),
 }
 
 /// Operator keypairs the bootstrap funds (each is skipped when unset).
@@ -210,6 +217,11 @@ async fn main() -> Result<()> {
         .init();
     // Parse first: `--help` and argument errors need neither RPC nor secrets.
     let cli = Cli::parse();
+    let command = match cli.command {
+        Command::Overlay(args) => return compose::overlay(args).await,
+        Command::Estimate(args) => return compose::estimate_cmd(args),
+        command => command,
+    };
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     let chain = ChainClient::with_options(
         &cfg.rpc.http_url,
@@ -228,7 +240,7 @@ async fn main() -> Result<()> {
         record,
         require_verified,
         require_artifact,
-    } = &cli.command
+    } = &command
     {
         let options = janitor::CheckOptions {
             allow_absent: *allow_absent,
@@ -243,7 +255,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
-    let report = match cli.command {
+    let report = match command {
         Command::Bootstrap {
             faucet_keypair_env,
             mint_authority_keypair_env,
@@ -355,6 +367,9 @@ async fn main() -> Result<()> {
                     .map(|(env, key)| (env, key.pubkey())),
             );
             teardown::leftovers(&chain, &rpc, &scenario, &keys).await?
+        }
+        Command::Overlay(_) | Command::Estimate(_) => {
+            unreachable!("handled before the config loads")
         }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
