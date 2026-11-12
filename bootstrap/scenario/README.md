@@ -57,6 +57,22 @@ Binance ──▶ oracle ──▶ mm (12 makers) ──▶ Manifest / Orca / Ra
   confirmation is still accounted (`arb_unaccounted_total` counts the ones
   whose balance read failed).
 
+**Hedging** (`[scenario.hedge]`, on in every profile): real market makers
+lay off their on-chain fills on a CEX, which keeps their inventory near a
+target mix. Without it the uninformed flow (and the minted taker refills)
+leaves every maker one-sided within an hour or two, and depth disappears
+(2-hour run, 2026-10-15: CLOB makers and oracle arbitrageurs at ~$0 USDC,
+two LPs with ~$0.1–0.5k left in their pools). Each tick a maker whose base
+share of inventory value is more than `threshold_bps` (default 2000: 20
+points) from its target (the ladder's `target_base_ratio`, else 50%) sells
+the excess at the oracle price less `cost_bps` (default 10): the sold
+test tokens are burned from its wallet and the bought ones minted into it
+(mm needs `KEYPAIR_TOKEN_MINT_AUTHORITY`). Oracle arbitrageurs hedge from
+their wallet, LPs between positions (so a one-sided close reopens at full
+size), CLOB makers withdraw their seat's free balance, hedge it and deposit
+it back. At the oracle price a hedge costs only its fee, so PnL stays
+honest; volume and cost are in `mm_hedge_*`.
+
 Uninformed flow: Poisson arrivals at `rate_per_min`, lognormal notionals
 around `median_usd`, a `large_probability` share of blocks at
 `large_multiplier`×, random pairs (JUP/RAY has no direct Manifest market, so
@@ -572,8 +588,9 @@ open, so the asset scale (39 pools) locks proportionally more.
 | `mm_venue_price`, `mm_deviation_bps`                                                           | maker, venue                | venue price and its gap to the oracle                                                                                         |
 | `mm_inventory`, `mm_inventory_value_usd`                                                       | maker, token                | holdings (wallet + seat) and USD value                                                                                        |
 | `mm_actions_total`                                                                             | maker, action               | requote(\_trimmed/\_empty) pull open close arb\_\*                                                                            |
-| `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                               | maker, stage / venue        | failures (ticks retry)                                                                                                        |
+| `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                               | maker, stage / venue        | failures by stage: setup, tick, hedge, deposit (seat re-deposit); ticks retry                                                 |
 | `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                              | maker                       | skew, arbitrage volume (µUSD), tick latency                                                                                   |
+| `mm_hedge_micro_usd_total`, `mm_hedge_cost_micro_usd_total`                                    | maker, side                 | inventory hedged at the oracle (µUSD) and its cost                                                                            |
 | `flow_swaps_total`                                                                             | pair, status, outcome, size | routed swaps landed/failed, why, normal/large                                                                                 |
 | `flow_venue_swaps_total`                                                                       | venue, status, outcome      | quoted swaps' send outcomes, once per venue the route touches                                                                 |
 | `flow_rpc_backoffs_total`, `flow_refill_errors_total`                                          | —                           | taker pauses after `rpc_rejected`; failed refill reads or top-ups                                                             |
@@ -585,6 +602,7 @@ open, so the asset scale (39 pools) locks proportionally more.
 | `router_snapshot_age_seconds`, `router_snapshot_load_seconds`                                  | — / result                  | pool data age when planned (from load start); loads                                                                           |
 | `router_snapshot_skipped_total`, `router_chain_tip_refresh_failures_total`                     | reason / —                  | pools left out of a quote; failed tip refreshes                                                                               |
 | `oracle_price_updates_total`, `{orca_whirlpool,raydium_clmm,manifest}_actions_total`           | —                           | feed health and per-venue transactions                                                                                        |
+| `manifest_orders_trimmed_total`, `manifest_stale_cancel_retries_total`                         | side / action               | orders shrunk or dropped to fit the seat; batches rebuilt after a stale cancel                                                |
 | `arb_trades_total`                                                                             | bot, status, legs           | landed / reverted / expired / ambiguous / send_failed / rpc_rejected / below_floor / simulation_failed / quote_failed / error |
 | `arb_opportunities_total`, `arb_last_profit_usd`                                               | bot, legs, trigger          | cycles found, last realized PnL                                                                                               |
 | `arb_profit_micro_usd_total`, `arb_loss_micro_usd_total`, `arb_fees_lamports_total`            | bot                         | realized gains and losses (all touched tokens), fees                                                                          |

@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use manifest_dex_client::{ManifestClient, OrderSpec, Side, TokenAmount};
+use metrics::counter;
 use mtm_scenario::Strategy;
+use mtm_scenario::pricing::PriceBook;
 use mtm_scenario::venue::to_ui;
 use rust_decimal::{Decimal, RoundingStrategy};
 use solana_commitment_config::CommitmentConfig;
@@ -25,6 +27,16 @@ pub struct Clob {
     last: Option<(Decimal, Vec<(u64, u64)>)>,
     /// When to pull the ladder for an untrustworthy oracle.
     guard: OracleGuard,
+    /// When to try a seat hedge again after it failed.
+    hedge_backoff: crate::hedge::Backoff,
+}
+
+/// What a tick's seat hedge did.
+enum SeatHedge {
+    /// Not needed, or backing off.
+    None,
+    Hedged,
+    Failed(crate::hedge::Failed),
 }
 
 impl Clob {
@@ -40,27 +52,74 @@ impl Clob {
             CommitmentConfig::confirmed(),
         )?;
         client.claim_seat(ctx.pool).await.context("claiming seat")?;
-        for token in [&ctx.base, &ctx.quote] {
-            let atoms = ctx.wallet_balance(token).await?;
-            if atoms > 0 {
-                client
-                    .deposit(
-                        ctx.pool,
-                        TokenAmount {
-                            mint: token.mint,
-                            amount: to_ui(token, atoms),
-                        },
-                    )
-                    .await
-                    .with_context(|| format!("depositing {}", token.name))?;
-                info!(maker = %ctx.maker.name, token = %token.name, amount = %to_ui(token, atoms), "deposited into seat");
-            }
-        }
+        deposit_wallet(ctx, &client, None).await?;
         Ok(Self {
             client,
             last: None,
             guard: OracleGuard::default(),
+            hedge_backoff: crate::hedge::Backoff::default(),
         })
+    }
+
+    /// Hedge the seat when its inventory strays from the target: withdraw
+    /// what is not locked in orders, hedge it in the wallet, deposit back.
+    /// A failing hedge backs off ([`crate::hedge::Backoff`]) instead of
+    /// repeating the withdraw and re-deposit every tick.
+    async fn hedge(
+        &mut self,
+        ctx: &Ctx,
+        prices: &PriceBook,
+        seat: &manifest_dex_client::Seat,
+        base_atoms: u64,
+        quote_atoms: u64,
+    ) -> SeatHedge {
+        let held = crate::hedge::Inventory {
+            base_total: to_ui(&ctx.base, base_atoms),
+            quote_total: to_ui(&ctx.quote, quote_atoms),
+            base_free: to_ui(&ctx.base, seat.base_withdrawable),
+            quote_free: to_ui(&ctx.quote, seat.quote_withdrawable),
+        };
+        let plan = match crate::hedge::check(ctx, prices, held) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return SeatHedge::None,
+            Err(error) => {
+                return SeatHedge::Failed(crate::hedge::Failed {
+                    withdrew: false,
+                    error,
+                });
+            }
+        };
+        if !self.hedge_backoff.ready() {
+            return SeatHedge::None;
+        }
+        let client = &self.client;
+        let hedged = crate::hedge::through_wallet(
+            async {
+                let withdrawn = client
+                    .withdraw_all(ctx.pool)
+                    .await
+                    .context("withdrawing the seat to hedge")?;
+                Ok(withdrawn.transaction.map(|tx| tx.confirmation_slot))
+            },
+            crate::hedge::execute(ctx, &plan),
+            |slot| async move {
+                deposit_wallet(ctx, client, slot)
+                    .await
+                    .context("re-depositing after a hedge")?;
+                Ok(())
+            },
+        )
+        .await;
+        match hedged {
+            Ok(()) => {
+                self.hedge_backoff.succeeded();
+                SeatHedge::Hedged
+            }
+            Err(failed) => {
+                self.hedge_backoff.failed();
+                SeatHedge::Failed(failed)
+            }
+        }
     }
 
     pub async fn tick(&mut self, ctx: &Ctx) -> Result<()> {
@@ -76,6 +135,17 @@ impl Clob {
         else {
             unreachable!("clob maker with a non-clob strategy");
         };
+        // Anything in the wallet belongs in the seat: a hedge (or a crash)
+        // between its withdraw and deposit must not strand it unquoted.
+        match deposit_wallet(ctx, &self.client, None).await {
+            Ok(true) => self.last = None,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(maker = %ctx.maker.name, error = %format!("{error:#}"), "re-depositing the wallet failed");
+                counter!("mm_errors_total", "maker" => ctx.name(), "stage" => "deposit")
+                    .increment(1);
+            }
+        }
         let params = LadderParams {
             levels: u32::from(levels),
             spread_bps,
@@ -124,6 +194,27 @@ impl Clob {
         // Seat inventory = withdrawable + what our resting orders lock.
         let (base_atoms, quote_atoms) = snapshot.book.holdings(&seat)?;
         ctx.record_inventory(&prices, base_atoms, quote_atoms);
+        match self
+            .hedge(ctx, &prices, &seat, base_atoms, quote_atoms)
+            .await
+        {
+            SeatHedge::None => {}
+            SeatHedge::Hedged => {
+                // The seat changed: re-quote from a fresh read next tick.
+                self.last = None;
+                return Ok(());
+            }
+            SeatHedge::Failed(failed) => {
+                crate::hedge::contain(ctx, Err(failed.error));
+                if failed.withdrew {
+                    // The seat's balances moved (an ambiguous hedge may
+                    // even have landed): re-quote now, sized from the
+                    // batch's own fresh snapshot. A failed withdraw moved
+                    // nothing, so the ladder stands.
+                    self.last = None;
+                }
+            }
+        }
         let best_bid = snapshot.book.bids.first().map(|o| o.price_raw);
         let best_ask = snapshot.book.asks.first().map(|o| o.price_raw);
         let book_mid = match (best_bid, best_ask) {
@@ -250,6 +341,43 @@ fn next_last(
                 .collect(),
         )
     })
+}
+
+/// Deposit the maker's whole wallet balance of both tokens into its seat
+/// (one batched balance read, at a context slot of at least
+/// `min_context_slot`: after a hedge, its confirmation slot); whether
+/// anything moved.
+async fn deposit_wallet(
+    ctx: &Ctx,
+    client: &ManifestClient,
+    min_context_slot: Option<u64>,
+) -> Result<bool> {
+    let balances = mtm_scenario::funding::wallet_balances(
+        &ctx.chain,
+        &ctx.wallet_pubkey(),
+        &[&ctx.base, &ctx.quote],
+        min_context_slot,
+    )
+    .await?;
+    let mut moved = false;
+    for (token, &atoms) in [&ctx.base, &ctx.quote].into_iter().zip(&balances.tokens) {
+        if atoms == 0 {
+            continue;
+        }
+        client
+            .deposit(
+                ctx.pool,
+                TokenAmount {
+                    mint: token.mint,
+                    amount: to_ui(token, atoms),
+                },
+            )
+            .await
+            .with_context(|| format!("depositing {}", token.name))?;
+        info!(maker = %ctx.maker.name, token = %token.name, amount = %to_ui(token, atoms), "deposited into seat");
+        moved = true;
+    }
+    Ok(moved)
 }
 
 /// Share of each side's inventory the ladder quotes: the rest absorbs a

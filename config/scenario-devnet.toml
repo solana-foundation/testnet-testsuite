@@ -261,6 +261,13 @@ strategy = { kind = "pool-arb", threshold_bps = 10, max_trade_usd = "3000" }
 
 # --- uninformed flow: random takers routing through the router ----------------
 
+# Makers lay off inventory at the oracle (a CEX hedge; test tokens are
+# burned and minted), so uninformed flow cannot leave them one-sided.
+[scenario.hedge]
+threshold_bps = 2000
+cost_bps = 10
+min_usd = "50"
+
 [scenario.flow]
 takers = 4
 rate_per_min = 4.0

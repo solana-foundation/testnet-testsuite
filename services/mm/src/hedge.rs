@@ -1,0 +1,461 @@
+//! Off-chain hedging at the oracle price.
+//!
+//! Real market makers lay off their on-chain fills on a CEX, which keeps
+//! their inventory near a target mix; the scenario's uninformed flow
+//! otherwise leaves every maker one-sided within an hour or two (all base,
+//! no quote), and the venues lose depth. A maker whose base share of
+//! inventory value strays past `threshold_bps` from its target sells the
+//! excess "on the exchange": the tokens are test tokens, so the sold side
+//! is burned from the maker's wallet and the bought side minted into it,
+//! at the oracle price less `cost_bps`. At the oracle price a hedge only
+//! costs its fee, so it does not distort PnL (unlike taker refills).
+
+use anyhow::{Context, Result};
+use metrics::counter;
+use mtm_chain::SubmissionConfig;
+use mtm_dex_harness::spl;
+use mtm_scenario::HedgeConfig;
+use mtm_scenario::pricing::PriceBook;
+use mtm_scenario::venue::{to_atoms, to_ui};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use solana_signer::Signer;
+use tracing::{info, warn};
+
+use crate::maker::Ctx;
+
+/// A planned hedge, in UI units.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    /// Sell base for quote (else quote for base).
+    pub sell_base: bool,
+    pub sell: Decimal,
+    pub buy: Decimal,
+    pub notional_usd: Decimal,
+    pub cost_usd: Decimal,
+}
+
+/// What the maker holds, in UI units: `total` sizes the decision, `free`
+/// (wallet, or seat withdrawable) caps what can be sold now.
+#[derive(Debug, Clone, Copy)]
+pub struct Inventory {
+    pub base_total: Decimal,
+    pub quote_total: Decimal,
+    pub base_free: Decimal,
+    pub quote_free: Decimal,
+}
+
+/// The hedge that brings the base value share back to `target`, or `None`
+/// inside the threshold or below the minimum size.
+pub fn plan(
+    held: Inventory,
+    base_usd: Decimal,
+    quote_usd: Decimal,
+    target: Decimal,
+    config: &HedgeConfig,
+) -> Option<Plan> {
+    let base_value = held.base_total * base_usd;
+    let total = base_value + held.quote_total * quote_usd;
+    if total <= Decimal::ZERO || base_usd <= Decimal::ZERO || quote_usd <= Decimal::ZERO {
+        return None;
+    }
+    let share = base_value / total;
+    if (share - target).abs() * Decimal::from(10_000) < Decimal::from(config.threshold_bps) {
+        return None;
+    }
+    let excess_usd = (base_value - target * total).abs();
+    let sell_base = share > target;
+    let (price_sell, price_buy, free) = if sell_base {
+        (base_usd, quote_usd, held.base_free)
+    } else {
+        (quote_usd, base_usd, held.quote_free)
+    };
+    let sell = (excess_usd / price_sell).min(free);
+    let notional_usd = sell * price_sell;
+    if notional_usd < config.min_usd || notional_usd <= Decimal::ZERO {
+        return None;
+    }
+    let cost_usd = notional_usd * Decimal::from(config.cost_bps) / Decimal::from(10_000);
+    Some(Plan {
+        sell_base,
+        sell,
+        buy: (notional_usd - cost_usd) / price_buy,
+        notional_usd,
+        cost_usd,
+    })
+}
+
+/// The maker's target base share: the CLOB ladder's own target, else half.
+pub fn target(ctx: &Ctx) -> Decimal {
+    match &ctx.maker.strategy {
+        mtm_scenario::Strategy::ClobLadder {
+            target_base_ratio, ..
+        } => *target_base_ratio,
+        _ => Decimal::new(5, 1),
+    }
+}
+
+/// Plan for `held`, if hedging is on for this maker.
+pub fn check(ctx: &Ctx, prices: &PriceBook, held: Inventory) -> Result<Option<Plan>> {
+    let Some((config, _)) = &ctx.hedger else {
+        return Ok(None);
+    };
+    Ok(plan(
+        held,
+        prices.usd(&ctx.base)?,
+        prices.usd(&ctx.quote)?,
+        target(ctx),
+        config,
+    ))
+}
+
+/// Burn the sold side from the maker's wallet and mint the bought side into
+/// it, in one transaction (the maker pays, the mint authority co-signs).
+/// Returns the slot it confirmed in (`None` when too small to send).
+pub async fn execute(ctx: &Ctx, plan: &Plan) -> Result<Option<u64>> {
+    let (_, authority) = ctx.hedger.as_ref().context("hedging is off")?;
+    let (sold, bought) = if plan.sell_base {
+        (&ctx.base, &ctx.quote)
+    } else {
+        (&ctx.quote, &ctx.base)
+    };
+    let owner = ctx.wallet_pubkey();
+    let sell_atoms = to_atoms(sold, plan.sell).context("hedge size overflow")?;
+    let buy_atoms = to_atoms(bought, plan.buy).context("hedge size overflow")?;
+    if sell_atoms == 0 || buy_atoms == 0 {
+        return Ok(None);
+    }
+    let instructions = vec![
+        spl::create_associated_token_account_idempotent(
+            &owner,
+            &owner,
+            &bought.mint,
+            &bought.token_program,
+        ),
+        spl::burn_checked(
+            &sold.token_program,
+            &spl::associated_token_address(&owner, &sold.mint, &sold.token_program),
+            &sold.mint,
+            &owner,
+            sell_atoms,
+            sold.decimals,
+        ),
+        spl::mint_to_checked(
+            &bought.token_program,
+            &bought.mint,
+            &spl::associated_token_address(&owner, &bought.mint, &bought.token_program),
+            &authority.pubkey(),
+            buy_atoms,
+            bought.decimals,
+        ),
+    ];
+    let config = SubmissionConfig {
+        compute_unit_limit: 60_000,
+        ..SubmissionConfig::default()
+    };
+    let submitted = ctx
+        .chain
+        .submit(
+            instructions,
+            ctx.wallet.as_ref(),
+            &[authority.as_ref()],
+            config,
+        )
+        .await
+        .context("hedging")?;
+    let micro = |usd: Decimal| {
+        (usd * Decimal::from(1_000_000))
+            .round()
+            .to_u64()
+            .unwrap_or_default()
+    };
+    let side = if plan.sell_base {
+        "sell_base"
+    } else {
+        "sell_quote"
+    };
+    counter!("mm_hedge_micro_usd_total", "maker" => ctx.name(), "side" => side)
+        .increment(micro(plan.notional_usd));
+    counter!("mm_hedge_cost_micro_usd_total", "maker" => ctx.name())
+        .increment(micro(plan.cost_usd));
+    ctx.action("hedge");
+    info!(
+        maker = %ctx.maker.name, sold = %sold.name, amount = %plan.sell, bought = %bought.name,
+        received = %plan.buy, notional_usd = %plan.notional_usd.round_dp(2), "hedged inventory at the oracle"
+    );
+    Ok(Some(submitted.confirmation_slot))
+}
+
+/// Longest back-off after failed hedges, in ticks.
+const MAX_BACKOFF_TICKS: u32 = 64;
+
+/// Bounded exponential back-off for a hedge that keeps failing (wrong mint
+/// authority, a burn larger than the wallet): each try of a seat hedge
+/// costs a withdraw and a re-deposit, so retrying every tick churns three
+/// or four transactions a tick for nothing. After the n-th consecutive
+/// failure the next `2^n` ticks skip the hedge (capped at
+/// [`MAX_BACKOFF_TICKS`]); a success resets it.
+#[derive(Debug, Default)]
+pub struct Backoff {
+    failures: u32,
+    skip: u32,
+}
+
+impl Backoff {
+    /// Whether to try a hedge this tick; a skipped tick counts down.
+    pub fn ready(&mut self) -> bool {
+        if self.skip == 0 {
+            return true;
+        }
+        self.skip -= 1;
+        false
+    }
+
+    pub fn failed(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        self.skip = 1_u32
+            .checked_shl(self.failures)
+            .unwrap_or(u32::MAX)
+            .min(MAX_BACKOFF_TICKS);
+    }
+
+    pub fn succeeded(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Keep a failed hedge from stopping the tick: quoting, opening and arbing
+/// matter more than the mix. Logs it, counts
+/// `mm_errors_total{stage="hedge"}`, and reports no hedge.
+pub fn contain(ctx: &Ctx, hedged: Result<bool>) -> bool {
+    match hedged {
+        Ok(hedged) => hedged,
+        Err(error) => {
+            warn!(maker = %ctx.maker.name, error = %format!("{error:#}"), "hedge failed; continuing the tick");
+            counter!("mm_errors_total", "maker" => ctx.name(), "stage" => "hedge").increment(1);
+            false
+        }
+    }
+}
+
+/// A seat hedge that failed.
+#[derive(Debug)]
+pub struct Failed {
+    /// The withdraw landed, so the seat's balances moved (and may not all
+    /// be back); a failed withdraw changed nothing.
+    pub withdrew: bool,
+    pub error: anyhow::Error,
+}
+
+/// Run a seat hedge's steps: take the free balance out (`withdraw`), hedge
+/// it in the wallet (`hedge`), and put the wallet back (`deposit`) whether
+/// or not the hedge landed, so a failed hedge cannot strand the seat's
+/// free balance in the wallet. A withdraw failure skips the rest.
+///
+/// `withdraw` and `hedge` return the slot they confirmed in (if they sent
+/// anything); `deposit` gets the later one, to read the wallet no earlier
+/// than both (a lagging node would serve it from before them).
+pub async fn through_wallet<W, H, D, DF>(
+    withdraw: W,
+    hedge: H,
+    deposit: D,
+) -> std::result::Result<(), Failed>
+where
+    W: std::future::Future<Output = Result<Option<u64>>>,
+    H: std::future::Future<Output = Result<Option<u64>>>,
+    D: FnOnce(Option<u64>) -> DF,
+    DF: std::future::Future<Output = Result<()>>,
+{
+    let withdrawn = withdraw.await.map_err(|error| Failed {
+        withdrew: false,
+        error,
+    })?;
+    let hedged = hedge.await;
+    let slot = withdrawn.max(hedged.as_ref().ok().copied().flatten());
+    let deposited = deposit(slot).await;
+    hedged.and(deposited).map_err(|error| Failed {
+        withdrew: true,
+        error,
+    })
+}
+
+/// Hedge out of the wallet (oracle arbs, and LPs between positions):
+/// re-reads the balances, so callers see the result.
+pub async fn wallet(ctx: &Ctx, prices: &PriceBook) -> Result<bool> {
+    let base = to_ui(&ctx.base, ctx.wallet_balance(&ctx.base).await?);
+    let quote = to_ui(&ctx.quote, ctx.wallet_balance(&ctx.quote).await?);
+    let held = Inventory {
+        base_total: base,
+        quote_total: quote,
+        base_free: base,
+        quote_free: quote,
+    };
+    match check(ctx, prices, held)? {
+        Some(plan) => {
+            execute(ctx, &plan).await?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).expect("decimal")
+    }
+
+    fn config() -> HedgeConfig {
+        HedgeConfig {
+            threshold_bps: 2_000,
+            cost_bps: 10,
+            min_usd: d("50"),
+        }
+    }
+
+    fn held(base: &str, quote: &str) -> Inventory {
+        Inventory {
+            base_total: d(base),
+            quote_total: d(quote),
+            base_free: d(base),
+            quote_free: d(quote),
+        }
+    }
+
+    #[test]
+    fn inside_the_threshold_nothing_happens() {
+        // 60% base against a 50% target: 10 points < 20
+        assert_eq!(
+            plan(held("600", "400"), d("1"), d("1"), d("0.5"), &config()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_one_sided_maker_sells_back_to_target() {
+        // all base: $1000 at $2, target half → sell $500 of base
+        let p = plan(held("500", "0"), d("2"), d("1"), d("0.5"), &config()).expect("hedge");
+        assert!(p.sell_base);
+        assert_eq!(p.sell, d("250"));
+        assert_eq!(p.notional_usd, d("500"));
+        assert_eq!(p.cost_usd, d("0.5"));
+        assert_eq!(p.buy, d("499.5"));
+        // and the other way round
+        let p = plan(held("0", "1000"), d("2"), d("1"), d("0.5"), &config()).expect("hedge");
+        assert!(!p.sell_base);
+        assert_eq!(p.sell, d("500"));
+        assert_eq!(p.buy, d("249.75"));
+    }
+
+    #[test]
+    fn only_free_inventory_is_sold_and_dust_is_skipped() {
+        let mut h = held("500", "0");
+        h.base_free = d("100"); // the rest locked in orders
+        let p = plan(h, d("2"), d("1"), d("0.5"), &config()).expect("hedge");
+        assert_eq!(p.sell, d("100"));
+        assert_eq!(p.notional_usd, d("200"));
+        h.base_free = d("10"); // $20 < $50 minimum
+        assert_eq!(plan(h, d("2"), d("1"), d("0.5"), &config()), None);
+        assert_eq!(
+            plan(held("0", "0"), d("2"), d("1"), d("0.5"), &config()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_hedge_puts_the_seat_back() {
+        use std::cell::Cell;
+        // Seat free balance and wallet balance, in atoms of one token.
+        let (seat, wallet) = (Cell::new(1_000_u64), Cell::new(0_u64));
+        let withdraw = async {
+            wallet.set(wallet.get() + seat.replace(0));
+            Ok(Some(10))
+        };
+        let deposit = |_| async {
+            seat.set(seat.get() + wallet.replace(0));
+            Ok(())
+        };
+        let failing = async { Err(anyhow::anyhow!("mint authority rejected")) };
+        let result = through_wallet(withdraw, failing, deposit).await;
+        assert!(
+            result.as_ref().is_err_and(|failed| failed.withdrew),
+            "the failure is still reported, with the seat moved"
+        );
+        assert_eq!((seat.get(), wallet.get()), (1_000, 0), "nothing stranded");
+        // A failed withdraw touches nothing else.
+        let hedged = Cell::new(false);
+        let result = through_wallet(
+            async { Err(anyhow::anyhow!("rpc down")) },
+            async {
+                hedged.set(true);
+                Ok(None)
+            },
+            |_| async {
+                hedged.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err_and(|failed| !failed.withdrew) && !hedged.get());
+    }
+
+    #[tokio::test]
+    async fn the_redeposit_reads_no_earlier_than_the_hedge() {
+        use std::cell::Cell;
+        let read_at = Cell::new(None);
+        let deposit = |slot| {
+            read_at.set(slot);
+            async { Ok(()) }
+        };
+        let result = through_wallet(async { Ok(Some(10)) }, async { Ok(Some(12)) }, deposit).await;
+        assert!(result.is_ok());
+        assert_eq!(read_at.get(), Some(12), "pinned to the hedge's slot");
+        // A failed hedge: pinned to the withdraw.
+        let deposit = |slot| {
+            read_at.set(slot);
+            async { Ok(()) }
+        };
+        let failing = async { Err(anyhow::anyhow!("burn exceeds the wallet")) };
+        let result = through_wallet(async { Ok(Some(10)) }, failing, deposit).await;
+        assert!(result.is_err());
+        assert_eq!(read_at.get(), Some(10));
+    }
+
+    #[test]
+    fn a_failing_hedge_backs_off_and_a_success_resets() {
+        let mut backoff = Backoff::default();
+        // A hedge that always fails, tried only when ready: over 20 ticks
+        // it runs on ticks 0, 3, 8 and 17 (skipping 2, 4, then 8 ticks).
+        let tried: Vec<usize> = (0..20)
+            .filter(|_| {
+                let ready = backoff.ready();
+                if ready {
+                    backoff.failed();
+                }
+                ready
+            })
+            .collect();
+        assert_eq!(tried, vec![0, 3, 8, 17]);
+        // Bounded.
+        for _ in 0..40 {
+            backoff.failed();
+        }
+        assert_eq!(backoff.skip, MAX_BACKOFF_TICKS);
+        // One success and the next tick hedges again.
+        backoff.succeeded();
+        assert!(backoff.ready());
+        assert!(backoff.ready());
+    }
+
+    #[test]
+    fn a_skewed_target_is_respected() {
+        // target 30% base; holding 50% → 20 points off → sell base
+        let p = plan(held("500", "500"), d("1"), d("1"), d("0.3"), &config()).expect("hedge");
+        assert!(p.sell_base);
+        assert_eq!(p.notional_usd, d("200"));
+    }
+}
