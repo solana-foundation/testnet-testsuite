@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS slots (
     tx_total INTEGER NOT NULL, tx_vote INTEGER NOT NULL, tx_failed INTEGER NOT NULL,
     tx_ours INTEGER NOT NULL, tx_ours_failed INTEGER NOT NULL,
     cu_consumed INTEGER, cost_units INTEGER, fees_lamports INTEGER NOT NULL,
-    prio_p50 INTEGER, prio_p90 INTEGER, prio_max INTEGER, observed_at_us INTEGER NOT NULL);
+    prio_p50 INTEGER, prio_p90 INTEGER, prio_max INTEGER, observed_at_us INTEGER NOT NULL,
+    details INTEGER);
 CREATE TABLE IF NOT EXISTS txs (
     signature TEXT PRIMARY KEY, slot INTEGER NOT NULL, payer TEXT NOT NULL, role TEXT NOT NULL,
     ok INTEGER NOT NULL, error TEXT, error_program TEXT, cu_consumed INTEGER, cu_limit INTEGER,
@@ -62,6 +63,7 @@ impl Store {
         let path = dir.join("run.db");
         let conn = connect(&path)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         for (key, value) in meta {
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -123,6 +125,19 @@ impl Store {
     }
 }
 
+/// Bring a `run.db` from an older chain-watch (same run id) up to
+/// [`SCHEMA`]. Its rows keep `details` NULL, read back as "read" when they
+/// carry a block height.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_details = conn
+        .prepare("SELECT 1 FROM pragma_table_info('slots') WHERE name = 'details'")?
+        .exists([])?;
+    if !has_details {
+        conn.execute_batch("ALTER TABLE slots ADD COLUMN details INTEGER")?;
+    }
+    Ok(())
+}
+
 fn connect(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     conn.busy_timeout(Duration::from_secs(10))?;
@@ -163,7 +178,7 @@ fn write_batch(conn: &mut Connection, batch: Vec<Write>) -> Result<()> {
             Write::Slot(s) => {
                 tx.prepare_cached(
                     "INSERT OR REPLACE INTO slots VALUES
-                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 )?
                 .execute(params![
                     s.slot,
@@ -185,6 +200,7 @@ fn write_batch(conn: &mut Connection, batch: Vec<Write>) -> Result<()> {
                     s.prio_p90,
                     s.prio_max,
                     s.observed_at_us,
+                    s.details,
                 ])?;
             }
             Write::Txs(slot, txs) => {
@@ -283,7 +299,8 @@ pub fn slots(conn: &Connection, from: u64, to: u64, limit: u32) -> Result<Vec<Sl
     let mut stmt = conn.prepare(
         "SELECT slot, leader, leader_client, leader_version, status, block_time, block_height,
                 tx_total, tx_vote, tx_failed, tx_ours, tx_ours_failed, cu_consumed, cost_units,
-                fees_lamports, prio_p50, prio_p90, prio_max, observed_at_us
+                fees_lamports, prio_p50, prio_p90, prio_max, observed_at_us,
+                COALESCE(details, block_height IS NOT NULL)
          FROM slots WHERE slot BETWEEN ?1 AND ?2 ORDER BY slot LIMIT ?3",
     )?;
     // SQLite integers are i64.
@@ -314,6 +331,7 @@ pub fn slots(conn: &Connection, from: u64, to: u64, limit: u32) -> Result<Vec<Sl
             prio_p90: row.get(16)?,
             prio_max: row.get(17)?,
             observed_at_us: row.get(18)?,
+            details: row.get(19)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -393,6 +411,7 @@ mod tests {
             prio_p90: Some(2),
             prio_max: Some(3),
             observed_at_us: 9,
+            details: true,
         };
         store.write(Write::Slot(slot.clone()));
         store.write(Write::Txs(
@@ -477,6 +496,7 @@ mod tests {
             prio_p90: None,
             prio_max: None,
             observed_at_us: 0,
+            details: false,
         };
         // Rows from 300_000_000, a 5_000-slot hole, then more.
         for slot in (300_000_000..300_000_010).chain(300_005_010..300_005_020) {
@@ -505,6 +525,66 @@ mod tests {
             read(300_000_010, 300_005_000, 10).await.expect("read"),
             Vec::<u64>::new()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_older_run_db_gains_the_details_column() {
+        let dir = std::env::temp_dir().join(format!("chain-watch-migrate-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("test setup");
+        // The slots table as chain-watch created it before `details`.
+        let old = SCHEMA.replace(",\n    details INTEGER)", ")");
+        assert_ne!(old, SCHEMA);
+        let conn = connect(&dir.join("run.db")).expect("test setup");
+        conn.execute_batch(&old).expect("test setup");
+        for (slot, height) in [(1_i64, Some(1_i64)), (2, None)] {
+            conn.execute(
+                "INSERT INTO slots VALUES (?1, NULL, NULL, NULL, 'produced', NULL, ?2,
+                 0, 0, 0, 0, 0, NULL, NULL, 0, NULL, NULL, NULL, 0)",
+                params![slot, height],
+            )
+            .expect("test setup");
+        }
+        drop(conn);
+        let store = Store::open(&dir, &[]).expect("open");
+        let mut row = SlotRecord {
+            slot: 3,
+            leader: None,
+            leader_client: None,
+            leader_version: None,
+            status: SlotStatus::Produced,
+            block_time: None,
+            block_height: None,
+            tx_total: 0,
+            tx_vote: 0,
+            tx_failed: 0,
+            tx_ours: 0,
+            tx_ours_failed: 0,
+            cu_consumed: None,
+            cost_units: None,
+            fees_lamports: 0,
+            prio_p50: None,
+            prio_p90: None,
+            prio_max: None,
+            observed_at_us: 0,
+            details: false,
+        };
+        store.write(Write::Slot(row.clone()));
+        row.slot = 4;
+        row.details = true;
+        store.write(Write::Slot(row));
+        store.flush(Duration::from_secs(5));
+        let details = store
+            .read(|conn| {
+                Ok(slots(conn, 0, 10, 10)?
+                    .into_iter()
+                    .map(|s| (s.slot, s.details))
+                    .collect::<Vec<_>>())
+            })
+            .await
+            .expect("read");
+        assert_eq!(details, vec![(1, true), (2, false), (3, false), (4, true)]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

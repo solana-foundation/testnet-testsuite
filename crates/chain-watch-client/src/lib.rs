@@ -64,6 +64,17 @@ pub struct SlotRecord {
     pub prio_p90: Option<u64>,
     pub prio_max: Option<u64>,
     pub observed_at_us: i64,
+    /// The block was read (`getBlock`), so the transaction, CU and fee
+    /// figures are real. `false` for a produced slot recorded without its
+    /// block (`slots` mode, or a gap backfilled after falling behind): its
+    /// zeros mean "not fetched", not an empty block. Missing on the wire
+    /// (an older chain-watch): `true`, what it meant there.
+    #[serde(default = "details_default")]
+    pub details: bool,
+}
+
+fn details_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,5 +232,23 @@ impl ChainWatchClient {
     /// Our transactions that landed in `slot`.
     pub async fn txs(&self, slot: u64) -> Result<Vec<OurTx>, Error> {
         self.get("/txs", &[("slot", slot.to_string())]).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slot_from_an_older_chain_watch_counts_as_read() {
+        let record: SlotRecord = serde_json::from_value(serde_json::json!({
+            "slot": 7, "leader": null, "leader_client": null, "leader_version": null,
+            "status": "produced", "block_time": null, "block_height": 6,
+            "tx_total": 3, "tx_vote": 1, "tx_failed": 0, "tx_ours": 0, "tx_ours_failed": 0,
+            "cu_consumed": null, "cost_units": null, "fees_lamports": 0,
+            "prio_p50": null, "prio_p90": null, "prio_max": null, "observed_at_us": 1,
+        }))
+        .expect("parses");
+        assert!(record.details);
     }
 }

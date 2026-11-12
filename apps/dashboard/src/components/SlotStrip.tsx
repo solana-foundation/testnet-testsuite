@@ -1,5 +1,6 @@
 // The slot strip: one column per confirmed slot, newest on the right.
-//   status row   produced (recessive) / skipped / our failures / unavailable
+//   status row   produced (recessive) / not fetched (hollow) / skipped /
+//                our failures / unavailable (hollow)
 //   leader lane  producing client (Agave, Firedancer, JitoLabs, other)
 //   bars         non-vote transactions: others (de-emphasised) under ours
 // Hover for the slot, click to open it.
@@ -22,15 +23,23 @@ const BARS_Y = LANE_Y + LANE_H + 6;
 const BARS_H = 44;
 const HEIGHT = BARS_Y + BARS_H;
 
-export function slotState(
-  slot: SlotRecord,
-): "produced" | "skipped" | "failures" | "unavailable" {
+export type SlotState =
+  "produced" | "not fetched" | "skipped" | "failures" | "unavailable";
+
+export function slotState(slot: SlotRecord): SlotState {
   if (slot.status === "skipped") return "skipped";
   if (slot.status === "unavailable") return "unavailable";
+  // Produced, block not read: its zero counts are unknown, not empty.
+  if (!slot.details) return "not fetched";
   return slot.tx_ours_failed > 0 ? "failures" : "produced";
 }
 
-function stateColor(state: ReturnType<typeof slotState>): string {
+/** Per-block figures, or "–" when the block was not read. */
+export function blockFigure(slot: SlotRecord, value: string): string {
+  return slot.details ? value : "–";
+}
+
+function stateColor(state: SlotState): string {
   switch (state) {
     case "skipped":
       return cssVar("--warning");
@@ -99,7 +108,10 @@ export function SlotStrip({
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, HEIGHT);
-    const max = Math.max(1, ...visible.map((s) => s.tx_total - s.tx_vote));
+    const max = Math.max(
+      1,
+      ...visible.filter((s) => s.details).map((s) => s.tx_total - s.tx_vote),
+    );
     const others = cssVar("--deemphasis");
     const ours = cssVar("--series-1");
     const baseline = cssVar("--axis");
@@ -107,7 +119,7 @@ export function SlotStrip({
       const x = startX + i * PITCH;
       const state = slotState(slot);
       ctx.fillStyle = stateColor(state);
-      if (state === "unavailable") {
+      if (state === "unavailable" || state === "not fetched") {
         ctx.strokeStyle = ctx.fillStyle;
         ctx.lineWidth = 1;
         ctx.strokeRect(x + 0.5, 0.5, CELL - 1, STATUS_H - 1);
@@ -118,6 +130,8 @@ export function SlotStrip({
         ctx.fillStyle = cssVar(clientVar(slot.leader_client));
         ctx.fillRect(x, LANE_Y, CELL, LANE_H);
       }
+      // No bars for a block not read: zero would read as an empty block.
+      if (!slot.details) return;
       const nonVote = slot.tx_total - slot.tx_vote;
       const theirs = Math.max(0, nonVote - slot.tx_ours);
       const hTheirs = (theirs / max) * BARS_H;
@@ -191,6 +205,7 @@ export function SlotStrip({
       </div>
       <div className="legend">
         <StatusLabel color="var(--axis)" label="produced" />
+        <StatusLabel color="var(--axis)" label="not fetched" hollow />
         <StatusLabel color="var(--warning)" label="skipped" />
         <StatusLabel color="var(--critical)" label="our tx failed" />
         <StatusLabel color="var(--text-muted)" label="unavailable" hollow />
@@ -240,13 +255,22 @@ export function SlotStrip({
               ],
               [
                 "non-vote tx",
-                compact(hover.slot.tx_total - hover.slot.tx_vote),
+                blockFigure(
+                  hover.slot,
+                  compact(hover.slot.tx_total - hover.slot.tx_vote),
+                ),
               ],
               [
                 "ours",
-                `${hover.slot.tx_ours} (${hover.slot.tx_ours_failed} failed)`,
+                blockFigure(
+                  hover.slot,
+                  `${hover.slot.tx_ours} (${hover.slot.tx_ours_failed} failed)`,
+                ),
               ],
-              ["failed (all)", compact(hover.slot.tx_failed)],
+              [
+                "failed (all)",
+                blockFigure(hover.slot, compact(hover.slot.tx_failed)),
+              ],
               ["CU", compact(hover.slot.cu_consumed)],
               [
                 "prio p50 / p90",
@@ -291,9 +315,13 @@ function SlotTable({
               <td className="num">{s.slot}</td>
               <td>{slotState(s)}</td>
               <td>{s.leader_client ?? "–"}</td>
-              <td className="num">{s.tx_total - s.tx_vote}</td>
-              <td className="num">{s.tx_ours}</td>
-              <td className="num">{s.tx_ours_failed}</td>
+              <td className="num">
+                {blockFigure(s, String(s.tx_total - s.tx_vote))}
+              </td>
+              <td className="num">{blockFigure(s, String(s.tx_ours))}</td>
+              <td className="num">
+                {blockFigure(s, String(s.tx_ours_failed))}
+              </td>
               <td className="num">{compact(s.cu_consumed)}</td>
               <td className="num">{compact(s.prio_p50)}</td>
             </tr>

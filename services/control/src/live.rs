@@ -218,6 +218,7 @@ mod tests {
             prio_p90: None,
             prio_max: None,
             observed_at_us: 0,
+            details: true,
         }
     }
 

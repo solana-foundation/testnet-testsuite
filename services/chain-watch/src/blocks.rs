@@ -392,6 +392,7 @@ fn record(shared: &Shared, raw_dir: &Path, slot: u64, fetched: Fetched, tip: u64
         prio_p90: percentile(&mut prices, 90),
         prio_max: prices.last().copied(),
         observed_at_us: now_us(),
+        details: raw.is_some(),
     };
     shared.store.write(Write::Slot(record));
     let keep_raw = match shared.cfg.raw_blocks {
@@ -628,7 +629,8 @@ mod tests {
         let mut progress = Progress::default();
         steps(&shared, &dir, &mut progress, 10).await;
         assert_eq!(shared.cursor.load(Ordering::Relaxed), tip + 1);
-        // Every slot of the gap has a row, without one getBlock.
+        // Every slot of the gap has a row, without one getBlock; the
+        // produced ones are marked unread, not empty.
         let recorded = records(&shared, cursor, tip).await;
         assert_eq!(recorded.len() as u64, tip - cursor + 1);
         assert!(recorded.iter().all(|r| {
@@ -639,6 +641,7 @@ mod tests {
                 } else {
                     SlotStatus::Skipped
                 }
+                && !r.details
         }));
         assert_eq!(node.get_block_calls.load(Ordering::Relaxed), 0);
         let events = shared
@@ -659,6 +662,8 @@ mod tests {
         steps(&shared, &dir, &mut progress, 1).await;
         assert_eq!(node.get_block_calls.load(Ordering::Relaxed), 1);
         assert_eq!(shared.cursor.load(Ordering::Relaxed), tip + 3);
+        let read = records(&shared, tip + 2, tip + 2).await;
+        assert!(read[0].details);
         std::fs::remove_dir_all(&dir).ok();
     }
 

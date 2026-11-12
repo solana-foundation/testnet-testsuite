@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 
 import { getJson, type OurTx, type SlotRecord } from "../api";
 import { compact, short } from "../format";
-import { slotState } from "./SlotStrip";
+import { blockFigure, slotState } from "./SlotStrip";
 import { KeyValues, StatusLabel } from "./Tooltip";
 
 export function explorer(
@@ -68,12 +68,23 @@ export function SlotDetail({
           ["block height", slot.block_height?.toLocaleString() ?? "–"],
           [
             "transactions",
-            `${slot.tx_total} (${slot.tx_vote} vote, ${slot.tx_failed} failed)`,
+            slot.details
+              ? `${slot.tx_total} (${slot.tx_vote} vote, ${slot.tx_failed} failed)`
+              : "not fetched (block not read)",
           ],
-          ["ours", `${slot.tx_ours} (${slot.tx_ours_failed} failed)`],
+          [
+            "ours",
+            blockFigure(
+              slot,
+              `${slot.tx_ours} (${slot.tx_ours_failed} failed)`,
+            ),
+          ],
           ["CU consumed", compact(slot.cu_consumed)],
           ["cost units", compact(slot.cost_units)],
-          ["fees", `${compact(slot.fees_lamports)} lamports`],
+          [
+            "fees",
+            blockFigure(slot, `${compact(slot.fees_lamports)} lamports`),
+          ],
           [
             "priority p50 / p90 / max",
             `${compact(slot.prio_p50)} / ${compact(slot.prio_p90)} / ${compact(slot.prio_max)}`,
@@ -83,7 +94,13 @@ export function SlotDetail({
       <h3 style={{ fontSize: 14, marginTop: 18 }}>Our transactions</h3>
       {error && <div className="error">{error}</div>}
       {txs == null && !error && <div className="hint">loading…</div>}
-      {txs?.length === 0 && <div className="hint">none in this slot</div>}
+      {txs?.length === 0 && (
+        <div className="hint">
+          {slot.details || slot.status !== "produced"
+            ? "none in this slot"
+            : "not fetched: the block was not read"}
+        </div>
+      )}
       {txs && txs.length > 0 && (
         <table>
           <thead>

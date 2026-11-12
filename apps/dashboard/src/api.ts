@@ -36,6 +36,10 @@ export interface SlotRecord {
   prio_p90: number | null;
   prio_max: number | null;
   observed_at_us: number;
+  /** The block was read. False for a produced slot recorded without it
+   * (`slots` mode or a backfilled gap): its zero counts mean "not
+   * fetched", not an empty block. */
+  details: boolean;
 }
 
 export interface Feature {
