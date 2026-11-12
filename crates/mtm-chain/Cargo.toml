@@ -5,8 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes `mtm_chain::mock` and `ChainClient::from_sender` for other crates'
+# tests (add it in their `[dev-dependencies]` only).
+test-util = ["dep:base64"]
+
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true, optional = true }
 futures = { workspace = true }
 http = { workspace = true }
 reqwest-middleware = { workspace = true }

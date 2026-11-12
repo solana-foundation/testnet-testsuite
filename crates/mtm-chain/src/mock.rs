@@ -1,5 +1,42 @@
-//! A scripted [`RpcSender`] for the submission state machine tests: every
-//! request is recorded and answered by a closure over (method, params).
+//! A scripted [`RpcSender`] for tests: every request is recorded and
+//! answered by a closure over (method, params).
+//!
+//! Outside this crate it needs the `test-util` feature, as a dev-dependency
+//! only so it stays out of normal builds:
+//!
+//! ```toml
+//! [dev-dependencies]
+//! mtm-chain = { workspace = true, features = ["test-util"] }
+//! tokio = { workspace = true, features = ["test-util"] } # start_paused
+//! ```
+//!
+//! Then build a client over the mock and drive it under paused time (the
+//! confirmer polls every 400 ms, rebroadcasts every 2 s):
+//!
+//! ```ignore
+//! use mtm_chain::mock::{self, MockRpc};
+//! use mtm_chain::{ChainClient, ChainOptions};
+//!
+//! #[tokio::test(start_paused = true)]
+//! async fn lands() {
+//!     let rpc = MockRpc::new(|method, params| match method {
+//!         "getLatestBlockhash" => Ok(mock::latest_blockhash(1000)),
+//!         "sendTransaction" => Ok(mock::sent_signature(params)),
+//!         "getBlockHeight" => Ok(serde_json::json!(10)),
+//!         "getSignatureStatuses" => {
+//!             Ok(mock::statuses(params, &mock::status(7, "confirmed", None)))
+//!         }
+//!         other => panic!("unexpected {other}"),
+//!     });
+//!     let chain = ChainClient::from_sender(
+//!         rpc.clone(),
+//!         solana_commitment_config::CommitmentConfig::confirmed(),
+//!         ChainOptions::default(),
+//!     );
+//!     // ... exercise code that takes `chain`, then assert on
+//!     // `rpc.count("sendTransaction")`, `rpc.calls(..)`, ...
+//! }
+//! ```
 
 use std::future::Future;
 use std::pin::Pin;

@@ -2,8 +2,8 @@
 
 mod confirm;
 pub mod keys;
-#[cfg(test)]
-mod mock;
+#[cfg(any(test, feature = "test-util"))]
+pub mod mock;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -17,7 +17,7 @@ use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client::rpc_client::{RpcClientConfig, SerializableTransaction};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use solana_rpc_client::rpc_sender::RpcSender;
 use solana_rpc_client_api::client_error::{Error as ClientError, ErrorKind as RpcErrorKind};
 use solana_rpc_client_api::config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
@@ -221,11 +221,12 @@ impl ChainClient {
         Ok(Self::assemble(callers, confirmer, commitment, options))
     }
 
-    /// A client over any transport (the seam the state machine tests use).
-    /// Callers share `options.max_in_flight` permits per request; the
-    /// confirmer has its own.
-    #[cfg(test)]
-    pub(crate) fn from_sender(
+    /// A client over any transport, e.g. [`mock::MockRpc`] in tests (needs
+    /// the `test-util` feature outside this crate). Callers share
+    /// `options.max_in_flight` permits per request; the confirmer has its
+    /// own.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn from_sender(
         sender: impl RpcSender + Send + Sync + 'static,
         commitment: CommitmentConfig,
         options: ChainOptions,

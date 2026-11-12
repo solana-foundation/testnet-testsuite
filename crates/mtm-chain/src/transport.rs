@@ -34,7 +34,7 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn limited(inner: Arc<dyn RpcSender + Send + Sync>, permits: usize) -> Self {
         Self {
             inner,
@@ -70,7 +70,7 @@ impl Transport {
     }
 
     /// The same sender with its own pool of `permits` (for the confirmer).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn sibling(&self, permits: usize) -> Self {
         Self::limited(Arc::clone(&self.inner), permits)
     }
