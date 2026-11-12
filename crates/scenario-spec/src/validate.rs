@@ -3,7 +3,7 @@
 //! spec that renders is one flow, mm and arb will start with.
 
 use anyhow::{Context, Result};
-use mtm_scenario::config::{ArbBotConfig, FlowConfig, MakerConfig, PoolConfig, TokenConfig};
+use mtm_scenario::config::{ArbConfig, FlowConfig, MakerConfig, PoolConfig, TokenConfig};
 use serde::de::DeserializeOwned;
 
 fn section<T: DeserializeOwned>(scenario: &toml::Table, key: &str) -> Result<Option<T>> {
@@ -33,13 +33,13 @@ pub fn overlay(text: &str) -> Result<()> {
     flow.validate()?;
     let tokens: Option<Vec<TokenConfig>> = section(scenario, "tokens")?;
     if let Some(arb) = scenario.get("arb").and_then(|v| v.as_table()) {
-        let bots: Vec<ArbBotConfig> = section(arb, "bots")?.unwrap_or_default();
-        mtm_scenario::config::ArbConfig {
-            bots,
-            poll_ms: 5_000,
-            debounce_ms: 250,
-        }
-        .validate()?;
+        // The section as the arb service reads it (serde defaults included,
+        // e.g. `search_commitment`); an overlay may leave `bots` out.
+        let mut arb = arb.clone();
+        arb.entry("bots")
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        let arb: ArbConfig = toml::Value::Table(arb).try_into().context("scenario.arb")?;
+        arb.validate()?;
     }
     if let Some(tokens) = tokens {
         let known = |name: &str| tokens.iter().any(|t| t.name == name);

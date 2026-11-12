@@ -240,7 +240,7 @@ async fn main() -> Result<()> {
         record,
         require_verified,
         require_artifact,
-    } = &cli.command
+    } = &command
     {
         let options = janitor::CheckOptions {
             allow_absent: *allow_absent,
