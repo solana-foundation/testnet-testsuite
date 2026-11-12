@@ -60,6 +60,14 @@ pub struct CacheTimings {
 pub const MIN_FAILURE_BACKOFF: Duration = Duration::from_millis(200);
 
 impl CacheTimings {
+    pub fn from_config(cfg: &crate::config::RouterConfig) -> Self {
+        Self {
+            ttl: Duration::from_millis(cfg.snapshot_ttl_ms),
+            max_age: Duration::from_millis(cfg.snapshot_max_age_ms),
+            load_timeout: Duration::from_millis(cfg.snapshot_load_timeout_ms),
+        }
+    }
+
     /// How long a failure suppresses reloads: one `ttl`, at least
     /// [`MIN_FAILURE_BACKOFF`].
     pub fn failure_backoff(&self) -> Duration {
@@ -560,6 +568,39 @@ mod tests {
         }
         let most = (window.as_millis() / MIN_FAILURE_BACKOFF.as_millis()) as usize + 1;
         assert!(fake.calls() <= most, "{} loads in {window:?}", fake.calls());
+    }
+
+    /// R2-ROUTER-4: with the default timings, a refresh that times out
+    /// followed by a 300 ms retry never leaves a healthy pool unusable.
+    #[tokio::test(start_paused = true)]
+    async fn default_timings_survive_one_timed_out_refresh() {
+        let cfg: crate::config::RouterConfig =
+            serde_json::from_value(serde_json::json!({ "listen_addr": "127.0.0.1:0" }))
+                .expect("router config");
+        let timings = CacheTimings::from_config(&cfg);
+        let (fake, cache) = Fake::with_timings(
+            timings,
+            |call| match call {
+                0 => Duration::from_millis(50),
+                1 => Duration::from_secs(60),
+                _ => Duration::from_millis(300),
+            },
+            never,
+        );
+        let wait = Duration::from_millis(cfg.snapshot_wait_ms);
+        cache.get(&entry(), wait).await.expect("first load");
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            let loaded = cache.get(&entry(), Duration::ZERO).await;
+            assert!(
+                loaded.is_ok(),
+                "unusable after {:?} ({} loads): {loaded:?}",
+                started.elapsed(),
+                fake.calls()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(fake.calls() >= 3, "the timed-out refresh was retried");
     }
 
     /// A failed refresh keeps the last good snapshot until it ages out.

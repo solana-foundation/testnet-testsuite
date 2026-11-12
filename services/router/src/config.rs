@@ -1,9 +1,12 @@
 //! Service config, loaded via mtm-common's layered loader.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 pub use mtm_common::config::RpcConfig;
 use serde::Deserialize;
+
+use crate::snapshots::CacheTimings;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -53,20 +56,22 @@ pub struct RouterConfig {
     /// Hard bound on snapshot age when a quote is planned, counted from the
     /// start of the snapshot's load (its data is that old): an older pool is
     /// left out of that quote. `router_snapshot_age_seconds` uses the same
-    /// age. Keep it above `snapshot_ttl_ms +
-    /// snapshot_load_timeout_ms` so a slow refresh does not drop pools.
+    /// age. Must exceed `snapshot_ttl_ms` + the failure backoff (the TTL, at
+    /// least 200 ms) + `snapshot_load_timeout_ms`, so one timed-out refresh
+    /// leaves its retry time to land before the pool is dropped; checked at
+    /// startup.
     #[serde(default = "default_snapshot_max_age_ms")]
     pub snapshot_max_age_ms: u64,
     /// Each snapshot load is abandoned after this long (and the failure
     /// reused for one TTL); also the per-request HTTP timeout of the RPC
-    /// client used on the quote path. Keep it well below
-    /// `request_timeout_ms`.
+    /// client used on the quote path. Must be above 0.
     #[serde(default = "default_snapshot_load_timeout_ms")]
     pub snapshot_load_timeout_ms: u64,
     /// Longest a quote waits for a pool with no usable snapshot (its first
     /// load, or a refresh after an idle gap); the pool is left out of that
     /// quote after it (its load keeps running). A pool whose last load
     /// failed is left out at once, without waiting, until a load succeeds.
+    /// Must be below `request_timeout_ms`.
     #[serde(default = "default_snapshot_wait_ms")]
     pub snapshot_wait_ms: u64,
     /// How often the background task refreshes the slot and blockhash that
@@ -74,7 +79,9 @@ pub struct RouterConfig {
     #[serde(default = "default_chain_tip_refresh_ms")]
     pub chain_tip_refresh_ms: u64,
     /// Each tip refresh is abandoned after this long (also the HTTP timeout
-    /// of the tip's own RPC client) and retried on the next tick.
+    /// of the tip's own RPC client) and retried on the next tick. Must be
+    /// above 0, and `chain_tip_max_age_ms` above `chain_tip_refresh_ms` +
+    /// this, so one timed-out refresh does not expire the tip.
     #[serde(default = "default_chain_tip_timeout_ms")]
     pub chain_tip_timeout_ms: u64,
     /// Quotes needing the slot or blockhash answer 502 once the cached
@@ -90,6 +97,44 @@ pub struct RouterConfig {
     pub max_concurrent_requests: usize,
     #[serde(default)]
     pub jupiter: JupiterConfig,
+}
+
+impl RouterConfig {
+    /// Reject timings that cannot work together (checked at startup).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let timings = CacheTimings::from_config(self);
+        let ms = |duration: Duration| duration.as_millis();
+        anyhow::ensure!(
+            self.snapshot_load_timeout_ms > 0,
+            "router.snapshot_load_timeout_ms must be above 0 (every load would fail)"
+        );
+        let needed = timings.ttl + timings.failure_backoff() + timings.load_timeout;
+        anyhow::ensure!(
+            timings.max_age > needed,
+            "router.snapshot_max_age_ms ({}) must exceed snapshot_ttl_ms + failure backoff + \
+             snapshot_load_timeout_ms ({} ms), or one timed-out refresh drops the pool",
+            self.snapshot_max_age_ms,
+            ms(needed)
+        );
+        anyhow::ensure!(
+            self.snapshot_wait_ms < self.request_timeout_ms,
+            "router.snapshot_wait_ms ({}) must be below request_timeout_ms ({})",
+            self.snapshot_wait_ms,
+            self.request_timeout_ms
+        );
+        anyhow::ensure!(
+            self.chain_tip_timeout_ms > 0,
+            "router.chain_tip_timeout_ms must be above 0"
+        );
+        let tip_needed = self.chain_tip_refresh_ms + self.chain_tip_timeout_ms;
+        anyhow::ensure!(
+            self.chain_tip_max_age_ms > tip_needed,
+            "router.chain_tip_max_age_ms ({}) must exceed chain_tip_refresh_ms + \
+             chain_tip_timeout_ms ({tip_needed} ms), or one timed-out refresh expires the tip",
+            self.chain_tip_max_age_ms
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -155,7 +200,7 @@ fn default_snapshot_max_age_ms() -> u64 {
     3_000
 }
 fn default_snapshot_load_timeout_ms() -> u64 {
-    2_000
+    1_000
 }
 fn default_snapshot_wait_ms() -> u64 {
     1_000
@@ -177,4 +222,60 @@ fn default_loaded_accounts_data_size_limit() -> u32 {
 }
 fn default_jupiter_overhead() -> u32 {
     60_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(overrides: serde_json::Value) -> RouterConfig {
+        let mut value = serde_json::json!({ "listen_addr": "127.0.0.1:0" });
+        value
+            .as_object_mut()
+            .expect("object")
+            .extend(overrides.as_object().expect("object").clone());
+        serde_json::from_value(value).expect("router config")
+    }
+
+    #[test]
+    fn defaults_are_valid() {
+        config(serde_json::json!({})).validate().expect("defaults");
+    }
+
+    #[test]
+    fn timings_that_cannot_work_are_rejected() {
+        for (overrides, why) in [
+            (
+                serde_json::json!({ "snapshot_load_timeout_ms": 0 }),
+                "load_timeout",
+            ),
+            // 400 + 400 + 2000 >= 2800: one timed-out refresh drops the pool.
+            (
+                serde_json::json!({ "snapshot_load_timeout_ms": 2_000, "snapshot_max_age_ms": 2_800 }),
+                "snapshot_max_age_ms",
+            ),
+            // TTL 0 still backs off 200 ms.
+            (
+                serde_json::json!({ "snapshot_ttl_ms": 0, "snapshot_max_age_ms": 1_200 }),
+                "snapshot_max_age_ms",
+            ),
+            (
+                serde_json::json!({ "snapshot_wait_ms": 10_000 }),
+                "snapshot_wait_ms",
+            ),
+            (
+                serde_json::json!({ "chain_tip_timeout_ms": 0 }),
+                "chain_tip_timeout_ms",
+            ),
+            (
+                serde_json::json!({ "chain_tip_max_age_ms": 1_400 }),
+                "chain_tip_max_age_ms",
+            ),
+        ] {
+            let error = config(overrides.clone())
+                .validate()
+                .expect_err(&format!("{overrides} should be rejected"));
+            assert!(error.to_string().contains(why), "{overrides}: {error}");
+        }
+    }
 }

@@ -46,6 +46,7 @@ pub struct AppState {
 }
 
 pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
+    cfg.router.validate()?;
     // Startup and discovery (`getProgramAccounts`) keep the default HTTP
     // timeout; the quote path gets one bounded by the snapshot load timeout.
     let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
@@ -101,11 +102,7 @@ pub async fn run(cfg: AppConfig) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         registry,
         snapshots: SnapshotCache::new(
-            CacheTimings {
-                ttl: Duration::from_millis(cfg.router.snapshot_ttl_ms),
-                max_age: Duration::from_millis(cfg.router.snapshot_max_age_ms),
-                load_timeout,
-            },
+            CacheTimings::from_config(&cfg.router),
             snapshots::chain_loader(quote_chain.clone()),
         ),
         tip,
@@ -262,14 +259,7 @@ mod tests {
         let (tip_tx, tip) = TipCell::new(Duration::from_millis(cfg.chain_tip_max_age_ms));
         let state = AppState {
             registry,
-            snapshots: SnapshotCache::new(
-                CacheTimings {
-                    ttl: Duration::from_millis(cfg.snapshot_ttl_ms),
-                    max_age: Duration::from_millis(cfg.snapshot_max_age_ms),
-                    load_timeout: Duration::from_millis(cfg.snapshot_load_timeout_ms),
-                },
-                loader,
-            ),
+            snapshots: SnapshotCache::new(CacheTimings::from_config(&cfg), loader),
             tip,
             chain,
             cfg,
