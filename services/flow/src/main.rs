@@ -146,9 +146,15 @@ async fn main() -> Result<()> {
     let shards = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(takers.len());
+    // `rpc.max_in_flight` bounds the whole process: each shard's client
+    // gets its share, so the load on the RPC does not grow with the core
+    // count.
+    let shard_in_flight = per_shard(cfg.rpc.max_in_flight, shards);
     info!(
         takers = takers.len(),
         shards,
+        max_in_flight = cfg.rpc.max_in_flight,
+        shard_in_flight,
         rate_per_min = flow.rate_per_min,
         "flow started"
     );
@@ -174,7 +180,7 @@ async fn main() -> Result<()> {
                                     &rpc.http_url,
                                     &rpc.commitment,
                                     ChainOptions {
-                                        max_in_flight: rpc.max_in_flight,
+                                        max_in_flight: shard_in_flight,
                                         ..ChainOptions::default()
                                     },
                                 )?,
@@ -717,6 +723,12 @@ impl Flow<'_> {
     }
 }
 
+/// One shard's share of the process-wide request bound (at least 1, so a
+/// bound below the shard count still lets every shard trade).
+fn per_shard(max_in_flight: usize, shards: usize) -> usize {
+    (max_in_flight / shards.max(1)).max(1)
+}
+
 /// Salt for each taker's backoff jitter stream.
 const JITTER_STREAM: u64 = 0x6a69_7474_6572;
 /// First pause after the RPC refuses a taker's trade.
@@ -835,6 +847,16 @@ mod tests {
             Outcome::of_read(&anyhow::anyhow!("timed out")),
             Outcome::RpcAmbiguous
         );
+    }
+
+    #[test]
+    fn the_request_bound_is_split_over_the_shards() {
+        assert_eq!(per_shard(128, 16), 8);
+        assert_eq!(per_shard(128, 1), 128);
+        assert_eq!(per_shard(100, 16), 6);
+        assert!(per_shard(100, 16) * 16 <= 100);
+        assert_eq!(per_shard(8, 16), 1);
+        assert_eq!(per_shard(8, 0), 8);
     }
 
     #[test]

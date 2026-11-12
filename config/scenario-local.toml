@@ -9,6 +9,9 @@
 [rpc]
 http_url = "http://127.0.0.1:8899"
 ws_url = "ws://127.0.0.1:8900"
+# Per process (flow splits it over its shards): 2048 is the 128 per shard
+# the x2000 runs had on a 16-core host. A local validator takes it.
+max_in_flight = 2048
 
 # --- oracle: keyless external prices -------------------------------------------
 # Binance top-of-book for JUP and RAY; USDC pegged. Arrays replace the
