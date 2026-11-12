@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use futures::future::join_all;
 use metrics::counter;
 use mtm_chain::{ChainClient, SubmissionError, VersionedSendConfig};
-use mtm_scenario::funding::{balances, wallet_balances};
+use mtm_scenario::funding::{WalletBalances, balances, wallet_balances};
 use mtm_scenario::pricing::PriceBook;
 use mtm_scenario::venue::{to_atoms, to_ui};
 use mtm_scenario::{ArbBotConfig, ArbConfig, Scenario, Token, Venue};
@@ -133,6 +133,10 @@ impl<'s> Searcher<'s> {
             }
             for legs in ["2", "3"] {
                 counter!("arb_trades_total", "bot" => name.clone(), "status" => "landed", "legs" => legs)
+                    .absolute(0);
+            }
+            for status in ["landed", "reverted"] {
+                counter!("arb_unaccounted_total", "bot" => name.clone(), "status" => status)
                     .absolute(0);
             }
             counter!("arb_profit_micro_usd_total", "bot" => name.clone()).absolute(0);
@@ -285,6 +289,10 @@ impl<'s> Searcher<'s> {
             counter!("arb_trades_total", "bot" => bot.config.name.clone(), "status" => status)
                 .increment(1);
         };
+        let unaccounted = |status: &'static str| {
+            counter!("arb_unaccounted_total", "bot" => bot.config.name.clone(), "status" => status)
+                .increment(1);
+        };
         if bot.config.latency_ms > 0 {
             tokio::time::sleep(Duration::from_millis(bot.config.latency_ms)).await;
         }
@@ -352,6 +360,13 @@ impl<'s> Searcher<'s> {
             .into_iter()
             .filter_map(|mint| self.scenario.token_by_mint(&mint))
             .collect();
+        // Valued now, while the plan's prices are fresh: the verdict can
+        // come long after the oracle bound, and a cycle that confirms
+        // slowly must still be accounted.
+        let usd: Vec<Decimal> = touched
+            .iter()
+            .map(|token| prices.usd(token))
+            .collect::<Result<_>>()?;
         let before = wallet_balances(&self.chain, &owner, &touched, None).await?;
         let (blockhash, last_valid_block_height) = self
             .chain
@@ -393,8 +408,9 @@ impl<'s> Searcher<'s> {
                 debug!(%signature, %error, route = ?route, "cycle reverted on-chain");
                 status("reverted");
                 // Counted once, as reverted: an accounting failure only
-                // loses the fee.
-                if let Err(error) = self.account(bot, &touched, &before, slot, prices).await {
+                // loses the fee, and says so.
+                if let Err(error) = self.account(bot, &touched, &usd, &before, slot).await {
+                    unaccounted("reverted");
                     warn!(bot = %bot.config.name, %signature, error = %format!("{error:#}"), "reverted cycle not accounted");
                 }
                 return Ok(());
@@ -414,9 +430,20 @@ impl<'s> Searcher<'s> {
                 return Ok(());
             }
         };
-        let (realized_usd, fee_lamports) =
-            self.account(bot, &touched, &before, slot, prices).await?;
+        // Landed is landed: a failed accounting read loses the PnL, not the
+        // trade.
         counter!("arb_trades_total", "bot" => bot.config.name.clone(), "status" => "landed", "legs" => legs.len().to_string()).increment(1);
+        let (realized_usd, fee_lamports) = match self
+            .account(bot, &touched, &usd, &before, slot)
+            .await
+        {
+            Ok(accounted) => accounted,
+            Err(error) => {
+                unaccounted("landed");
+                warn!(bot = %bot.config.name, %signature, error = %format!("{error:#}"), "landed cycle not accounted");
+                return Ok(());
+            }
+        };
         metrics::gauge!("arb_last_profit_usd", "bot" => bot.config.name.clone())
             .set(realized_usd.to_f64().unwrap_or_default());
         info!(
@@ -428,27 +455,22 @@ impl<'s> Searcher<'s> {
         Ok(())
     }
 
-    /// Value every touched token's change at oracle prices (gains and
-    /// losses on separate counters) and the SOL spent, from a read pinned
-    /// to the transaction's slot.
+    /// Value every touched token's change at the prices resolved before the
+    /// send (`usd`, one per token; gains and losses on separate counters)
+    /// and the SOL spent, from a read pinned to the transaction's slot.
     async fn account(
         &self,
         bot: &Bot,
         touched: &[&Token],
-        before: &mtm_scenario::funding::WalletBalances,
+        usd: &[Decimal],
+        before: &WalletBalances,
         slot: u64,
-        prices: &PriceBook,
     ) -> Result<(Decimal, u64)> {
         let owner = bot.wallet.pubkey();
         let after =
             until_slot_reached(|| wallet_balances(&self.chain, &owner, touched, Some(slot)))
                 .await?;
-        let mut realized_usd = Decimal::ZERO;
-        for ((token, was), now) in touched.iter().zip(&before.tokens).zip(&after.tokens) {
-            let delta = to_ui(token, *now) - to_ui(token, *was);
-            realized_usd += delta * prices.usd(token)?;
-        }
-        let fee_lamports = before.lamports.saturating_sub(after.lamports);
+        let (realized_usd, fee_lamports) = realized(touched, usd, before, &after);
         let name = bot.config.name.clone();
         let micro = |usd: Decimal| {
             (usd * Decimal::from(1_000_000))
@@ -490,6 +512,23 @@ impl<'s> Searcher<'s> {
             })
             .collect()
     }
+}
+
+/// A cycle's USD result (every touched token's change at `usd`) and the
+/// lamports it cost.
+fn realized(
+    touched: &[&Token],
+    usd: &[Decimal],
+    before: &WalletBalances,
+    after: &WalletBalances,
+) -> (Decimal, u64) {
+    let realized_usd = touched
+        .iter()
+        .zip(usd)
+        .zip(before.tokens.iter().zip(&after.tokens))
+        .map(|((token, price), (was, now))| (to_ui(token, *now) - to_ui(token, *was)) * *price)
+        .sum();
+    (realized_usd, before.lamports.saturating_sub(after.lamports))
 }
 
 /// Retries of a read pinned to a slot the node has not reached yet.
@@ -702,6 +741,43 @@ mod tests {
     use solana_instruction::AccountMeta;
 
     use super::*;
+
+    fn token(name: &str, decimals: u8) -> Token {
+        Token {
+            name: name.to_owned(),
+            mint: Pubkey::new_unique(),
+            decimals,
+            token_program: Pubkey::new_unique(),
+            oracle_symbol: format!("{name}/USD"),
+        }
+    }
+
+    #[test]
+    fn a_cycle_is_valued_at_the_prices_resolved_before_the_send() {
+        // No price book is consulted after the verdict, so a cycle that
+        // confirms past the oracle staleness bound is still valued.
+        let (usdc, jup) = (token("USDC", 6), token("JUP", 6));
+        let touched = [&usdc, &jup];
+        let usd = [Decimal::ONE, Decimal::new(5, 1)];
+        let balances = |lamports, tokens: [u64; 2]| WalletBalances {
+            slot: 0,
+            lamports,
+            tokens: tokens.to_vec(),
+        };
+        // +2 USDC, -1 JUP at $0.50, 5,000 lamports of fee.
+        let before = balances(1_000_000, [10_000_000, 4_000_000]);
+        let after = balances(995_000, [12_000_000, 3_000_000]);
+        assert_eq!(
+            realized(&touched, &usd, &before, &after),
+            (Decimal::new(15, 1), 5_000)
+        );
+        // A revert: nothing moved but the fee.
+        let reverted = balances(995_000, [10_000_000, 4_000_000]);
+        assert_eq!(
+            realized(&touched, &usd, &before, &reverted),
+            (Decimal::ZERO, 5_000)
+        );
+    }
 
     #[test]
     fn enumerates_two_and_three_hop_cycles() {
