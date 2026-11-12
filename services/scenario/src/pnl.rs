@@ -57,6 +57,10 @@ pub struct Snapshot {
     /// USD per token, by token name.
     pub prices: BTreeMap<String, Decimal>,
     pub participants: Vec<Holdings>,
+    /// How the wait before the reads ended (absent in snapshots taken
+    /// before it was recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle: Option<crate::settle::Record>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +188,7 @@ pub async fn snapshot(chain: &ChainClient, rpc: &JsonRpc, scenario: &Scenario) -
         slot,
         prices,
         participants,
+        settle: None,
     })
 }
 
@@ -859,6 +864,32 @@ async fn trade_counts(
     trades
 }
 
+/// A warning per snapshot whose settle wait may have missed in-flight
+/// transactions (their effects then land in the wrong window).
+fn settle_warnings(start: &Snapshot, end: &Snapshot) -> Vec<String> {
+    [("start", start), ("end", end)]
+        .into_iter()
+        .filter_map(|(side, snapshot)| {
+            let record = snapshot.settle?;
+            let why = match record.mode {
+                crate::settle::Mode::Fallback => {
+                    "the block height was never readable, so it settled on wall-clock time"
+                        .to_owned()
+                }
+                crate::settle::Mode::TimedOut => format!(
+                    "it timed out after {} blocks",
+                    record.blocks.map_or("no".to_owned(), |b| b.to_string())
+                ),
+                _ => return None,
+            };
+            Some(format!(
+                "the {side} snapshot may have missed in-flight transactions: {why} ({} ms)",
+                record.waited_ms
+            ))
+        })
+        .collect()
+}
+
 /// `compute_every`: sample compute from every n-th slot's full block
 /// (0: no compute in the venue breakdown).
 pub async fn report(
@@ -872,7 +903,7 @@ pub async fn report(
     let window_s = (end.time_us - start.time_us) as f64 / 1e6;
     let end_s = end.time_us as f64 / 1e6;
     let range = format!("{}s", window_s.round().max(1.0) as u64);
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = settle_warnings(start, end);
 
     let trades = match prometheus_url {
         Some(url) => trade_counts(url, &range, end_s, &mut warnings).await,
@@ -1029,6 +1060,44 @@ mod tests {
         assert!(value(&unpriced, &prices).is_err());
         let empty = BTreeMap::from([("RAY".to_owned(), Decimal::ZERO)]);
         assert_eq!(value(&empty, &prices).expect("nothing held"), Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_degraded_settle_on_either_side_is_a_warning() {
+        use crate::settle::{Mode, Record};
+        let snapshot = |mode: Option<Mode>| Snapshot {
+            time_us: 0,
+            slot: 0,
+            prices: BTreeMap::new(),
+            participants: Vec::new(),
+            settle: mode.map(|mode| Record {
+                mode,
+                blocks: (mode != Mode::Fallback).then_some(40),
+                waited_ms: 300_000,
+            }),
+        };
+        // Old snapshots (no record), and settles that ran as asked: quiet.
+        for (start, end) in [
+            (None, None),
+            (Some(Mode::Blocks), Some(Mode::Blocks)),
+            (Some(Mode::WallClock), Some(Mode::WallClock)),
+        ] {
+            assert!(settle_warnings(&snapshot(start), &snapshot(end)).is_empty());
+        }
+        let warnings = settle_warnings(
+            &snapshot(Some(Mode::Fallback)),
+            &snapshot(Some(Mode::TimedOut)),
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("start") && warnings[0].contains("wall-clock"));
+        assert!(warnings[1].contains("end") && warnings[1].contains("timed out after 40 blocks"));
+        // The record survives a round trip, and an old snapshot still reads.
+        let json = serde_json::to_string(&snapshot(Some(Mode::TimedOut))).expect("json");
+        assert!(json.contains(r#""settle":{"mode":"timedOut""#), "{json}");
+        let old: Snapshot =
+            serde_json::from_str(r#"{"time_us":0,"slot":0,"prices":{},"participants":[]}"#)
+                .expect("old snapshot");
+        assert!(old.settle.is_none());
     }
 
     #[test]

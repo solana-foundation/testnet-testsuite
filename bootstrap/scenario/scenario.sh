@@ -9,6 +9,14 @@
 #                                       "mtm — market-making scenario")
 #   scenario.sh snapshot FILE [local|testnet]   participant holdings at oracle prices
 #   scenario.sh report START END [local|testnet] PnL, transactions, trades between snapshots
+#   scenario.sh measure NAME SECONDS [local|testnet] snapshot → sample load → snapshot → report
+#                                       into .scenario/runs/NAME-{t0,t1,load,report}.json
+#
+# SCENARIO_SCALE=x10|x100|assets layers config/scale-<scale>.toml (generated
+# by scale.py) over the profile; `up` records it in .scenario/scale, and later
+# commands use that unless SCENARIO_SCALE names it (a different one is
+# refused). SCENARIO_TOKENS_CONFIG picks the token bootstrap config (the
+# asset scale uses bootstrap/scenario/tokens-assets.json).
 #   scenario.sh down                    stop every service started by `up`/`observe`
 #                                       (TERM, then KILL after 30 s)
 #   scenario.sh supervise NAME CMD...   (internal) rerun CMD whenever it exits
@@ -58,13 +66,29 @@ if [[ "${1:-}" == supervise ]]; then
   supervise "$@"
 fi
 
+usage() { echo "usage: $0 {deploy|up|bootstrap|observe|status|down} [local|testnet]" \
+  "| snapshot FILE [target] | report START END [target] | measure NAME SECONDS [target]" >&2; exit 2; }
+is_target() { [[ "$1" == local || "$1" == testnet ]]; }
+
+# Positional arguments, checked strictly: a forgotten operand must not shift
+# the target into its place (e.g. `measure x10 testnet` running locally).
 cmd="${1:-up}"
+[[ $# -gt 0 ]] && shift
 args=()
 case "$cmd" in
-  snapshot) args=("${2:?snapshot FILE}"); shift ;;
-  report) args=("${2:?report START END}" "${3:?report START END}"); shift 2 ;;
+  snapshot) operands=1 ;;
+  report | measure) operands=2 ;;
+  *) operands=0 ;;
 esac
-target="${2:-local}"
+for _ in $(seq 1 "$operands"); do
+  [[ $# -gt 0 ]] && ! is_target "$1" || usage
+  args+=("$1"); shift
+done
+if [[ "$cmd" == measure ]] && ! [[ "${args[1]}" =~ ^[0-9]+$ ]]; then
+  echo "measure: SECONDS must be a whole number, got '${args[1]}'" >&2; exit 2
+fi
+target="${1:-local}"
+[[ $# -le 1 ]] || usage
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 state="$root/.scenario"
 mkdir -p "$state/logs" "$state/pids" "$state/state"
@@ -81,11 +105,30 @@ case "$target" in
     ;;
   *) echo "unknown target: $target (local|testnet)" >&2; exit 2 ;;
 esac
+# The scale `up` started at, so later commands resolve the same participants
+# (a snapshot or report at another scale reads a different wallet set). Unset,
+# the recorded scale applies; a different one is refused.
+if [[ "$cmd" == up ]]; then
+  printf %s "${SCENARIO_SCALE:-}" >"$state/scale"
+elif [[ "$cmd" =~ ^(bootstrap|status|snapshot|report|measure)$ && -f "$state/scale" ]]; then
+  recorded="$(cat "$state/scale")"
+  if [[ -z "${SCENARIO_SCALE+set}" ]]; then
+    SCENARIO_SCALE="$recorded"
+    [[ -n "$recorded" ]] && echo "using the running scenario's scale: $recorded (.scenario/scale)" >&2
+  elif [[ "$SCENARIO_SCALE" != "$recorded" ]]; then
+    echo "$cmd: the scenario was started at scale '${recorded:-base}', not '${SCENARIO_SCALE:-base}' (.scenario/scale)" >&2
+    exit 2
+  fi
+fi
+[[ -n "${SCENARIO_SCALE:-}" ]] && export MTM_PROFILE="$MTM_PROFILE,scale-$SCENARIO_SCALE"
 export MTM_RPC__HTTP_URL="$rpc"
 if [[ -n "${SCENARIO_WS_URL:-}" ]]; then
   export MTM_RPC__WS_URL="$SCENARIO_WS_URL"
+elif [[ "$target" == local && "$rpc" =~ ^http://([^/:]+):([0-9]+)/?$ ]]; then
+  # Surfpool and solana-test-validator: websocket on the RPC port + 1.
+  export MTM_RPC__WS_URL="ws://${BASH_REMATCH[1]}:$(( BASH_REMATCH[2] + 1 ))"
 elif [[ "$target" == local ]]; then
-  export MTM_RPC__WS_URL="ws://127.0.0.1:$(( ${rpc##*:} + 1 ))" # Surfpool: RPC port + 1
+  echo "cannot derive the websocket URL from $rpc: set SCENARIO_WS_URL" >&2; exit 2
 else
   export MTM_RPC__WS_URL="${rpc/https/wss}"
 fi
@@ -173,6 +216,7 @@ tokens() {
   local runner=(pnpm bootstrap:tokens)
   [[ -x node_modules/.bin/tsx ]] && runner=(node_modules/.bin/tsx bootstrap/tokens/deploy.ts)
   "${runner[@]}" --apply --skip-existing --testnet-rpc "$rpc" \
+    ${SCENARIO_TOKENS_CONFIG:+--config "$SCENARIO_TOKENS_CONFIG"} \
     ${SCENARIO_MAINNET_RPC:+--mainnet-rpc "$SCENARIO_MAINNET_RPC"}
 }
 
@@ -273,7 +317,8 @@ case "$cmd" in
     (export MTM_ORACLE__STATE_PATH="$state/state/oracle-pricing.json"
       start oracle "$root/bootstrap/scenario/scenario.sh" supervise oracle "$bin/oracle")
     # Pools are created at live oracle prices: wait until every instrument
-    # has a fresh price, not just a listening socket.
+    # has a fresh price (every asset in the profile), not just a listening
+    # socket.
     wait_http http://127.0.0.1:8180/ready oracle
     "$bin/scenario" bootstrap | tee "$state/bootstrap.json"
     (router_env; start router "$bin/router")
@@ -305,6 +350,45 @@ case "$cmd" in
     "$bin/scenario" report --start "${args[0]}" --end "${args[1]}" \
       --prometheus "${SCENARIO_PROMETHEUS:-http://127.0.0.1:9190}"
     ;;
+  measure)
+    # Participants are frozen (SIGSTOP) while each snapshot reads, so every
+    # wallet, seat, and position is read in the same chain state.
+    name="${args[0]}" seconds="${args[1]}" runs="$state/runs"
+    mkdir -p "$runs"
+    participants=(flow arb mm)
+    signal() {
+      for n in "${participants[@]}"; do
+        [[ -f "$state/pids/$n" ]] && kill "-$1" "$(cat "$state/pids/$n")" 2>/dev/null || true
+      done
+    }
+    # Let in-flight transactions land before reading. A local validator
+    # settles in a slot or two; a remote RPC node keeps rebroadcasting until
+    # the blockhash expires, 150 blocks on: wait for those blocks (however
+    # long a slow cluster takes, up to SCENARIO_SETTLE_TIMEOUT_S, after which
+    # the snapshot is taken and marked timedOut), with SCENARIO_SETTLE_S of
+    # wall-clock time as the fallback when the height is never readable.
+    remote=$([[ "$target" == local ]] && echo false || echo true)
+    settle_s="${SCENARIO_SETTLE_S:-$($remote && echo 90 || echo 3)}"
+    settle_blocks="${SCENARIO_SETTLE_BLOCKS:-$($remote && echo 150 || echo 0)}"
+    settle_timeout_s="${SCENARIO_SETTLE_TIMEOUT_S:-300}"
+    frozen_snapshot() {
+      signal STOP
+      "$bin/scenario" snapshot --out "$1" --settle-blocks "$settle_blocks" \
+        --settle-s "$settle_s" --settle-timeout-s "$settle_timeout_s" >&2 || { signal CONT; return 1; }
+    }
+    trap 'signal CONT' EXIT
+    frozen_snapshot "$runs/$name-t0.json"
+    signal CONT
+    python3 -I "$root/bootstrap/scenario/sample.py" --seconds "$seconds" --rpc "$rpc" \
+      --out "$runs/$name-load.json" >/dev/null
+    frozen_snapshot "$runs/$name-t1.json"
+    # Still frozen through the report: its block scan and Prometheus reads
+    # compete with flow's connections at high scale (x2000 ran out of ports).
+    "$bin/scenario" report --start "$runs/$name-t0.json" --end "$runs/$name-t1.json" \
+      --prometheus "${SCENARIO_PROMETHEUS:-http://127.0.0.1:9190}" >"$runs/$name-report.json"
+    signal CONT
+    echo "wrote $runs/$name-{t0,t1,load,report}.json"
+    ;;
   down)
     # Takers first, so nothing trades against makers that are unwinding.
     for name in arb flow mm router oracle grafana prometheus; do
@@ -316,5 +400,5 @@ case "$cmd" in
       $compose -f ops/compose.scenario.yaml down # volumes are kept
     fi
     ;;
-  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|snapshot|report|down)" >&2; exit 2 ;;
+  *) echo "unknown command: $cmd (deploy|up|bootstrap|observe|status|snapshot|report|measure|down)" >&2; exit 2 ;;
 esac

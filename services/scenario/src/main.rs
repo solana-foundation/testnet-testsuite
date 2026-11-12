@@ -11,12 +11,14 @@
 
 mod pnl;
 mod rpc;
+mod settle;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use futures::StreamExt;
 use mtm_chain::{ChainClient, ChainOptions};
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::{keypair_from_environment, signer_from_environment};
@@ -29,6 +31,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solana_commitment_config::CommitmentConfig;
+use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 
 #[derive(Debug, Parser)]
@@ -57,11 +60,31 @@ enum Command {
     },
     /// Print every scenario pool and wallet with its balances.
     Status,
+    /// Wait until the oracle has a fresh price for every scenario token
+    /// (pools are created at oracle prices).
+    WaitPrices {
+        #[arg(long, default_value_t = 120)]
+        timeout_s: u64,
+    },
     /// Record every participant's holdings (wallet, seats, LP positions) and
-    /// the oracle prices, for `report`.
+    /// the oracle prices, for `report`. With participants frozen, wait first
+    /// for their in-flight transactions to land (`--settle-blocks`,
+    /// `--settle-s`); prices and holdings are read after the wait.
     Snapshot {
         #[arg(long)]
         out: PathBuf,
+        /// Wait until the block height has advanced this many blocks (150:
+        /// a blockhash's lifetime). 0: wait `--settle-s` instead.
+        #[arg(long, default_value_t = 0)]
+        settle_blocks: u64,
+        /// Wall-clock wait when `--settle-blocks` is 0 or the block height
+        /// cannot be read.
+        #[arg(long, default_value_t = 0)]
+        settle_s: u64,
+        /// Stop waiting for `--settle-blocks` after this long; the snapshot
+        /// is still taken, marked `timedOut` (and `report` warns).
+        #[arg(long, default_value_t = settle::DEFAULT_TIMEOUT.as_secs())]
+        settle_timeout_s: u64,
     },
     /// PnL, transactions, and trades per participant between two snapshots.
     Report {
@@ -77,6 +100,9 @@ enum Command {
         compute_sample_every: u64,
     },
 }
+
+/// role, wallet, SOL target, token targets, funding mode
+type FundingTarget<'s> = (String, Pubkey, Decimal, Vec<(&'s Token, Decimal)>, Funding);
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -126,12 +152,32 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
-        Command::Snapshot { out } => {
-            let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
+        Command::WaitPrices { timeout_s } => wait_prices(&scenario, timeout_s).await?,
+        Command::Snapshot {
+            out,
+            settle_blocks,
+            settle_s,
+            settle_timeout_s,
+        } => {
+            let settled = settle::settle(
+                || async { Ok(chain.rpc().get_block_height().await?) },
+                settle_blocks,
+                std::time::Duration::from_secs(settle_s),
+                std::time::Duration::from_secs(settle_timeout_s),
+                settle::POLL,
+            )
+            .await?;
+            let mut snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
+            // Kept even after a timeout: the window it closes has run, and
+            // `report` warns about a snapshot that did not settle as asked.
+            snapshot.settle = Some(settled.into());
             // Compact: at tens of thousands of participants a pretty
             // snapshot is several MB of whitespace.
             std::fs::write(&out, serde_json::to_vec(&snapshot)?)?;
-            json!({ "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len() })
+            json!({
+                "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len(),
+                "settle": snapshot.settle,
+            })
         }
         Command::Report {
             start,
@@ -309,75 +355,108 @@ async fn bootstrap(
         }));
     }
 
-    // 3. wallets
-    let mut wallets = Vec::new();
+    // 3. wallets: one funding transaction per wallet, sent concurrently
+    let mut targets: Vec<FundingTarget<'_>> = Vec::new();
     if !no_fund {
-        for maker in &scenario.config.makers {
-            let wallet = scenario.maker_wallet(&maker.name).pubkey();
-            let tokens = maker
-                .inventory
+        let resolve = |inventory: &std::collections::BTreeMap<String, Decimal>| {
+            inventory
                 .iter()
                 .map(|(name, amount)| Ok((scenario.token(name)?, *amount)))
-                .collect::<Result<Vec<_>>>()?;
-            let outcome = top_up(
-                chain,
-                faucet.as_ref(),
-                mint_authority.as_ref(),
-                &wallet,
+                .collect::<Result<Vec<_>>>()
+        };
+        for maker in &scenario.config.makers {
+            targets.push((
+                format!("maker/{}", maker.name),
+                scenario.maker_wallet(&maker.name).pubkey(),
                 maker.sol,
-                &tokens,
+                resolve(&maker.inventory)?,
                 Funding::Endowment,
-            )
-            .await?;
-            wallets.push(json!({ "role": format!("maker/{}", maker.name), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
+            ));
         }
         for bot in scenario.config.arb.iter().flat_map(|arb| &arb.bots) {
-            let wallet = scenario.arb_wallet(&bot.name).pubkey();
-            let tokens = bot
-                .inventory
-                .iter()
-                .map(|(name, amount)| Ok((scenario.token(name)?, *amount)))
-                .collect::<Result<Vec<_>>>()?;
-            let outcome = top_up(
-                chain,
-                faucet.as_ref(),
-                mint_authority.as_ref(),
-                &wallet,
+            targets.push((
+                format!("arb/{}", bot.name),
+                scenario.arb_wallet(&bot.name).pubkey(),
                 bot.sol,
-                &tokens,
+                resolve(&bot.inventory)?,
                 Funding::Endowment,
-            )
-            .await?;
-            wallets.push(json!({ "role": format!("arb/{}", bot.name), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
+            ));
         }
         if let Some(flow) = &scenario.config.flow {
-            let tokens = flow
-                .inventory
-                .iter()
-                .map(|(name, amount)| Ok((scenario.token(name)?, *amount)))
-                .collect::<Result<Vec<_>>>()?;
+            let tokens = resolve(&flow.inventory)?;
             for index in 0..flow.takers {
-                let wallet = scenario.taker_wallet(index).pubkey();
+                targets.push((
+                    format!("taker/{index}"),
+                    scenario.taker_wallet(index).pubkey(),
+                    flow.sol,
+                    tokens.clone(),
+                    Funding::TopUp,
+                ));
+            }
+        }
+    }
+    let concurrency: usize = std::env::var("SCENARIO_FUNDING_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let wallets: Vec<Value> = futures::stream::iter(targets.iter().map(
+        |(role, wallet, sol, tokens, funding)| {
+            let (faucet, mint_authority) = (&faucet, &mint_authority);
+            async move {
                 let outcome = top_up(
                     chain,
                     faucet.as_ref(),
                     mint_authority.as_ref(),
-                    &wallet,
-                    flow.sol,
-                    &tokens,
-                    Funding::TopUp,
+                    wallet,
+                    *sol,
+                    tokens,
+                    *funding,
                 )
                 .await?;
-                wallets.push(json!({ "role": format!("taker/{index}"), "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }));
+                Ok::<_, anyhow::Error>(json!({ "role": role, "wallet": wallet.to_string(), "lamportsSent": outcome.lamports_sent, "minted": outcome.minted }))
             }
-        }
-    }
+        },
+    ))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<_>>()?;
     Ok(json!({
         "orcaWhirlpoolsConfig": { "address": orca_config.whirlpools_config.to_string(), "created": orca_config.created_config },
         "raydiumAmmConfig": { "address": raydium_config.amm_config.to_string(), "created": raydium_config.created },
         "pools": pools,
         "wallets": wallets,
     }))
+}
+
+async fn wait_prices(scenario: &Scenario, timeout_s: u64) -> Result<Value> {
+    let oracle = OracleClient::new(&scenario.config.oracle_url);
+    let started = std::time::Instant::now();
+    loop {
+        let missing: Vec<String> =
+            match PriceBook::fetch(&oracle, scenario.config.max_price_age_ms).await {
+                Ok(book) => scenario
+                    .tokens
+                    .values()
+                    .filter(|token| book.usd(token).is_err())
+                    .map(|token| token.name.clone())
+                    .collect(),
+                Err(_) => scenario.tokens.keys().cloned().collect(),
+            };
+        if missing.is_empty() {
+            return Ok(
+                json!({ "tokens": scenario.tokens.len(), "waitedMs": started.elapsed().as_millis() as u64 }),
+            );
+        }
+        if started.elapsed().as_secs() >= timeout_s {
+            anyhow::bail!(
+                "no fresh oracle price after {timeout_s} s for: {}",
+                missing.join(", ")
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 async fn status(chain: &ChainClient, scenario: &Scenario) -> Result<Value> {
