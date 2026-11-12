@@ -85,6 +85,100 @@ async fn ensure_janitor(chain: &ChainClient, program: &Pubkey, elf: &[u8]) -> Re
     deployment_slot(&data).with_context(|| format!("{program}'s program data has no slot"))
 }
 
+/// What a program ID runs, compared with the artifact it should run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Code {
+    /// Exactly the artifact.
+    Matches,
+    /// The janitor binary (a janitor teardown did not restore it).
+    Janitor,
+    /// Other code: a different build, or something else entirely.
+    Differs,
+    /// No account at the program ID.
+    Absent,
+    /// An upgradeable program with no program data: closed for good.
+    Closed,
+    /// The artifact file is missing, so nothing could be compared.
+    Unverified,
+}
+
+/// Classify one program's on-chain code. `program` and its program data
+/// are read with the batched raw reader, so an absent account is a
+/// definite answer and an RPC error is an error.
+pub async fn code_of(
+    rpc: &JsonRpc,
+    program: &Pubkey,
+    artifact: Option<&[u8]>,
+    janitor: Option<&[u8]>,
+) -> Result<Code> {
+    let Some(account) = accounts(rpc, &[*program]).await?.pop().flatten() else {
+        return Ok(Code::Absent);
+    };
+    // Upgradeable program account: u32 tag + ProgramData address.
+    let program_data = account
+        .data
+        .get(4..36)
+        .and_then(|raw| Pubkey::try_from(raw).ok())
+        .with_context(|| format!("{program} is not an upgradeable program"))?;
+    let Some(data) = accounts(rpc, &[program_data]).await?.pop().flatten() else {
+        return Ok(Code::Closed);
+    };
+    Ok(classify(&data.data, artifact, janitor))
+}
+
+fn classify(program_data: &[u8], artifact: Option<&[u8]>, janitor: Option<&[u8]>) -> Code {
+    if janitor.is_some_and(|elf| runs(program_data, elf)) {
+        return Code::Janitor;
+    }
+    match artifact {
+        None => Code::Unverified,
+        Some(elf) if runs(program_data, elf) => Code::Matches,
+        Some(_) => Code::Differs,
+    }
+}
+
+/// `deploy` / `up` preflight: every program must run its fork artifact.
+/// Fails listing the programs that run the janitor or other code, are
+/// closed, or (unless `allow_absent`) are not deployed; a missing artifact
+/// file is only a warning.
+pub async fn check_programs(
+    rpc: &JsonRpc,
+    programs: &[(Pubkey, std::path::PathBuf)],
+    janitor_so: Option<&std::path::Path>,
+    allow_absent: bool,
+) -> Result<Value> {
+    let janitor = janitor_so
+        .map(|path| std::fs::read(path).with_context(|| format!("reading {}", path.display())))
+        .transpose()?;
+    let mut rows = Vec::new();
+    let mut bad = Vec::new();
+    for (program, path) in programs {
+        let artifact = match std::fs::read(path) {
+            Ok(elf) => Some(elf),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        let code = code_of(rpc, program, artifact.as_deref(), janitor.as_deref()).await?;
+        match code {
+            Code::Matches => {}
+            Code::Absent if allow_absent => {}
+            Code::Unverified => {
+                tracing::warn!(%program, artifact = %path.display(), "artifact missing: the program's code was not checked")
+            }
+            Code::Janitor => bad.push(format!("{program} runs the janitor")),
+            Code::Differs => bad.push(format!("{program} does not run {}", path.display())),
+            Code::Absent => bad.push(format!("{program} is not deployed")),
+            Code::Closed => bad.push(format!("{program} was closed")),
+        }
+        rows.push(json!({ "program": program.to_string(), "artifact": path, "code": code }));
+    }
+    anyhow::ensure!(bad.is_empty(), "{}", bad.join("; "));
+    Ok(json!({ "programs": rows }))
+}
+
 /// A program upgraded in slot N only runs its new code from slot N + 1
 /// (invoking it earlier fails with UnsupportedProgramId): wait until the
 /// cluster is past `slot`.
@@ -570,6 +664,39 @@ mod tests {
         assert!(!runs(&changed, &elf));
         // too short to hold it
         assert!(!runs(&data[..PROGRAM_DATA_HEADER + 4], &elf));
+    }
+
+    #[test]
+    fn program_code_is_the_fork_the_janitor_or_other() {
+        let program_data = |elf: &[u8]| {
+            let mut data = vec![3, 0, 0, 0];
+            data.extend_from_slice(&[0; 41]);
+            data.extend_from_slice(elf);
+            data.extend_from_slice(&[0; 64]);
+            data
+        };
+        let (fork, janitor) = (b"\x7fELF fork".as_slice(), b"\x7fELF janitor".as_slice());
+        assert_eq!(
+            classify(&program_data(fork), Some(fork), Some(janitor)),
+            Code::Matches
+        );
+        assert_eq!(
+            classify(&program_data(janitor), Some(fork), Some(janitor)),
+            Code::Janitor
+        );
+        // Without the fork artifact the janitor is still recognised.
+        assert_eq!(
+            classify(&program_data(janitor), None, Some(janitor)),
+            Code::Janitor
+        );
+        assert_eq!(
+            classify(&program_data(fork), None, Some(janitor)),
+            Code::Unverified
+        );
+        assert_eq!(
+            classify(&program_data(b"\x7fELF v2"), Some(fork), None),
+            Code::Differs
+        );
     }
 
     #[test]

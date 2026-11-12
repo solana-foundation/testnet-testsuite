@@ -121,6 +121,14 @@ NO_DNA=1 just scenario-testnet          # bootstrap + run (prd Doppler config)
 NO_DNA=1 just scenario-status-testnet
 ```
 
+`deploy` skips a program only when its on-chain code is byte-for-byte its
+fork artifact (`scenario check-programs`); a deployed program running
+anything else (the janitor after a failed teardown, an older fork build) is
+refused, and `SCENARIO_UPGRADE_PROGRAMS=1` upgrades it to the artifact. `up`
+runs the same check before it starts anything and refuses a program that is
+not deployed or does not run its artifact (a missing artifact file only
+warns: nothing to compare with).
+
 The testnet profile slows every maker 5× and flow to 4 trades/min for the
 public RPC; set `SCENARIO_RPC_URL` (and `SCENARIO_WS_URL`) to a dedicated
 endpoint for sustained runs. `SCENARIO_SEED` is mandatory there.
@@ -424,7 +432,13 @@ unwind, which still needs the real code) and runs `scenario janitor`, which:
 3. closes every account the programs own.
 
 It then upgrades the forks back, empty: `bootstrap` re-creates configs, pools and
-markets on the same chain. Building needs the Agave platform tools
+markets on the same chain. The restore runs on every exit once the first
+upgrade to the janitor has started: a failed or interrupted `scenario
+janitor` or upgrade, or Ctrl-C (a second one stops only the deploy in
+flight). Each program that does not run its fork is redeployed, past a
+failed one; if any is left, the run fails listing it, and `deploy` / `up`
+refuse it until `SCENARIO_UPGRADE_PROGRAMS=1 scenario.sh deploy` restores
+it. Building needs the Agave platform tools
 (`cargo-build-sbf`, Agave >= 4.x) and `PUBKEY_PROGRAM_AUTHORITY` /
 `PUBKEY_FAUCET` in the Doppler config.
 

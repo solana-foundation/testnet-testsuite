@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Run the market-making scenario: oracle → bootstrap → router → makers → flow + arb.
 #
-#   scenario.sh deploy [local|testnet]  deploy the three DEX fork artifacts
-#   scenario.sh up [local|testnet]      build, start every service, bootstrap
+#   scenario.sh deploy [local|testnet]  deploy the three DEX fork artifacts; a deployed
+#                                       program whose code is not its artifact (e.g. left
+#                                       as the janitor) is refused, or upgraded to the
+#                                       artifact with SCENARIO_UPGRADE_PROGRAMS=1
+#   scenario.sh up [local|testnet]      build, check every DEX program runs its fork
+#                                       artifact, start every service, bootstrap
 #   scenario.sh bootstrap [local|testnet]   tokens + pools + wallet top-ups only
 #   scenario.sh status [local|testnet]  pools, wallets, processes
 #   scenario.sh observe                 Prometheus :9190 + Grafana :3100 (dashboard
@@ -222,6 +226,11 @@ build() {
   cargo build -q $build_flag -p oracle -p router -p mm -p flow -p arb -p scenario
 }
 
+# Passed to `scenario check-programs`, so a program left running the janitor
+# is named as such.
+janitor_check=()
+if [[ -f "${SCENARIO_JANITOR_SO:-}" ]]; then janitor_check=(--janitor-so "$SCENARIO_JANITOR_SO"); fi
+
 tokens() {
   # Mirrors mainnet metadata onto the target; existing mints are left alone.
   # Call tsx directly when installed: `pnpm run` re-checks the install first.
@@ -266,14 +275,53 @@ artifacts() { # program keypair var:fork artifact, one per DEX (defaults: siblin
 janitor() (
   # Upgrade the three DEX programs to the janitor (programs/janitor, built
   # with `just build-janitor`), close every account they own (rent to the
-  # faucet), then put the forks back unless the programs are being closed
-  # next: left as the janitor, a later `deploy` would skip them as
-  # "already deployed" and the scenario would run against the janitor.
+  # faucet), then put the forks back. The forks are restored on every exit
+  # once the first upgrade has started (a failed `scenario janitor`, a
+  # failed upgrade, Ctrl-C), each one attempted even if another fails; any
+  # program still not its fork fails the run and is listed (`deploy` and
+  # `up` refuse it until `SCENARIO_UPGRADE_PROGRAMS=1 scenario.sh deploy`).
   so="${SCENARIO_JANITOR_SO:?set SCENARIO_JANITOR_SO to the janitor .so (just build-janitor)}"
   require_agave_cli
   umask 077
-  dir=""
-  trap '[[ -n "$dir" ]] && rm -rf "$dir"' EXIT
+  dir="" upgraded=0
+  restore() { # every program not running its fork → its fork; 1 if any is left
+    local spec var artifact key left=()
+    while IFS= read -r spec; do
+      var="${spec%%:*}" artifact="${spec#*:}"
+      key="$(pubkey_of "$var")"
+      # Already the fork (its janitor upgrade never ran): nothing to deploy.
+      if "$bin/scenario" check-programs --program "$key=$artifact" --janitor-so "$so" >/dev/null 2>&1; then
+        continue
+      fi
+      upgrade "$var" "$artifact" || left+=("$var")
+    done < <(artifacts)
+    if (( ${#left[@]} )); then
+      echo "janitor: NOT restored, still running the janitor (or no code): ${left[*]};" \
+        "restore with \`SCENARIO_UPGRADE_PROGRAMS=1 $0 deploy $target\`" >&2
+      return 1
+    fi
+  }
+  finish() {
+    local status=$?
+    if [[ "$upgraded" == 1 ]]; then
+      upgraded=0
+      # A second Ctrl-C stops the deploy in flight (the CLI gets it too),
+      # not the restore of the others.
+      trap 'echo "janitor: interrupted; still restoring the forks" >&2' INT TERM
+      if restore; then
+        if [[ "$status" == 0 ]]; then
+          echo "janitor: forks restored with no accounts or vaults; bootstrap re-creates them" >&2
+        else
+          echo "janitor: failed (status $status); the forks are restored" >&2
+        fi
+      else
+        [[ "$status" != 0 ]] || status=1
+      fi
+    fi
+    if [[ -n "$dir" ]]; then rm -rf "$dir"; fi
+    exit "$status"
+  }
+  trap finish EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   if [[ -d /dev/shm && -w /dev/shm ]]; then dir="$(mktemp -d /dev/shm/kp.XXXXXX)"; else dir="$(mktemp -d)"; fi
@@ -293,10 +341,9 @@ janitor() (
   done < <(artifacts)
   if [[ "$live" == 0 ]]; then echo "janitor: the DEX programs are already closed" >&2; exit 0; fi
   [[ "$live" == 3 ]] || { echo "janitor: only $live of 3 DEX programs exist; refusing a partial run" >&2; exit 1; }
+  upgraded=1 # from here on, `finish` restores the forks
   while IFS= read -r spec; do upgrade "${spec%%:*}" "$so"; done < <(artifacts)
   "$bin/scenario" janitor --janitor-so "$so" | tee "$state/janitor.json"
-  while IFS= read -r spec; do upgrade "${spec%%:*}" "${spec#*:}"; done < <(artifacts)
-  echo "janitor: forks restored with no accounts or vaults; bootstrap re-creates them" >&2
 )
 
 program_closed() { # pubkey → 0 if it is an upgradeable program that was closed
@@ -311,11 +358,15 @@ program_closed() { # pubkey → 0 if it is an upgradeable program that was close
 
 deploy() (
   # Deploys each fork artifact at its program keypair, skipping programs that
-  # are already deployed. Paths default to sibling fork checkouts.
+  # already run it. A deployed program running other code (the janitor after
+  # a failed teardown, an older build) is refused, or upgraded to the
+  # artifact with SCENARIO_UPGRADE_PROGRAMS=1. Paths default to sibling fork
+  # checkouts.
   # Manifest is SBPF v3: use an Agave >= 4.x `solana` CLI.
   # A subshell, so umask and traps stay local; the key directory is removed
   # on any exit, Ctrl-C and SIGTERM included.
   require_agave_cli
+  cargo build -q $build_flag -p scenario # check-programs
   umask 077
   dir=""
   trap '[[ -n "$dir" ]] && rm -rf "$dir"' EXIT
@@ -328,11 +379,20 @@ deploy() (
   [[ "$target" == local ]] && flags+=(--use-rpc) # Surfpool has no TPU/QUIC
   while IFS= read -r spec; do
     var="${spec%%:*}" so="${spec#*:}"
-    if program_exists "$(pubkey_of "$var")"; then
-      if program_closed "$(pubkey_of "$var")"; then
+    key="$(pubkey_of "$var")"
+    if program_exists "$key"; then
+      if program_closed "$key"; then
         echo "$var was closed; closed program IDs cannot be reused: use a new keypair" >&2; exit 1
       fi
-      echo "$var already deployed"; continue
+      if "$bin/scenario" check-programs --program "$key=$so" "${janitor_check[@]}" >/dev/null; then
+        echo "$var already deployed"; continue
+      fi
+      if [[ "${SCENARIO_UPGRADE_PROGRAMS:-0}" != 1 ]]; then
+        echo "$var is deployed but does not run $so (above); refusing. SCENARIO_UPGRADE_PROGRAMS=1" \
+          "upgrades it to the artifact" >&2
+        exit 1
+      fi
+      echo "$var: upgrading to $so"
     fi
     printf %s "${!var:?missing secret: $var}" >"$dir/program.json"
     solana program deploy -u "$rpc" "${flags[@]}" --program-id "$dir/program.json" \
@@ -375,6 +435,12 @@ case "$cmd" in
     ;;
   up)
     build
+    # The forks, not the janitor a failed teardown left (nor an old build).
+    checks=()
+    while IFS= read -r spec; do checks+=(--program "$(pubkey_of "${spec%%:*}")=${spec#*:}"); done < <(artifacts)
+    "$bin/scenario" check-programs "${checks[@]}" "${janitor_check[@]}" >/dev/null \
+      || { echo "up: a DEX program does not run its fork artifact (above); \`deploy\` deploys it" \
+        "(SCENARIO_UPGRADE_PROGRAMS=1 upgrades one running other code). Nothing was started" >&2; exit 1; }
     tokens
     # Supervised: the oracle exits when any of its tasks dies, and comes
     # back (restarts are logged in .scenario/logs/oracle.log). Its synthetic

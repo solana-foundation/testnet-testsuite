@@ -65,6 +65,20 @@ enum Command {
     /// Resolve the scenario (seed, program ids, mints) and change nothing:
     /// the preflight for commands that must not fail halfway.
     Check,
+    /// Fail unless each program runs its fork artifact (`deploy` / `up`
+    /// preflight: a failed janitor teardown leaves the janitor there).
+    /// Needs no scenario resolution, so it runs before the mints exist.
+    CheckPrograms {
+        /// `<program id>=<artifact .so>`, repeated.
+        #[arg(long = "program", value_parser = parse_program, required = true)]
+        programs: Vec<(Pubkey, PathBuf)>,
+        /// The janitor binary, so a program left running it is named as such.
+        #[arg(long)]
+        janitor_so: Option<PathBuf>,
+        /// A program that is not deployed passes (`deploy` creates it).
+        #[arg(long)]
+        allow_absent: bool,
+    },
     /// Wait until the oracle has a fresh price for every scenario token
     /// (pools are created at oracle prices).
     WaitPrices {
@@ -183,6 +197,17 @@ async fn main() -> Result<()> {
         },
     )?;
     let rpc = rpc::JsonRpc::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    if let Command::CheckPrograms {
+        programs,
+        janitor_so,
+        allow_absent,
+    } = &cli.command
+    {
+        let report =
+            janitor::check_programs(&rpc, programs, janitor_so.as_deref(), *allow_absent).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let report = match cli.command {
         Command::Bootstrap {
@@ -202,6 +227,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
+        Command::CheckPrograms { .. } => unreachable!("handled before the scenario resolves"),
         Command::Check => json!({
             "ok": true,
             "participants": scenario.participants().len(),
@@ -608,4 +634,14 @@ fn round_sf(value: Decimal, digits: u32) -> Result<Decimal> {
         .map(|rounded| rounded.normalize())
         .filter(|rounded| !rounded.is_zero())
         .with_context(|| format!("price {value} does not round to a usable value"))
+}
+
+fn parse_program(spec: &str) -> Result<(Pubkey, PathBuf), String> {
+    let (program, path) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("expected <program id>=<artifact .so>, got {spec}"))?;
+    let program = program
+        .parse()
+        .map_err(|error| format!("program id {program}: {error}"))?;
+    Ok((program, PathBuf::from(path)))
 }
