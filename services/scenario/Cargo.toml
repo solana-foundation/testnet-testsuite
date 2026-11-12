@@ -1,0 +1,31 @@
+[package]
+name = "scenario"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+manifest-dex-orchestrator = { workspace = true }
+mtm-chain = { workspace = true }
+mtm-common = { workspace = true }
+mtm-dex-harness = { workspace = true, features = ["cli"] }
+mtm-scenario = { workspace = true }
+oracle-client = { workspace = true }
+orca-whirlpool-orchestrator = { workspace = true }
+raydium-clmm-orchestrator = { workspace = true }
+rust_decimal = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-commitment-config = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-signer = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

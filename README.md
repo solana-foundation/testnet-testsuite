@@ -17,6 +17,7 @@ the point is generating realistic traffic against it.
 | `crates/manifest-dex-orchestrator`     | Reusable funding and maker/taker lifecycle sequencing for Manifest                                 |
 | `crates/sdks/manifest`                 | Codama-generated Manifest instruction SDK (from the published IDL)                                 |
 | `crates/mtm-dex-harness`               | SPL builders, test-token funding, and the ephemeral-user CLI lifecycle shared by DEX orchestrators |
+| `crates/mtm-scenario`                  | Scenario config, deterministic wallets, oracle pricing, venue price math, top-ups                  |
 | `crates/orca-whirlpool-client`         | Async Orca Whirlpool pool, tick-array, position, collection, close, and swap actions               |
 | `crates/orca-whirlpool-orchestrator`   | Reusable funding and full Whirlpool lifecycle sequencing                                           |
 | `crates/raydium-clmm-client`           | Async Raydium CLMM pool, position, collection, close, and swap actions                             |
@@ -24,6 +25,9 @@ the point is generating realistic traffic against it.
 | `services/oracle`                      | Polls Hermes → serves `/v1/prices` + `/v1/ws` → pushes on-chain (WIP)                              |
 | `services/manifest-dex-orchestrator`   | CLI with `create-markets` and `user-flow` commands for the Manifest fork                           |
 | `services/router`                      | Quote + transaction API routing across Raydium CLMM, Orca, and Manifest (direct or Jupiter fork)   |
+| `services/mm`                          | Market makers: Manifest ladders, Raydium/Orca ranges, and oracle arbitrage per configured maker    |
+| `services/flow`                        | Uninformed takers sending random and large swaps through the router                                |
+| `services/scenario`                    | Idempotent scenario bootstrap: venue configs, pools at oracle prices, wallet funding               |
 | `services/orca-whirlpool-orchestrator` | CLI with `admin`, `create-pools`, and `user-flow` commands for the Whirlpool fork                  |
 | `services/raydium-clmm-orchestrator`   | CLI with `admin` setup and complete `flow` lifecycle commands                                      |
 | `programs/`                            | On-chain programs (empty for now — Anchor workspace lands here later)                              |
@@ -429,6 +433,18 @@ On a fresh Surfpool, `NO_DNA=1 just router-seed-dev` opens faucet-funded
 positions and resting orders on every pool so routes have liquidity, and
 `cargo run -p router --example swap_via_router` signs and submits a routed
 swap and prints quoted versus landed amounts.
+
+## Market-making scenario
+
+A replayable end-to-end scenario runs all three venues with oracle-driven
+market makers and router-driven uninformed flow, with Prometheus and a
+provisioned Grafana dashboard. See
+[bootstrap/scenario/README.md](bootstrap/scenario/README.md):
+
+```sh
+NO_DNA=1 just scenario-surfpool   # terminal 1
+NO_DNA=1 just scenario-dev        # deploy, bootstrap, run, observe (Grafana :3100)
+```
 
 ## Conventions
 
