@@ -20,7 +20,7 @@ use mtm_scenario::venue::{to_atoms, to_ui};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use solana_signer::Signer;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::maker::Ctx;
 
@@ -184,6 +184,36 @@ pub async fn execute(ctx: &Ctx, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+/// Keep a failed hedge from stopping the tick: quoting, opening and arbing
+/// matter more than the mix. Logs it, counts
+/// `mm_errors_total{stage="hedge"}`, and reports no hedge.
+pub fn contain(ctx: &Ctx, hedged: Result<bool>) -> bool {
+    match hedged {
+        Ok(hedged) => hedged,
+        Err(error) => {
+            warn!(maker = %ctx.maker.name, error = %format!("{error:#}"), "hedge failed; continuing the tick");
+            counter!("mm_errors_total", "maker" => ctx.name(), "stage" => "hedge").increment(1);
+            false
+        }
+    }
+}
+
+/// Run a seat hedge's steps: take the free balance out (`withdraw`), hedge
+/// it in the wallet (`hedge`), and put the wallet back (`deposit`) whether
+/// or not the hedge landed, so a failed hedge cannot strand the seat's
+/// free balance in the wallet. A withdraw failure skips the rest.
+pub async fn through_wallet<W, H, D>(withdraw: W, hedge: H, deposit: D) -> Result<()>
+where
+    W: std::future::Future<Output = Result<()>>,
+    H: std::future::Future<Output = Result<()>>,
+    D: std::future::Future<Output = Result<()>>,
+{
+    withdraw.await?;
+    let hedged = hedge.await;
+    let deposited = deposit.await;
+    hedged.and(deposited)
+}
+
 /// Hedge out of the wallet (oracle arbs, and LPs between positions):
 /// re-reads the balances, so callers see the result.
 pub async fn wallet(ctx: &Ctx, prices: &PriceBook) -> Result<bool> {
@@ -269,6 +299,40 @@ mod tests {
             plan(held("0", "0"), d("2"), d("1"), d("0.5"), &config()),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_hedge_puts_the_seat_back() {
+        use std::cell::Cell;
+        // Seat free balance and wallet balance, in atoms of one token.
+        let (seat, wallet) = (Cell::new(1_000_u64), Cell::new(0_u64));
+        let withdraw = async {
+            wallet.set(wallet.get() + seat.replace(0));
+            Ok(())
+        };
+        let deposit = async {
+            seat.set(seat.get() + wallet.replace(0));
+            Ok(())
+        };
+        let failing = async { Err(anyhow::anyhow!("mint authority rejected")) };
+        let result = through_wallet(withdraw, failing, deposit).await;
+        assert!(result.is_err(), "the failure is still reported");
+        assert_eq!((seat.get(), wallet.get()), (1_000, 0), "nothing stranded");
+        // A failed withdraw touches nothing else.
+        let hedged = Cell::new(false);
+        let result = through_wallet(
+            async { Err(anyhow::anyhow!("rpc down")) },
+            async {
+                hedged.set(true);
+                Ok(())
+            },
+            async {
+                hedged.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err() && !hedged.get());
     }
 
     #[test]

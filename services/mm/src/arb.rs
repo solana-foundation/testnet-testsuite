@@ -37,7 +37,7 @@ impl Arb {
         let spot = spot_price(&snapshot, &ctx.base, &ctx.quote, oracle);
         ctx.record_prices(oracle, spot);
         // Lay off what the last arbs accumulated before sizing the next one.
-        crate::hedge::wallet(ctx, &prices).await?;
+        crate::hedge::contain(ctx, crate::hedge::wallet(ctx, &prices).await);
         let base_atoms = ctx.wallet_balance(&ctx.base).await?;
         let quote_atoms = ctx.wallet_balance(&ctx.quote).await?;
         ctx.record_inventory(&prices, base_atoms, quote_atoms);
