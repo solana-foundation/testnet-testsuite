@@ -149,3 +149,39 @@ base = { kind = "basket", rebase = "100.00", legs = [
     { feed = "BTC/USD", weight = "0.3" },
     { feed = "ETH/USD", weight = "0.3" },
 ] }
+
+# --- router service (docs/router-architecture.md) ------------------------------
+
+[router]
+listen_addr = "127.0.0.1:8081"
+metrics_addr = "127.0.0.1:9101"
+# Intermediate mints for 2-hop routes, e.g. the bootstrap USDC mint.
+bridge_mints = []
+# Snapshot cache and chain tip (defaults shown; see RouterConfig):
+# snapshot_ttl_ms = 400            # fresh window after a load completes
+# snapshot_max_age_ms = 3000       # never plan on an older snapshot
+# snapshot_load_timeout_ms = 1000  # per load, and quote-path RPC timeout
+# snapshot_wait_ms = 1000          # max wait for a pool with no snapshot
+# chain_tip_refresh_ms = 400       # background slot/blockhash refresh
+# chain_tip_timeout_ms = 1000      # per refresh, and the tip client's timeout
+# chain_tip_max_age_ms = 5000      # 502 once the cached tip is older
+
+# Program IDs of the deployed DEX forks. Set per environment, e.g.
+# MTM_ROUTER__PROGRAMS__RAYDIUM_CLMM / __ORCA_WHIRLPOOL / __MANIFEST
+# (`just router-dev` maps them from Doppler's PUBKEY_* variables).
+[router.programs]
+
+# Pools are discovered from each program by account discriminator and vetted
+# with a two-way probe quote; curated pools can also be pinned:
+# [[router.pools]]
+# venue = "orca-whirlpool"
+# address = "<pool>"
+[router.discovery]
+enabled = true
+interval_ms = 60000
+probe_amount = 1000
+
+# Jupiter aggregator fork for `execution = "jupiter"` requests
+# (MTM_ROUTER__JUPITER__PROGRAM_ID). Unset: such requests are rejected.
+[router.jupiter]
+overhead_cu = 60000
