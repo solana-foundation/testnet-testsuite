@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     mtm_telemetry::init("chain-watch", cfg.chain_watch.metrics_addr)?;
     let watch = cfg.chain_watch.clone();
+    watch.validate()?;
 
     let http_url = watch
         .rpc

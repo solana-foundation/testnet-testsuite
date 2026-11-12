@@ -932,6 +932,7 @@ dependencies = [
  "figment",
  "futures",
  "metrics",
+ "metrics-exporter-prometheus",
  "mtm-chain",
  "mtm-common",
  "mtm-scenario",

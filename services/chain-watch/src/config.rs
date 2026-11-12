@@ -67,6 +67,21 @@ pub struct ChainWatchConfig {
     pub block_cost_limit: Option<u64>,
 }
 
+impl ChainWatchConfig {
+    /// Settings that load but cannot work.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // Below this, the slots that pass during one step's ranges make
+        // every step a backfill with its own `gap` event.
+        let min_lag = 2 * crate::blocks::RANGE;
+        anyhow::ensure!(
+            self.max_lag_slots >= min_lag,
+            "chain_watch.max_lag_slots = {} is below the minimum {min_lag}",
+            self.max_lag_slots
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RpcOverride {
     pub http_url: Option<String>,
@@ -156,6 +171,19 @@ mod tests {
     struct RunId {
         #[serde(default, deserialize_with = "string_or_number")]
         run_id: Option<String>,
+    }
+
+    #[test]
+    fn max_lag_slots_below_two_ranges_is_rejected() {
+        let cfg = |lag: u64| -> ChainWatchConfig {
+            serde_json::from_value(serde_json::json!({
+                "listen_addr": "127.0.0.1:0", "max_lag_slots": lag,
+            }))
+            .expect("parses")
+        };
+        assert!(cfg(999).validate().is_err());
+        assert!(cfg(1_000).validate().is_ok());
+        assert!(cfg(default_max_lag_slots()).validate().is_ok());
     }
 
     #[test]

@@ -33,6 +33,8 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 figment = { workspace = true }
+# renders the counters a step increments (already in the lock via mtm-telemetry)
+metrics-exporter-prometheus = { workspace = true }
 # paused clock for the request-budget test
 tokio = { workspace = true, features = ["test-util"] }
 

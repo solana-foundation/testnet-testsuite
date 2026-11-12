@@ -23,11 +23,14 @@ use crate::state::Shared;
 use crate::store::Write;
 
 /// Slots per `getBlocks` range.
-const RANGE: u64 = 500;
-/// A `getBlocks` range that lists no block at all is taken as skipped only
-/// once the confirmed tip is this far past its end; before that the node
-/// answering is more likely behind than the cluster silent.
-const EMPTY_RANGE_MARGIN: u64 = RANGE;
+pub const RANGE: u64 = 500;
+/// Consecutive `getBlocks` replies that may lack the anchor (the node that
+/// answered does not hold that part of the ledger) before the slots below
+/// the first block they list are recorded `unavailable`.
+const ANCHOR_ATTEMPTS: u32 = 5;
+/// Consecutive undecided steps (at [`NOT_YET_WAIT`]) between warnings:
+/// about 10 s.
+const WAIT_WARN_EVERY: u32 = 25;
 /// Widest gap recorded in `slots` mode after falling behind (about 100
 /// `getBlocks` calls); a wider one is dropped with only a `gap` event.
 const MAX_BACKFILL_SLOTS: u64 = 50_000;
@@ -43,18 +46,35 @@ enum Fetched {
     Unavailable,
 }
 
+/// What the pipeline carries from one step to the next.
+#[derive(Debug, Default)]
+struct Progress {
+    /// Last slot of a gap being recorded in `slots` mode (0: none).
+    backfill_to: u64,
+    /// Newest slot below the cursor known to be produced (listed by an
+    /// earlier `getBlocks`). Every `getBlocks` starts there: a reply that
+    /// lists it comes from a node holding the ledger from there on, so a
+    /// slot it leaves out is skipped; a reply without it proves nothing.
+    /// `None`: the cursor itself, which starts at the confirmed tip (a
+    /// produced slot, since `getSlot` answers with a block).
+    anchor: Option<u64>,
+    /// Consecutive replies without the anchor.
+    anchor_misses: u32,
+    /// Consecutive steps that could decide nothing.
+    waits: u32,
+}
+
 pub async fn run(shared: Arc<Shared>, raw_dir: PathBuf) {
-    // Last slot of a gap being recorded in `slots` mode (0: none).
-    let mut backfill_to = 0;
+    let mut progress = Progress::default();
     loop {
-        if let Err(error) = step(&shared, &raw_dir, &mut backfill_to).await {
+        if let Err(error) = step(&shared, &raw_dir, &mut progress).await {
             warn!(error = %format!("{error:#}"), "block pipeline step failed");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
 
-async fn step(shared: &Shared, raw_dir: &Path, backfill_to: &mut u64) -> Result<()> {
+async fn step(shared: &Shared, raw_dir: &Path, progress: &mut Progress) -> Result<()> {
     let tip = shared.confirmed();
     let mut cursor = shared.cursor.load(Ordering::Relaxed);
     if tip == 0 {
@@ -86,7 +106,7 @@ async fn step(shared: &Shared, raw_dir: &Path, backfill_to: &mut u64) -> Result<
     }
     let lag = tip - cursor;
     gauge!("chain_block_lag_slots").set(lag as f64);
-    if lag > shared.cfg.max_lag_slots && *backfill_to < cursor {
+    if lag > shared.cfg.max_lag_slots && progress.backfill_to < cursor {
         // Fell behind: record the gap in `slots` mode (produced or skipped
         // and the leader, one `getBlocks` per range) and resume reading
         // blocks at the tip. Only a gap too wide for that is dropped.
@@ -97,11 +117,8 @@ async fn step(shared: &Shared, raw_dir: &Path, backfill_to: &mut u64) -> Result<
             backfilled,
             "block pipeline fell behind; skipping ahead"
         );
-        if backfilled {
-            counter!("chain_block_backfill_slots_total").increment(lag);
-        } else {
-            counter!("chain_block_gap_slots_total").increment(lag);
-        }
+        // `cursor..=tip`, both ends included.
+        let slots = lag + 1;
         shared
             .store
             .event(
@@ -110,34 +127,78 @@ async fn step(shared: &Shared, raw_dir: &Path, backfill_to: &mut u64) -> Result<
                 kind::GAP,
                 &format!("{cursor}-{tip}"),
                 json!({
-                    "from": cursor, "to": tip, "slots": lag, "backfilled": backfilled,
+                    "from": cursor, "to": tip, "slots": slots, "backfilled": backfilled,
                 }),
             )
             .await?;
+        // Counted once the event is stored: a failed insert retries the step.
+        if backfilled {
+            counter!("chain_block_backfill_slots_total").increment(slots);
+        } else {
+            counter!("chain_block_gap_slots_total").increment(slots);
+        }
         if !backfilled {
             shared.cursor.store(tip, Ordering::Relaxed);
+            progress.anchor = None;
             return Ok(());
         }
-        *backfill_to = tip;
+        progress.backfill_to = tip;
     }
-    let backfilling = cursor <= *backfill_to;
-    let mut end = tip.min(cursor + RANGE - 1);
-    if backfilling {
-        end = end.min(*backfill_to);
+    let backfilling = cursor <= progress.backfill_to;
+    // A slot known to be produced at or past every range asked for: the
+    // tip (`getSlot` answers with a block), or the tip a backfill started at.
+    let upper = if backfilling {
+        progress.backfill_to
+    } else {
+        tip
+    };
+    let anchor = progress.anchor.unwrap_or(cursor).min(cursor);
+    let narrow_end = upper.min(cursor + RANGE - 1);
+    let mut produced = list_blocks(shared, anchor, narrow_end).await?;
+    let widened = produced.range(cursor..).next().is_none() && narrow_end < upper;
+    if widened {
+        // Nothing listed in the range: ask once more up to `upper`. One
+        // reply listing the anchor and a block past the range shows that
+        // the node answering holds all of it, so the slots between were
+        // skipped, however long the outage. (Two separate calls would
+        // prove nothing: another node may answer each.)
+        counter!("chain_block_widened_ranges_total").increment(1);
+        produced = list_blocks(shared, anchor, upper).await?;
     }
-    let listed = shared
-        .rpc
-        .call(
-            "getBlocks",
-            json!([cursor, end, { "commitment": "confirmed" }]),
-        )
-        .await?;
-    let produced = produced_set(&listed);
-    let Some(until) = decided_until(end, tip, &produced) else {
-        // The node that answered is behind the tip: ask again shortly.
+    let end = if widened { upper } else { narrow_end };
+    let exhausted = progress.anchor_misses + 1 >= ANCHOR_ATTEMPTS;
+    let Some(decision) = decide(cursor, end, anchor, widened, exhausted, &produced) else {
+        progress.waits += 1;
+        if !produced.contains(&anchor) {
+            progress.anchor_misses += 1;
+            counter!("chain_block_anchor_missing_total").increment(1);
+        }
+        counter!("chain_block_undecided_waits_total").increment(1);
+        if progress.waits.is_multiple_of(WAIT_WARN_EVERY) {
+            warn!(
+                cursor,
+                tip,
+                anchor,
+                anchor_listed = produced.contains(&anchor),
+                waits = progress.waits,
+                "getBlocks has not listed the slots after the cursor yet; waiting"
+            );
+        }
+        // The node that answered is behind the tip, or does not hold this
+        // part of the ledger: ask again shortly.
         tokio::time::sleep(NOT_YET_WAIT).await;
         return Ok(());
     };
+    if decision.unavailable_below > cursor {
+        warn!(
+            from = cursor,
+            to = decision.unavailable_below - 1,
+            anchor,
+            "getBlocks never listed the anchor; recording the slots before \
+             its first block as unavailable"
+        );
+    }
+    let until = decision.until;
     if let Err(error) = ensure_leaders(shared, cursor, until).await {
         warn!(error = %format!("{error:#}"), "leader schedule unavailable");
     }
@@ -145,9 +206,11 @@ async fn step(shared: &Shared, raw_dir: &Path, backfill_to: &mut u64) -> Result<
     let mut blocks = stream::iter(cursor..=until)
         .map(|slot| {
             let produced = produced.contains(&slot);
+            let known = slot >= decision.unavailable_below;
             async move {
                 let fetched = match (produced, slots_only) {
-                    (false, _) => Fetched::Skipped,
+                    (false, _) if known => Fetched::Skipped,
+                    (false, _) => Fetched::Unavailable,
                     (true, true) => Fetched::Unread,
                     (true, false) => fetch(shared, slot).await,
                 };
@@ -160,7 +223,22 @@ async fn step(shared: &Shared, raw_dir: &Path, backfill_to: &mut u64) -> Result<
         shared.cursor.store(slot + 1, Ordering::Relaxed);
         gauge!("chain_cursor_slot").set(slot as f64);
     }
+    // `until` is a listed slot: the next anchor.
+    progress.anchor = Some(until);
+    progress.anchor_misses = 0;
+    progress.waits = 0;
     Ok(())
+}
+
+async fn list_blocks(shared: &Shared, from: u64, to: u64) -> Result<BTreeSet<u64>> {
+    let listed = shared
+        .rpc
+        .call(
+            "getBlocks",
+            json!([from, to, { "commitment": "confirmed" }]),
+        )
+        .await?;
+    Ok(produced_set(&listed))
 }
 
 /// Slots a `getBlocks` reply lists as produced.
@@ -173,18 +251,48 @@ fn produced_set(listed: &Value) -> BTreeSet<u64> {
         .collect()
 }
 
-/// The last slot of `cursor..=end` that a `getBlocks` reply lets us decide
-/// (`None`: none yet). `getSlot` and `getBlocks` may be answered by different
-/// nodes behind a load balancer, so a slot missing from the list is skipped
-/// only below the newest block the list holds: the tail after it may just be
-/// missing from a node that is behind, and is left for the next step. An
-/// empty list is accepted only once the tip is well past the range.
-fn decided_until(end: u64, tip: u64, produced: &BTreeSet<u64>) -> Option<u64> {
-    match produced.last() {
-        Some(&last) => Some(last.min(end)),
-        None if tip >= end.saturating_add(EMPTY_RANGE_MARGIN) => Some(end),
-        None => None,
-    }
+/// What one `getBlocks(anchor, end)` reply lets the pipeline record.
+#[derive(Debug, PartialEq)]
+struct Decision {
+    /// Record `cursor..=until`; always a listed slot.
+    until: u64,
+    /// Unlisted slots below this are `unavailable`, not skipped (the node
+    /// never showed it holds them); `cursor` when the anchor was listed.
+    unavailable_below: u64,
+}
+
+/// `getSlot` and `getBlocks` may be answered by different nodes behind a
+/// load balancer, and a node lists nothing below its first available slot
+/// or past its own tip, so an unlisted slot is skipped only between two
+/// listed ones: below, the anchor (a slot known produced) must be in the
+/// reply; above, a listed block. The tail after the newest listed block
+/// waits for the next step. `None`: nothing can be decided yet. After
+/// [`ANCHOR_ATTEMPTS`] replies without the anchor (`exhausted`), the slots
+/// below the first listed block are given up as unavailable. A `widened`
+/// reply is decided only up to its first block past the cursor, to keep
+/// one step's work to about a range.
+fn decide(
+    cursor: u64,
+    end: u64,
+    anchor: u64,
+    widened: bool,
+    exhausted: bool,
+    produced: &BTreeSet<u64>,
+) -> Option<Decision> {
+    let mut listed = produced.range(cursor..=end);
+    let first = *listed.next()?;
+    let last = listed.next_back().copied().unwrap_or(first);
+    let unavailable_below = if produced.contains(&anchor) {
+        cursor
+    } else if exhausted {
+        first
+    } else {
+        return None;
+    };
+    Some(Decision {
+        until: if widened { first } else { last },
+        unavailable_below,
+    })
 }
 
 async fn fetch(shared: &Shared, slot: u64) -> Fetched {
@@ -381,12 +489,25 @@ mod tests {
     use crate::rpc::{JsonRpc, RpcError};
     use crate::store::{self, Store};
 
-    /// A JSON-RPC node whose `getBlocks` knows the blocks in `blocks` up to
-    /// `node_tip`, as a node behind the cluster tip would.
+    /// A JSON-RPC node whose `getBlocks` knows the blocks in `blocks` from
+    /// `first_available` (its ledger starts there) up to `node_tip`, as a
+    /// node behind the cluster tip would.
     struct FakeNode {
         blocks: BTreeSet<u64>,
+        first_available: AtomicU64,
         node_tip: AtomicU64,
         get_block_calls: AtomicU64,
+    }
+
+    impl FakeNode {
+        fn new(blocks: impl IntoIterator<Item = u64>, node_tip: u64) -> Arc<Self> {
+            Arc::new(Self {
+                blocks: blocks.into_iter().collect(),
+                first_available: AtomicU64::new(0),
+                node_tip: AtomicU64::new(node_tip),
+                get_block_calls: AtomicU64::new(0),
+            })
+        }
     }
 
     async fn answer(State(node): State<Arc<FakeNode>>, Json(request): Json<Value>) -> Json<Value> {
@@ -397,6 +518,7 @@ mod tests {
                     params[0].as_u64().expect("test setup"),
                     params[1].as_u64().expect("test setup"),
                 );
+                let from = from.max(node.first_available.load(Ordering::Relaxed));
                 let to = to.min(node.node_tip.load(Ordering::Relaxed));
                 json!(
                     node.blocks
@@ -449,31 +571,35 @@ mod tests {
         (shared, dir)
     }
 
-    async fn rows(shared: &Shared, from: u64, to: u64) -> Vec<(u64, SlotStatus)> {
+    async fn records(shared: &Shared, from: u64, to: u64) -> Vec<SlotRecord> {
         shared.store.flush(Duration::from_secs(5));
-        let rows = shared
+        shared
             .store
             .read(move |conn| store::slots(conn, from, to, u32::MAX))
             .await
-            .expect("test setup");
-        rows.into_iter().map(|r| (r.slot, r.status)).collect()
+            .expect("test setup")
+    }
+
+    async fn rows(shared: &Shared, from: u64, to: u64) -> Vec<(u64, SlotStatus)> {
+        records(shared, from, to)
+            .await
+            .into_iter()
+            .map(|r| (r.slot, r.status))
+            .collect()
+    }
+
+    async fn steps(shared: &Shared, dir: &Path, progress: &mut Progress, n: usize) {
+        for _ in 0..n {
+            step(shared, dir, progress).await.expect("test setup");
+        }
     }
 
     #[tokio::test]
     async fn slots_a_lagging_node_has_not_listed_are_not_recorded_skipped() {
-        let node = Arc::new(FakeNode {
-            blocks: BTreeSet::from([1_000, 1_003]),
-            node_tip: AtomicU64::new(1_001),
-            get_block_calls: AtomicU64::new(0),
-        });
+        let node = FakeNode::new([1_000, 1_003], 1_001);
         let (shared, dir) = harness("lagging-node", &node, 1_000, 1_003).await;
-        let mut backfill_to = 0;
-        step(&shared, &dir, &mut backfill_to)
-            .await
-            .expect("test setup");
-        step(&shared, &dir, &mut backfill_to)
-            .await
-            .expect("test setup");
+        let mut progress = Progress::default();
+        steps(&shared, &dir, &mut progress, 2).await;
         // 1_001..=1_003 are past what the node lists: undecided.
         assert_eq!(shared.cursor.load(Ordering::Relaxed), 1_001);
         assert_eq!(
@@ -481,9 +607,7 @@ mod tests {
             vec![(1_000, SlotStatus::Produced)]
         );
         node.node_tip.store(1_003, Ordering::Relaxed);
-        step(&shared, &dir, &mut backfill_to)
-            .await
-            .expect("test setup");
+        steps(&shared, &dir, &mut progress, 1).await;
         assert_eq!(
             rows(&shared, 1_000, 1_003).await,
             vec![
@@ -499,25 +623,18 @@ mod tests {
     #[tokio::test]
     async fn a_gap_is_backfilled_in_slots_mode_then_blocks_are_read_again() {
         let (cursor, tip) = (10_000, 13_500);
-        let node = Arc::new(FakeNode {
-            blocks: (cursor..=tip + 10).filter(|s| s % 2 == 0).collect(),
-            node_tip: AtomicU64::new(tip),
-            get_block_calls: AtomicU64::new(0),
-        });
+        let node = FakeNode::new((cursor..=tip + 10).filter(|s| s % 2 == 0), tip);
         let (shared, dir) = harness("backfill", &node, cursor, tip).await;
-        let mut backfill_to = 0;
-        for _ in 0..10 {
-            step(&shared, &dir, &mut backfill_to)
-                .await
-                .expect("test setup");
-        }
+        let mut progress = Progress::default();
+        steps(&shared, &dir, &mut progress, 10).await;
         assert_eq!(shared.cursor.load(Ordering::Relaxed), tip + 1);
         // Every slot of the gap has a row, without one getBlock.
-        let recorded = rows(&shared, cursor, tip).await;
+        let recorded = records(&shared, cursor, tip).await;
         assert_eq!(recorded.len() as u64, tip - cursor + 1);
-        assert!(recorded.iter().all(|(slot, status)| {
-            *status
-                == if slot % 2 == 0 {
+        assert!(recorded.iter().all(|r| {
+            let produced = r.slot % 2 == 0;
+            r.status
+                == if produced {
                     SlotStatus::Produced
                 } else {
                     SlotStatus::Skipped
@@ -534,14 +651,41 @@ mod tests {
             .find(|e| e.kind == kind::GAP)
             .expect("gap event");
         assert_eq!(gap.detail["backfilled"], json!(true));
+        // `cursor..=tip` inclusive.
+        assert_eq!(gap.detail["slots"], json!(tip - cursor + 1));
         // Past the gap, blocks are read again.
         node.node_tip.store(tip + 2, Ordering::Relaxed);
         shared.confirmed.store(tip + 2, Ordering::Relaxed);
-        step(&shared, &dir, &mut backfill_to)
-            .await
-            .expect("test setup");
+        steps(&shared, &dir, &mut progress, 1).await;
         assert_eq!(node.get_block_calls.load(Ordering::Relaxed), 1);
         assert_eq!(shared.cursor.load(Ordering::Relaxed), tip + 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_gap_whose_event_fails_is_counted_once() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let (cursor, tip) = (10_000, 13_500);
+        let node = FakeNode::new([cursor, tip], tip);
+        let (shared, dir) = harness("gap-event-fails", &node, cursor, tip).await;
+        let db = rusqlite::Connection::open(dir.join("run.db")).expect("test setup");
+        db.execute_batch("ALTER TABLE events RENAME TO events_away")
+            .expect("test setup");
+        let mut progress = Progress::default();
+        for _ in 0..3 {
+            assert!(step(&shared, &dir, &mut progress).await.is_err());
+        }
+        db.execute_batch("ALTER TABLE events_away RENAME TO events")
+            .expect("test setup");
+        steps(&shared, &dir, &mut progress, 1).await;
+        let counted = handle
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix("chain_block_backfill_slots_total "))
+            .map(str::to_owned);
+        assert_eq!(counted, Some((tip - cursor + 1).to_string()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -553,29 +697,124 @@ mod tests {
         .into())
     }
 
-    #[test]
-    fn a_tail_missing_from_get_blocks_waits_for_the_next_step() {
-        // getSlot says 1_003, the getBlocks node only has up to 1_000.
-        let produced = produced_set(&json!([998, 1_000]));
-        assert_eq!(decided_until(1_003, 1_003, &produced), Some(1_000));
-        // Next step (cursor 1_001): that node is still behind, nothing listed.
-        let empty = produced_set(&json!([]));
-        assert_eq!(decided_until(1_003, 1_003, &empty), None);
-        assert_eq!(
-            decided_until(1_003, 1_003 + EMPTY_RANGE_MARGIN - 1, &empty),
-            None
+    #[tokio::test]
+    async fn a_range_below_the_nodes_ledger_is_not_recorded_skipped() {
+        // Backfilling 10_000..=13_500 against a node restarted from a
+        // snapshot at 12_000: it lists nothing below that.
+        let (cursor, tip) = (10_000, 13_500);
+        let node = FakeNode::new((cursor..=tip).filter(|s| s % 2 == 0), tip);
+        node.first_available.store(12_000, Ordering::Relaxed);
+        let (shared, dir) = harness("first-available", &node, cursor, tip).await;
+        let mut progress = Progress::default();
+        steps(&shared, &dir, &mut progress, ANCHOR_ATTEMPTS as usize - 1).await;
+        // The anchor (10_000) is never listed: nothing decided yet.
+        assert_eq!(shared.cursor.load(Ordering::Relaxed), cursor);
+        assert_eq!(rows(&shared, cursor, tip).await, vec![]);
+        // Given up: unavailable below the node's first block, not skipped.
+        steps(&shared, &dir, &mut progress, 1).await;
+        let recorded = rows(&shared, cursor, tip).await;
+        assert_eq!(recorded.len(), 2_001);
+        assert!(
+            recorded[..2_000]
+                .iter()
+                .all(|(_, status)| *status == SlotStatus::Unavailable)
         );
-        // It caught up: 1_001 and 1_002 were skipped, 1_003 produced.
-        let produced = produced_set(&json!([1_003]));
-        assert_eq!(decided_until(1_003, 1_004, &produced), Some(1_003));
+        assert_eq!(recorded[2_000], (12_000, SlotStatus::Produced));
+        // From there the node holds the ledger: skips are real again.
+        steps(&shared, &dir, &mut progress, 1).await;
+        assert_eq!(
+            rows(&shared, 12_001, 12_002).await,
+            vec![
+                (12_001, SlotStatus::Skipped),
+                (12_002, SlotStatus::Produced)
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_empty_range_from_a_node_far_behind_is_not_recorded_skipped() {
+        // The tip is 2_000 slots past the range, but the node answering
+        // getBlocks is at 1_200 and has not seen the block at 1_300.
+        let node = FakeNode::new([1_000, 1_300, 3_000], 1_200);
+        let (shared, dir) = harness("far-behind", &node, 1_000, 3_000).await;
+        let mut progress = Progress::default();
+        steps(&shared, &dir, &mut progress, 3).await;
+        assert_eq!(shared.cursor.load(Ordering::Relaxed), 1_001);
+        assert_eq!(
+            rows(&shared, 1_000, 3_000).await,
+            vec![(1_000, SlotStatus::Produced)]
+        );
+        node.node_tip.store(3_000, Ordering::Relaxed);
+        steps(&shared, &dir, &mut progress, 1).await;
+        let recorded = rows(&shared, 1_000, 1_300).await;
+        assert_eq!(recorded.len(), 301);
+        assert_eq!(recorded[300], (1_300, SlotStatus::Produced));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_outage_longer_than_a_range_is_decided_as_soon_as_blocks_resume() {
+        // 699 skipped slots, then blocks again; the tip only 5 past them.
+        let node = FakeNode::new([1_000, 1_700, 1_705], 1_705);
+        let (shared, dir) = harness("outage", &node, 1_000, 1_705).await;
+        let mut progress = Progress::default();
+        steps(&shared, &dir, &mut progress, 3).await;
+        assert_eq!(progress.waits, 0);
+        assert_eq!(shared.cursor.load(Ordering::Relaxed), 1_706);
+        let recorded = rows(&shared, 1_000, 1_705).await;
+        assert_eq!(recorded.len(), 706);
+        assert!(recorded.iter().all(|(slot, status)| {
+            *status
+                == if [1_000, 1_700, 1_705].contains(slot) {
+                    SlotStatus::Produced
+                } else {
+                    SlotStatus::Skipped
+                }
+        }));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn an_empty_range_is_skipped_once_the_tip_is_well_past_it() {
-        let empty = produced_set(&json!([]));
+    fn a_reply_is_decided_only_between_the_anchor_and_a_listed_block() {
+        let set = |slots: &[u64]| produced_set(&json!(slots));
+        // Anchor listed: up to the newest listed block; the tail waits.
         assert_eq!(
-            decided_until(1_499, 1_499 + EMPTY_RANGE_MARGIN, &empty),
-            Some(1_499)
+            decide(1_001, 1_003, 1_000, false, false, &set(&[1_000, 1_002])),
+            Some(Decision {
+                until: 1_002,
+                unavailable_below: 1_001
+            })
+        );
+        // Nothing listed after the cursor: undecided, however far the tip.
+        assert_eq!(
+            decide(1_001, 1_500, 1_000, false, false, &set(&[1_000])),
+            None
+        );
+        // Anchor missing: undecided until the attempts run out.
+        let no_anchor = set(&[1_200, 1_300]);
+        assert_eq!(decide(1_001, 1_500, 1_000, false, false, &no_anchor), None);
+        assert_eq!(
+            decide(1_001, 1_500, 1_000, false, true, &no_anchor),
+            Some(Decision {
+                until: 1_300,
+                unavailable_below: 1_200
+            })
+        );
+        // A widened reply: up to its first block only.
+        assert_eq!(
+            decide(
+                1_001,
+                5_000,
+                1_000,
+                true,
+                false,
+                &set(&[1_000, 1_700, 1_705])
+            ),
+            Some(Decision {
+                until: 1_700,
+                unavailable_below: 1_001
+            })
         );
         assert_eq!(produced_set(&Value::Null), BTreeSet::new());
     }
