@@ -244,24 +244,22 @@ impl ManifestOrchestrator {
                     )
                     .await?;
                 let (bid, ask) = straddle(params.mid_price, params.spread_bps)?;
-                let place_orders = self
-                    .client
-                    .place_orders(
-                        params.market,
-                        &[
-                            OrderSpec {
-                                side: Side::Bid,
-                                price: bid,
-                                base_amount: params.order_size,
-                            },
-                            OrderSpec {
-                                side: Side::Ask,
-                                price: ask,
-                                base_amount: params.order_size,
-                            },
-                        ],
-                    )
-                    .await?;
+                let orders = [
+                    OrderSpec {
+                        side: Side::Bid,
+                        price: bid,
+                        base_amount: params.order_size,
+                    },
+                    OrderSpec {
+                        side: Side::Ask,
+                        price: ask,
+                        base_amount: params.order_size,
+                    },
+                ];
+                let place_orders = self.client.place_orders(params.market, &orders).await?;
+                // The client trims what the seat cannot fund; the flow asked
+                // for exactly these orders, so a smaller book is a failure.
+                ensure_all_placed(&orders, &place_orders.placed)?;
                 let swap_exact_in = self
                     .client
                     .swap_exact_in(SwapExactInParams {
@@ -445,6 +443,31 @@ fn validate_user_flow_params(params: UserFlowParams) -> Result<()> {
     Ok(())
 }
 
+/// Fail unless `placed` is `requested` order for order at full size.
+fn ensure_all_placed(requested: &[OrderSpec], placed: &[OrderSpec]) -> Result<()> {
+    let same = requested.len() == placed.len()
+        && requested.iter().zip(placed).all(|(asked, sent)| {
+            asked.side == sent.side
+                && asked.price == sent.price
+                && asked.base_amount == sent.base_amount
+        });
+    if same {
+        return Ok(());
+    }
+    let sizes = |orders: &[OrderSpec]| {
+        orders
+            .iter()
+            .map(|o| format!("{:?} {}@{}", o.side, o.base_amount, o.price))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(OrchestrationError::OrdersTrimmed(format!(
+        "asked for [{}], the seat funded [{}]",
+        sizes(requested),
+        sizes(placed)
+    )))
+}
+
 #[derive(Debug, Error)]
 pub enum OrchestrationError {
     #[error("invalid orchestration input: {0}")]
@@ -459,6 +482,8 @@ pub enum OrchestrationError {
     Funding(#[from] FundingError),
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    #[error("orders were trimmed to the seat's balance: {0}")]
+    OrdersTrimmed(String),
 }
 
 #[cfg(test)]
@@ -480,6 +505,35 @@ mod tests {
             exact_in_amount: Decimal::from(10),
             exact_out_amount: Decimal::from(5),
         }
+    }
+
+    #[test]
+    fn a_trimmed_or_dropped_order_fails_the_flow() {
+        let order = |side, base: Decimal| OrderSpec {
+            side,
+            price: Decimal::ONE,
+            base_amount: base,
+        };
+        let asked = [
+            order(Side::Bid, Decimal::from(100)),
+            order(Side::Ask, Decimal::from(100)),
+        ];
+        assert!(ensure_all_placed(&asked, &asked).is_ok());
+        // The same size at a different scale is not a trim.
+        let rescaled = [
+            order(Side::Bid, Decimal::new(100_000_000, 6)),
+            order(Side::Ask, Decimal::from(100)),
+        ];
+        assert!(ensure_all_placed(&asked, &rescaled).is_ok());
+        let shrunk = [
+            order(Side::Bid, Decimal::new(99_999_999, 6)),
+            order(Side::Ask, Decimal::from(100)),
+        ];
+        assert!(matches!(
+            ensure_all_placed(&asked, &shrunk),
+            Err(OrchestrationError::OrdersTrimmed(_))
+        ));
+        assert!(ensure_all_placed(&asked, &asked[1..]).is_err());
     }
 
     #[test]

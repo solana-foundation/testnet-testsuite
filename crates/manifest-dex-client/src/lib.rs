@@ -603,7 +603,9 @@ impl ManifestClient {
     }
 
     /// Place resting limit orders funded from the payer's seat balance.
-    /// Orders the seat cannot fund are trimmed (see [`replace_orders_with`]).
+    /// Orders the seat cannot fund are trimmed, not refused (see
+    /// [`replace_orders_with`]): a caller that needs every order as asked
+    /// must compare [`OrdersOutcome::placed`] with `orders`.
     ///
     /// [`replace_orders_with`]: Self::replace_orders_with
     pub async fn place_orders(
@@ -618,7 +620,9 @@ impl ManifestClient {
 
     /// Cancel every resting order of the payer's seat and place `orders`, in
     /// one atomic `BatchUpdate` so the book never shows a gap. Orders the
-    /// seat cannot fund are trimmed (see [`replace_orders_with`]).
+    /// seat cannot fund are trimmed, not refused (see
+    /// [`replace_orders_with`]): compare [`OrdersOutcome::placed`] with
+    /// `orders` to detect it.
     ///
     /// [`replace_orders_with`]: Self::replace_orders_with
     pub async fn replace_orders(
@@ -1292,6 +1296,11 @@ where
         (vec![], (seat.base_withdrawable, seat.quote_withdrawable))
     };
     let fitted = fit_orders(&params, base_budget, quote_budget)?;
+    let first = (
+        params[0].price_mantissa,
+        params[0].price_exponent,
+        params[0].base_atoms,
+    );
     let mut orders = Vec::with_capacity(params.len());
     let mut placed = Vec::with_capacity(params.len());
     for ((mut param, spec), base_atoms) in params.into_iter().zip(&requested).zip(fitted) {
@@ -1313,13 +1322,23 @@ where
         });
     }
     if orders.is_empty() && cancels.is_empty() {
-        let (mint, available) = match requested[0].side {
-            Side::Bid => (book.quote_mint, quote_budget),
-            Side::Ask => (book.base_mint, base_budget),
+        // Report what the first requested order alone needs.
+        let (mantissa, exponent, base_atoms) = first;
+        let (mint, required, available) = match requested[0].side {
+            Side::Bid => {
+                let price = book::price_raw(mantissa, exponent).map_err(quote_error)?;
+                let lock = book::locked_quote_atoms(price, base_atoms).map_err(quote_error)?;
+                (
+                    book.quote_mint,
+                    lock.saturating_add(BID_MARGIN_ATOMS),
+                    quote_budget,
+                )
+            }
+            Side::Ask => (book.base_mint, base_atoms, base_budget),
         };
         return Err(ManifestError::InsufficientBalance {
             mint,
-            required: available.saturating_add(1),
+            required,
             available,
         });
     }
@@ -2002,9 +2021,15 @@ mod batch_tests {
             vec![],
             10,
         );
+        // It names what the order needs: 0.01 base at 0.5 locks 5_000
+        // quote, plus the margin atom (not "one more than available").
         assert!(matches!(
             plan_batch(&empty, trader, &build, true),
-            Err(ManifestError::InsufficientBalance { .. })
+            Err(ManifestError::InsufficientBalance {
+                required: 5_001,
+                available: 0,
+                ..
+            })
         ));
     }
 
