@@ -45,3 +45,4 @@ raydium-clmm-client = { workspace = true }
 rust_decimal = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-signer = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

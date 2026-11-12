@@ -42,9 +42,18 @@ What changed relative to the design below:
   atom on Surfpool for direct splits, 2-hop bridges, and exact-out. The
   ws/geyser cache (and CLMM tick-window subscriptions) is the latency step
   that replaces the per-request fetch later; `mtm-market-state` from the stash
-  is parked until then. Meanwhile snapshots are shared: `snapshot_ttl_ms`
-  (default 400 ms) reuses a pool's snapshot across quotes, concurrent quotes
-  share one in-flight load, and the book holds `Arc` references.
+  is parked until then. Meanwhile snapshots are cached and shared: a pool's
+  snapshot is fresh for `snapshot_ttl_ms` (default 400 ms) after its load
+  completes; past that, quotes keep using it while one background refresh
+  runs (stale-while-revalidate), up to `snapshot_max_age_ms` (3 s), beyond
+  which the pool is left out of the quote. Loads run detached from the
+  request that triggered them, are bounded by `snapshot_load_timeout_ms`
+  (2 s, also the quote-path RPC client's HTTP timeout), and a failure is
+  reused for one TTL; a quote waits at most `snapshot_wait_ms` (1 s) for a
+  pool with no usable snapshot. The slot (`state_slot`) and the blockhash
+  come from a background refresher (`chain_tip_refresh_ms`, 400 ms); once
+  that value is older than `chain_tip_max_age_ms` (5 s) quotes answer 502.
+  No quote issues an RPC call of its own. The book holds `Arc` references.
 - **Venue trait (§3)** is `mtm_venues::PoolSnapshot` (enum dispatch over the
   three snapshots) plus the engine's `QuoteSource` trait, which lets the
   planner's unit tests run on a constant-product mock.
@@ -393,8 +402,9 @@ shape doesn't change.
   `auto_promote` config, junk-market test fixtures. In lieu of ALTs, assembly
   enforced a hard 1232-byte serialize guard (superseded by transaction v1).
   Geyser backend and quote cache deferred: no geyser endpoint on our testnet
-  infra yet, and quoting is pure in-memory math over pushed state — there is
-  no RPC call to cache until that changes.
+  infra yet. (As built, snapshots are RPC loads cached with
+  stale-while-revalidate, and the slot/blockhash come from a background
+  refresher; see "What changed" above.)
 - **M2.5 — three deployed venues** _(done, 2026-10-10)_: Raydium CLMM, Orca
   Whirlpool, and Manifest via venue snapshots; discriminator discovery with
   probe vetting; transaction v1 with fitting to its limits; Jupiter-fork

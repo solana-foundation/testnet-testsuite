@@ -106,8 +106,8 @@ fn execution_label(execution: Execution) -> &'static str {
     }
 }
 
-/// Time a whole request (planning, fitting, assembly, and the blockhash
-/// fetch) and count its errors by status.
+/// Time a whole request (planning, fitting, and assembly) and count its
+/// errors by status.
 async fn observed<T>(
     endpoint: &'static str,
     execution: Execution,
@@ -174,9 +174,7 @@ async fn fitted(
         .map_err(assembly_error)?;
         match assemble::check_fits(state, user, &assembled) {
             Ok(()) => {
-                let tx = assemble::route_tx(state, user, &assembled)
-                    .await
-                    .map_err(assembly_error)?;
+                let tx = assemble::route_tx(state, user, &assembled).map_err(assembly_error)?;
                 return Ok((planned, assembled, tx));
             }
             Err(error) if assemble::is_oversized(&error) => {

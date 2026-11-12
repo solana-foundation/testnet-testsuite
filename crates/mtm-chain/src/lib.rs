@@ -88,6 +88,23 @@ impl ChainClient {
         })
     }
 
+    /// Like [`ChainClient::new`], but every RPC request fails after `timeout`
+    /// instead of the HTTP client's 30 s default.
+    pub fn with_timeout(
+        http_url: impl Into<String>,
+        commitment: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        let commitment = parse_commitment(commitment)?;
+        Ok(Self {
+            rpc: Arc::new(RpcClient::new_with_timeout_and_commitment(
+                http_url.into(),
+                timeout,
+                commitment,
+            )),
+        })
+    }
+
     pub fn rpc(&self) -> &RpcClient {
         &self.rpc
     }

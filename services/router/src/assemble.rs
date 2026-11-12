@@ -312,18 +312,14 @@ pub fn check_fits(state: &AppState, user: &Pubkey, assembled: &Assembled) -> any
 }
 
 /// Full unsigned v1 transaction (wincode wire format, base64): the route's
-/// instructions with the compute budget in the message config.
-pub async fn route_tx(
-    state: &AppState,
-    user: &Pubkey,
-    assembled: &Assembled,
-) -> anyhow::Result<String> {
+/// instructions with the compute budget in the message config, on the
+/// cached blockhash (no RPC; 502 when the cache is too old).
+pub fn route_tx(state: &AppState, user: &Pubkey, assembled: &Assembled) -> anyhow::Result<String> {
     let blockhash = state
-        .chain
-        .rpc()
-        .get_latest_blockhash()
-        .await
-        .map_err(|error| AssemblyFault::Rpc(format!("fetching blockhash: {error}")))?;
+        .tip
+        .current()
+        .map_err(|error| AssemblyFault::Rpc(format!("blockhash: {error}")))?
+        .blockhash;
     let tx = compile_v1(
         user,
         &assembled.instructions,

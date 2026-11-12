@@ -157,6 +157,13 @@ listen_addr = "127.0.0.1:8081"
 metrics_addr = "127.0.0.1:9101"
 # Intermediate mints for 2-hop routes, e.g. the bootstrap USDC mint.
 bridge_mints = []
+# Snapshot cache and chain tip (defaults shown; see RouterConfig):
+# snapshot_ttl_ms = 400            # fresh window after a load completes
+# snapshot_max_age_ms = 3000       # never plan on an older snapshot
+# snapshot_load_timeout_ms = 2000  # per load, and quote-path RPC timeout
+# snapshot_wait_ms = 1000          # max wait for a pool with no snapshot
+# chain_tip_refresh_ms = 400       # background slot/blockhash refresh
+# chain_tip_max_age_ms = 5000      # 502 once the cached tip is older
 
 # Program IDs of the deployed DEX forks. Set per environment, e.g.
 # MTM_ROUTER__PROGRAMS__RAYDIUM_CLMM / __ORCA_WHIRLPOOL / __MANIFEST

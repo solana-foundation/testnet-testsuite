@@ -38,12 +38,37 @@ pub struct RouterConfig {
     /// intermediate mints multi-hop routes may pass through
     #[serde(default)]
     pub bridge_mints: Vec<String>,
-    /// Reuse a pool snapshot across quotes for this long (default 400 ms,
-    /// about one slot; 0 = a fresh load per quote). Concurrent quotes always
-    /// share an in-flight load. Without reuse every quote reloads every
-    /// candidate pool: ~900 quotes/s averaged 5 s per quote in load tests.
+    /// A pool snapshot is fresh for this long after its load completed
+    /// (default 400 ms, about one slot). Past it, the next quote starts a
+    /// background refresh and quotes keep using the previous snapshot until
+    /// `snapshot_max_age_ms`. Concurrent quotes always share one load.
+    /// Without reuse every quote reloads every candidate pool: ~900 quotes/s
+    /// averaged 5 s per quote in load tests.
     #[serde(default = "default_snapshot_ttl_ms")]
     pub snapshot_ttl_ms: u64,
+    /// Hard bound on snapshot age when a quote is planned: an older pool is
+    /// left out of that quote. Keep it above `snapshot_ttl_ms +
+    /// snapshot_load_timeout_ms` so a slow refresh does not drop pools.
+    #[serde(default = "default_snapshot_max_age_ms")]
+    pub snapshot_max_age_ms: u64,
+    /// Each snapshot load is abandoned after this long (and the failure
+    /// reused for one TTL); also the per-request HTTP timeout of the RPC
+    /// client used on the quote path. Keep it well below
+    /// `request_timeout_ms`.
+    #[serde(default = "default_snapshot_load_timeout_ms")]
+    pub snapshot_load_timeout_ms: u64,
+    /// Longest a quote waits for a pool with no usable snapshot; the pool
+    /// is left out of that quote after it (its load keeps running).
+    #[serde(default = "default_snapshot_wait_ms")]
+    pub snapshot_wait_ms: u64,
+    /// How often the background task refreshes the slot and blockhash that
+    /// quotes report and transactions are built on.
+    #[serde(default = "default_chain_tip_refresh_ms")]
+    pub chain_tip_refresh_ms: u64,
+    /// Quotes needing the slot or blockhash answer 502 once the cached
+    /// value is older than this (the refresher keeps failing).
+    #[serde(default = "default_chain_tip_max_age_ms")]
+    pub chain_tip_max_age_ms: u64,
     /// A request still running after this long is answered 408, so slow RPC
     /// cannot pile requests up without bound.
     #[serde(default = "default_request_timeout_ms")]
@@ -113,6 +138,21 @@ fn default_max_concurrent_requests() -> usize {
 }
 fn default_snapshot_ttl_ms() -> u64 {
     400
+}
+fn default_snapshot_max_age_ms() -> u64 {
+    3_000
+}
+fn default_snapshot_load_timeout_ms() -> u64 {
+    2_000
+}
+fn default_snapshot_wait_ms() -> u64 {
+    1_000
+}
+fn default_chain_tip_refresh_ms() -> u64 {
+    400
+}
+fn default_chain_tip_max_age_ms() -> u64 {
+    5_000
 }
 fn default_cu_margin() -> u32 {
     50_000

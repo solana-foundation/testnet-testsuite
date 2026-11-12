@@ -80,8 +80,9 @@ pub struct QuoteResponse {
     /// not computed yet: always 0
     pub price_impact_bps: u32,
     pub route: Vec<RouteLeg>,
-    /// slot the router observed when it planned the quote; pool snapshots
-    /// can be up to the router's `snapshot_ttl_ms` older than this
+    /// slot of the router's cached chain tip when it planned the quote (up
+    /// to its `chain_tip_max_age_ms` old); pool snapshots are loaded
+    /// separately and can be up to its `snapshot_max_age_ms` old
     pub state_slot: u64,
     /// compute units the route is expected to consume: the legs' estimates
     /// plus aggregator overhead for `jupiter` execution (no margin)
