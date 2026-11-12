@@ -26,6 +26,9 @@ use solana_keypair::Keypair;
 use solana_message::VersionedMessage;
 use solana_message::v1::{self, TransactionConfig};
 use solana_pubkey::Pubkey;
+use solana_rpc_client_api::client_error::{Error as ClientError, ErrorKind as ClientErrorKind};
+use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED;
+use solana_rpc_client_api::request::RpcError;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use tracing::{debug, info, warn};
@@ -389,7 +392,11 @@ impl<'s> Searcher<'s> {
                 // fee is still paid.
                 debug!(%signature, %error, route = ?route, "cycle reverted on-chain");
                 status("reverted");
-                self.account(bot, &touched, &before, slot, prices).await?;
+                // Counted once, as reverted: an accounting failure only
+                // loses the fee.
+                if let Err(error) = self.account(bot, &touched, &before, slot, prices).await {
+                    warn!(bot = %bot.config.name, %signature, error = %format!("{error:#}"), "reverted cycle not accounted");
+                }
                 return Ok(());
             }
             Err(error) => {
@@ -433,7 +440,9 @@ impl<'s> Searcher<'s> {
         prices: &PriceBook,
     ) -> Result<(Decimal, u64)> {
         let owner = bot.wallet.pubkey();
-        let after = wallet_balances(&self.chain, &owner, touched, Some(slot)).await?;
+        let after =
+            until_slot_reached(|| wallet_balances(&self.chain, &owner, touched, Some(slot)))
+                .await?;
         let mut realized_usd = Decimal::ZERO;
         for ((token, was), now) in touched.iter().zip(&before.tokens).zip(&after.tokens) {
             let delta = to_ui(token, *now) - to_ui(token, *was);
@@ -481,6 +490,42 @@ impl<'s> Searcher<'s> {
             })
             .collect()
     }
+}
+
+/// Retries of a read pinned to a slot the node has not reached yet.
+const MIN_SLOT_RETRIES: u32 = 5;
+const MIN_SLOT_RETRY_DELAY: Duration = Duration::from_millis(400);
+
+/// Run a read pinned with `min_context_slot`, retrying while the node
+/// answers that it has not reached the slot (a load-balanced RPC can lag
+/// the node that reported the status).
+async fn until_slot_reached<T, F, Fut>(mut read: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut retries = 0;
+    loop {
+        match read().await {
+            Err(error) if retries < MIN_SLOT_RETRIES && is_min_context_slot_not_reached(&error) => {
+                retries += 1;
+                tokio::time::sleep(MIN_SLOT_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_min_context_slot_not_reached(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<ClientError>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. })
+                    if *code == JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED
+            )
+        })
+    })
 }
 
 /// Directed edges `(pool, input, output)` over every loaded pool.
@@ -761,5 +806,54 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn min_slot_error() -> anyhow::Error {
+        anyhow::Error::new(ClientError::from(RpcError::RpcResponseError {
+            code: JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
+            message: "Minimum context slot has not been reached".to_owned(),
+            data: solana_rpc_client_api::request::RpcResponseErrorData::Empty,
+        }))
+        .context("reading wallet balances")
+    }
+
+    #[test]
+    fn recognizes_a_min_context_slot_rejection() {
+        assert!(is_min_context_slot_not_reached(&min_slot_error()));
+        assert!(!is_min_context_slot_not_reached(&anyhow::anyhow!("other")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pinned_reads_retry_until_the_node_reaches_the_slot() {
+        let attempts = std::cell::Cell::new(0);
+        let read = || {
+            attempts.set(attempts.get() + 1);
+            let lagging = attempts.get() < 3;
+            async move {
+                if lagging {
+                    Err(min_slot_error())
+                } else {
+                    Ok(7)
+                }
+            }
+        };
+        assert_eq!(until_slot_reached(read).await.expect("reached"), 7);
+        assert_eq!(attempts.get(), 3);
+
+        // Other errors are not retried; a node that never catches up is.
+        attempts.set(0);
+        let failing = || {
+            attempts.set(attempts.get() + 1);
+            async { Err::<u64, _>(anyhow::anyhow!("boom")) }
+        };
+        assert!(until_slot_reached(failing).await.is_err());
+        assert_eq!(attempts.get(), 1);
+        attempts.set(0);
+        let behind = || {
+            attempts.set(attempts.get() + 1);
+            async { Err::<u64, _>(min_slot_error()) }
+        };
+        assert!(until_slot_reached(behind).await.is_err());
+        assert_eq!(attempts.get(), 1 + MIN_SLOT_RETRIES);
     }
 }
