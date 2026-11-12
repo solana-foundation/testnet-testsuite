@@ -11,6 +11,7 @@
 
 mod pnl;
 mod rpc;
+mod settle;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,10 +67,23 @@ enum Command {
         timeout_s: u64,
     },
     /// Record every participant's holdings (wallet, seats, LP positions) and
-    /// the oracle prices, for `report`.
+    /// the oracle prices, for `report`. With participants frozen, wait first
+    /// for their in-flight transactions to land (`--settle-blocks`,
+    /// `--settle-s`); prices and holdings are read after the wait.
     Snapshot {
         #[arg(long)]
         out: PathBuf,
+        /// Wait until the block height has advanced this many blocks (150:
+        /// a blockhash's lifetime). 0: wait `--settle-s` instead.
+        #[arg(long, default_value_t = 0)]
+        settle_blocks: u64,
+        /// Wall-clock wait when `--settle-blocks` is 0 or the block height
+        /// cannot be read.
+        #[arg(long, default_value_t = 0)]
+        settle_s: u64,
+        /// Fail if `--settle-blocks` blocks have not passed after this long.
+        #[arg(long, default_value_t = settle::DEFAULT_TIMEOUT.as_secs())]
+        settle_timeout_s: u64,
     },
     /// PnL, transactions, and trades per participant between two snapshots.
     Report {
@@ -138,12 +152,28 @@ async fn main() -> Result<()> {
         }
         Command::Status => status(&chain, &scenario).await?,
         Command::WaitPrices { timeout_s } => wait_prices(&scenario, timeout_s).await?,
-        Command::Snapshot { out } => {
+        Command::Snapshot {
+            out,
+            settle_blocks,
+            settle_s,
+            settle_timeout_s,
+        } => {
+            let settled = settle::settle(
+                || async { Ok(chain.rpc().get_block_height().await?) },
+                settle_blocks,
+                std::time::Duration::from_secs(settle_s),
+                std::time::Duration::from_secs(settle_timeout_s),
+                settle::POLL,
+            )
+            .await?;
             let snapshot = pnl::snapshot(&chain, &rpc, &scenario).await?;
             // Compact: at tens of thousands of participants a pretty
             // snapshot is several MB of whitespace.
             std::fs::write(&out, serde_json::to_vec(&snapshot)?)?;
-            json!({ "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len() })
+            json!({
+                "out": out, "slot": snapshot.slot, "participants": snapshot.participants.len(),
+                "settle": { "blocks": settled.blocks, "waitedMs": settled.waited.as_millis() as u64 },
+            })
         }
         Command::Report {
             start,

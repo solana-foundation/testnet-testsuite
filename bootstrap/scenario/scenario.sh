@@ -362,13 +362,18 @@ case "$cmd" in
       done
     }
     # Let in-flight transactions land before reading. A local validator
-    # settles in a slot or two; a testnet RPC node keeps rebroadcasting
-    # until the blockhash expires (60-90 s).
-    settle="${SCENARIO_SETTLE_S:-$([[ "$target" == testnet ]] && echo 90 || echo 3)}"
+    # settles in a slot or two; a remote RPC node keeps rebroadcasting until
+    # the blockhash expires, 150 blocks on: wait for those blocks (however
+    # long a slow cluster takes, up to SCENARIO_SETTLE_TIMEOUT_S), with
+    # SCENARIO_SETTLE_S of wall-clock time as the fallback.
+    remote=$([[ "$target" == local ]] && echo false || echo true)
+    settle_s="${SCENARIO_SETTLE_S:-$($remote && echo 90 || echo 3)}"
+    settle_blocks="${SCENARIO_SETTLE_BLOCKS:-$($remote && echo 150 || echo 0)}"
+    settle_timeout_s="${SCENARIO_SETTLE_TIMEOUT_S:-300}"
     frozen_snapshot() {
       signal STOP
-      sleep "$settle"
-      "$bin/scenario" snapshot --out "$1" >&2 || { signal CONT; return 1; }
+      "$bin/scenario" snapshot --out "$1" --settle-blocks "$settle_blocks" \
+        --settle-s "$settle_s" --settle-timeout-s "$settle_timeout_s" >&2 || { signal CONT; return 1; }
     }
     trap 'signal CONT' EXIT
     frozen_snapshot "$runs/$name-t0.json"

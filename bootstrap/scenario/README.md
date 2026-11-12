@@ -211,10 +211,14 @@ bootstrap crawls at ~2 TPS.
 `measure` freezes flow, arb, and mm (`SIGSTOP`) while each snapshot reads,
 so every wallet, seat, and position is read in one chain state; without it,
 heavy flow moves value between participants mid-read and PnL stops summing
-to (minus) the protocol fees. Before each snapshot it waits
-`SCENARIO_SETTLE_S` for in-flight transactions to land: 3 s locally, 90 s on
-testnet, where the RPC node rebroadcasts until the blockhash expires. They
-stay frozen through the report, whose block scan would otherwise compete
+to (minus) the protocol fees. Before each snapshot reads (prices and
+holdings both come after the wait) it lets in-flight transactions land:
+3 s (`SCENARIO_SETTLE_S`) locally; on a remote cluster, where the RPC node
+rebroadcasts until the blockhash expires, until the block height has
+advanced `SCENARIO_SETTLE_BLOCKS` (150, a blockhash's lifetime) however
+long that takes, failing after `SCENARIO_SETTLE_TIMEOUT_S` (300) and
+falling back to `SCENARIO_SETTLE_S` (90) of wall-clock time when the block
+height cannot be read. They stay frozen through the report, whose block scan would otherwise compete
 with flow for connections. `sample.py` records per-service CPU/RSS (from
 `.scenario/pids`), machine CPU, validator TPS (`getTransactionCount`), slot
 rate, and RPC latency; against a shared cluster that TPS is network-wide
