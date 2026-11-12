@@ -128,18 +128,32 @@ impl Ctx {
         }
     }
 
-    /// Register this maker's action series at zero: `increase()` cannot see
-    /// the first increment of a series that appears mid-window, so a
-    /// report would miss each maker's first action of every kind.
+    /// Register this maker's action and error series at zero: `increase()`
+    /// cannot see the first increment of a series that appears mid-window,
+    /// so a report would miss each maker's first action (or failure) of
+    /// every kind.
     pub fn register_actions(&self) {
         let actions: &[&'static str] = match self.maker.strategy {
-            Strategy::ClobLadder { .. } => &["requote", "pull", "hedge"],
+            Strategy::ClobLadder { .. } => &[
+                "requote",
+                "requote_trimmed",
+                "requote_empty",
+                "pull",
+                "hedge",
+            ],
             Strategy::ClmmRange { .. } => &["open", "close", "hedge"],
             Strategy::PoolArb { .. } => &["arb_buy", "arb_sell", "hedge"],
         };
         for action in actions {
             counter!("mm_actions_total", "maker" => self.name(), "venue" => self.maker.venue.as_str(), "action" => *action)
                 .absolute(0);
+        }
+        let stages: &[&'static str] = match self.maker.strategy {
+            Strategy::ClobLadder { .. } => &["setup", "tick", "hedge", "deposit"],
+            _ => &["setup", "tick", "hedge"],
+        };
+        for stage in stages {
+            counter!("mm_errors_total", "maker" => self.name(), "stage" => *stage).absolute(0);
         }
     }
 
