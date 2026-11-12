@@ -111,7 +111,8 @@ pub fn check(ctx: &Ctx, prices: &PriceBook, held: Inventory) -> Result<Option<Pl
 
 /// Burn the sold side from the maker's wallet and mint the bought side into
 /// it, in one transaction (the maker pays, the mint authority co-signs).
-pub async fn execute(ctx: &Ctx, plan: &Plan) -> Result<()> {
+/// Returns the slot it confirmed in (`None` when too small to send).
+pub async fn execute(ctx: &Ctx, plan: &Plan) -> Result<Option<u64>> {
     let (_, authority) = ctx.hedger.as_ref().context("hedging is off")?;
     let (sold, bought) = if plan.sell_base {
         (&ctx.base, &ctx.quote)
@@ -122,7 +123,7 @@ pub async fn execute(ctx: &Ctx, plan: &Plan) -> Result<()> {
     let sell_atoms = to_atoms(sold, plan.sell).context("hedge size overflow")?;
     let buy_atoms = to_atoms(bought, plan.buy).context("hedge size overflow")?;
     if sell_atoms == 0 || buy_atoms == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let instructions = vec![
         spl::create_associated_token_account_idempotent(
@@ -152,7 +153,8 @@ pub async fn execute(ctx: &Ctx, plan: &Plan) -> Result<()> {
         compute_unit_limit: 60_000,
         ..SubmissionConfig::default()
     };
-    ctx.chain
+    let submitted = ctx
+        .chain
         .submit(
             instructions,
             ctx.wallet.as_ref(),
@@ -181,7 +183,45 @@ pub async fn execute(ctx: &Ctx, plan: &Plan) -> Result<()> {
         maker = %ctx.maker.name, sold = %sold.name, amount = %plan.sell, bought = %bought.name,
         received = %plan.buy, notional_usd = %plan.notional_usd.round_dp(2), "hedged inventory at the oracle"
     );
-    Ok(())
+    Ok(Some(submitted.confirmation_slot))
+}
+
+/// Longest back-off after failed hedges, in ticks.
+const MAX_BACKOFF_TICKS: u32 = 64;
+
+/// Bounded exponential back-off for a hedge that keeps failing (wrong mint
+/// authority, a burn larger than the wallet): each try of a seat hedge
+/// costs a withdraw and a re-deposit, so retrying every tick churns three
+/// or four transactions a tick for nothing. After the n-th consecutive
+/// failure the next `2^n` ticks skip the hedge (capped at
+/// [`MAX_BACKOFF_TICKS`]); a success resets it.
+#[derive(Debug, Default)]
+pub struct Backoff {
+    failures: u32,
+    skip: u32,
+}
+
+impl Backoff {
+    /// Whether to try a hedge this tick; a skipped tick counts down.
+    pub fn ready(&mut self) -> bool {
+        if self.skip == 0 {
+            return true;
+        }
+        self.skip -= 1;
+        false
+    }
+
+    pub fn failed(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        self.skip = 1_u32
+            .checked_shl(self.failures)
+            .unwrap_or(u32::MAX)
+            .min(MAX_BACKOFF_TICKS);
+    }
+
+    pub fn succeeded(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Keep a failed hedge from stopping the tick: quoting, opening and arbing
@@ -198,20 +238,45 @@ pub fn contain(ctx: &Ctx, hedged: Result<bool>) -> bool {
     }
 }
 
+/// A seat hedge that failed.
+#[derive(Debug)]
+pub struct Failed {
+    /// The withdraw landed, so the seat's balances moved (and may not all
+    /// be back); a failed withdraw changed nothing.
+    pub withdrew: bool,
+    pub error: anyhow::Error,
+}
+
 /// Run a seat hedge's steps: take the free balance out (`withdraw`), hedge
 /// it in the wallet (`hedge`), and put the wallet back (`deposit`) whether
 /// or not the hedge landed, so a failed hedge cannot strand the seat's
 /// free balance in the wallet. A withdraw failure skips the rest.
-pub async fn through_wallet<W, H, D>(withdraw: W, hedge: H, deposit: D) -> Result<()>
+///
+/// `withdraw` and `hedge` return the slot they confirmed in (if they sent
+/// anything); `deposit` gets the later one, to read the wallet no earlier
+/// than both (a lagging node would serve it from before them).
+pub async fn through_wallet<W, H, D, DF>(
+    withdraw: W,
+    hedge: H,
+    deposit: D,
+) -> std::result::Result<(), Failed>
 where
-    W: std::future::Future<Output = Result<()>>,
-    H: std::future::Future<Output = Result<()>>,
-    D: std::future::Future<Output = Result<()>>,
+    W: std::future::Future<Output = Result<Option<u64>>>,
+    H: std::future::Future<Output = Result<Option<u64>>>,
+    D: FnOnce(Option<u64>) -> DF,
+    DF: std::future::Future<Output = Result<()>>,
 {
-    withdraw.await?;
+    let withdrawn = withdraw.await.map_err(|error| Failed {
+        withdrew: false,
+        error,
+    })?;
     let hedged = hedge.await;
-    let deposited = deposit.await;
-    hedged.and(deposited)
+    let slot = withdrawn.max(hedged.as_ref().ok().copied().flatten());
+    let deposited = deposit(slot).await;
+    hedged.and(deposited).map_err(|error| Failed {
+        withdrew: true,
+        error,
+    })
 }
 
 /// Hedge out of the wallet (oracle arbs, and LPs between positions):
@@ -308,15 +373,18 @@ mod tests {
         let (seat, wallet) = (Cell::new(1_000_u64), Cell::new(0_u64));
         let withdraw = async {
             wallet.set(wallet.get() + seat.replace(0));
-            Ok(())
+            Ok(Some(10))
         };
-        let deposit = async {
+        let deposit = |_| async {
             seat.set(seat.get() + wallet.replace(0));
             Ok(())
         };
         let failing = async { Err(anyhow::anyhow!("mint authority rejected")) };
         let result = through_wallet(withdraw, failing, deposit).await;
-        assert!(result.is_err(), "the failure is still reported");
+        assert!(
+            result.as_ref().is_err_and(|failed| failed.withdrew),
+            "the failure is still reported, with the seat moved"
+        );
         assert_eq!((seat.get(), wallet.get()), (1_000, 0), "nothing stranded");
         // A failed withdraw touches nothing else.
         let hedged = Cell::new(false);
@@ -324,15 +392,63 @@ mod tests {
             async { Err(anyhow::anyhow!("rpc down")) },
             async {
                 hedged.set(true);
-                Ok(())
+                Ok(None)
             },
-            async {
+            |_| async {
                 hedged.set(true);
                 Ok(())
             },
         )
         .await;
-        assert!(result.is_err() && !hedged.get());
+        assert!(result.is_err_and(|failed| !failed.withdrew) && !hedged.get());
+    }
+
+    #[tokio::test]
+    async fn the_redeposit_reads_no_earlier_than_the_hedge() {
+        use std::cell::Cell;
+        let read_at = Cell::new(None);
+        let deposit = |slot| {
+            read_at.set(slot);
+            async { Ok(()) }
+        };
+        let result = through_wallet(async { Ok(Some(10)) }, async { Ok(Some(12)) }, deposit).await;
+        assert!(result.is_ok());
+        assert_eq!(read_at.get(), Some(12), "pinned to the hedge's slot");
+        // A failed hedge: pinned to the withdraw.
+        let deposit = |slot| {
+            read_at.set(slot);
+            async { Ok(()) }
+        };
+        let failing = async { Err(anyhow::anyhow!("burn exceeds the wallet")) };
+        let result = through_wallet(async { Ok(Some(10)) }, failing, deposit).await;
+        assert!(result.is_err());
+        assert_eq!(read_at.get(), Some(10));
+    }
+
+    #[test]
+    fn a_failing_hedge_backs_off_and_a_success_resets() {
+        let mut backoff = Backoff::default();
+        // A hedge that always fails, tried only when ready: over 20 ticks
+        // it runs on ticks 0, 3, 8 and 17 (skipping 2, 4, then 8 ticks).
+        let tried: Vec<usize> = (0..20)
+            .filter(|_| {
+                let ready = backoff.ready();
+                if ready {
+                    backoff.failed();
+                }
+                ready
+            })
+            .collect();
+        assert_eq!(tried, vec![0, 3, 8, 17]);
+        // Bounded.
+        for _ in 0..40 {
+            backoff.failed();
+        }
+        assert_eq!(backoff.skip, MAX_BACKOFF_TICKS);
+        // One success and the next tick hedges again.
+        backoff.succeeded();
+        assert!(backoff.ready());
+        assert!(backoff.ready());
     }
 
     #[test]

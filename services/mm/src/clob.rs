@@ -27,6 +27,16 @@ pub struct Clob {
     last: Option<(Decimal, Vec<(u64, u64)>)>,
     /// When to pull the ladder for an untrustworthy oracle.
     guard: OracleGuard,
+    /// When to try a seat hedge again after it failed.
+    hedge_backoff: crate::hedge::Backoff,
+}
+
+/// What a tick's seat hedge did.
+enum SeatHedge {
+    /// Not needed, or backing off.
+    None,
+    Hedged,
+    Failed(crate::hedge::Failed),
 }
 
 impl Clob {
@@ -42,16 +52,19 @@ impl Clob {
             CommitmentConfig::confirmed(),
         )?;
         client.claim_seat(ctx.pool).await.context("claiming seat")?;
-        deposit_wallet(ctx, &client).await?;
+        deposit_wallet(ctx, &client, None).await?;
         Ok(Self {
             client,
             last: None,
             guard: OracleGuard::default(),
+            hedge_backoff: crate::hedge::Backoff::default(),
         })
     }
 
     /// Hedge the seat when its inventory strays from the target: withdraw
     /// what is not locked in orders, hedge it in the wallet, deposit back.
+    /// A failing hedge backs off ([`crate::hedge::Backoff`]) instead of
+    /// repeating the withdraw and re-deposit every tick.
     async fn hedge(
         &mut self,
         ctx: &Ctx,
@@ -59,34 +72,54 @@ impl Clob {
         seat: &manifest_dex_client::Seat,
         base_atoms: u64,
         quote_atoms: u64,
-    ) -> Result<bool> {
+    ) -> SeatHedge {
         let held = crate::hedge::Inventory {
             base_total: to_ui(&ctx.base, base_atoms),
             quote_total: to_ui(&ctx.quote, quote_atoms),
             base_free: to_ui(&ctx.base, seat.base_withdrawable),
             quote_free: to_ui(&ctx.quote, seat.quote_withdrawable),
         };
-        let Some(plan) = crate::hedge::check(ctx, prices, held)? else {
-            return Ok(false);
+        let plan = match crate::hedge::check(ctx, prices, held) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return SeatHedge::None,
+            Err(error) => {
+                return SeatHedge::Failed(crate::hedge::Failed {
+                    withdrew: false,
+                    error,
+                });
+            }
         };
-        crate::hedge::through_wallet(
+        if !self.hedge_backoff.ready() {
+            return SeatHedge::None;
+        }
+        let client = &self.client;
+        let hedged = crate::hedge::through_wallet(
             async {
-                self.client
+                let withdrawn = client
                     .withdraw_all(ctx.pool)
                     .await
                     .context("withdrawing the seat to hedge")?;
-                Ok(())
+                Ok(withdrawn.transaction.map(|tx| tx.confirmation_slot))
             },
             crate::hedge::execute(ctx, &plan),
-            async {
-                deposit_wallet(ctx, &self.client)
+            |slot| async move {
+                deposit_wallet(ctx, client, slot)
                     .await
                     .context("re-depositing after a hedge")?;
                 Ok(())
             },
         )
-        .await?;
-        Ok(true)
+        .await;
+        match hedged {
+            Ok(()) => {
+                self.hedge_backoff.succeeded();
+                SeatHedge::Hedged
+            }
+            Err(failed) => {
+                self.hedge_backoff.failed();
+                SeatHedge::Failed(failed)
+            }
+        }
     }
 
     pub async fn tick(&mut self, ctx: &Ctx) -> Result<()> {
@@ -104,7 +137,7 @@ impl Clob {
         };
         // Anything in the wallet belongs in the seat: a hedge (or a crash)
         // between its withdraw and deposit must not strand it unquoted.
-        match deposit_wallet(ctx, &self.client).await {
+        match deposit_wallet(ctx, &self.client, None).await {
             Ok(true) => self.last = None,
             Ok(false) => {}
             Err(error) => {
@@ -161,19 +194,26 @@ impl Clob {
         // Seat inventory = withdrawable + what our resting orders lock.
         let (base_atoms, quote_atoms) = snapshot.book.holdings(&seat)?;
         ctx.record_inventory(&prices, base_atoms, quote_atoms);
-        let hedged = self
+        match self
             .hedge(ctx, &prices, &seat, base_atoms, quote_atoms)
-            .await;
-        let hedge_failed = hedged.is_err();
-        if crate::hedge::contain(ctx, hedged) {
-            // The seat changed: re-quote from a fresh read next tick.
-            self.last = None;
-            return Ok(());
-        }
-        if hedge_failed {
-            // A failed hedge may still have moved the seat: re-quote now,
-            // sized from the batch's own fresh snapshot.
-            self.last = None;
+            .await
+        {
+            SeatHedge::None => {}
+            SeatHedge::Hedged => {
+                // The seat changed: re-quote from a fresh read next tick.
+                self.last = None;
+                return Ok(());
+            }
+            SeatHedge::Failed(failed) => {
+                crate::hedge::contain(ctx, Err(failed.error));
+                if failed.withdrew {
+                    // The seat's balances moved (an ambiguous hedge may
+                    // even have landed): re-quote now, sized from the
+                    // batch's own fresh snapshot. A failed withdraw moved
+                    // nothing, so the ladder stands.
+                    self.last = None;
+                }
+            }
         }
         let best_bid = snapshot.book.bids.first().map(|o| o.price_raw);
         let best_ask = snapshot.book.asks.first().map(|o| o.price_raw);
@@ -304,13 +344,19 @@ fn next_last(
 }
 
 /// Deposit the maker's whole wallet balance of both tokens into its seat
-/// (one batched, slot-pinned balance read); whether anything moved.
-async fn deposit_wallet(ctx: &Ctx, client: &ManifestClient) -> Result<bool> {
+/// (one batched balance read, at a context slot of at least
+/// `min_context_slot`: after a hedge, its confirmation slot); whether
+/// anything moved.
+async fn deposit_wallet(
+    ctx: &Ctx,
+    client: &ManifestClient,
+    min_context_slot: Option<u64>,
+) -> Result<bool> {
     let balances = mtm_scenario::funding::wallet_balances(
         &ctx.chain,
         &ctx.wallet_pubkey(),
         &[&ctx.base, &ctx.quote],
-        None,
+        min_context_slot,
     )
     .await?;
     let mut moved = false;
