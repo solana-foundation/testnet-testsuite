@@ -11,12 +11,15 @@
 //! Liveness is per connection, not per symbol: bookTicker only sends BBO
 //! changes, so a thin book can be quiet for a minute while perfectly
 //! current. The task pings every `ping_interval_ms`; any frame (book, ping,
-//! pong) is a sign of life, and only a connection silent for
-//! `idle_timeout_ms` is reconnected (a stalled socket can stay open for
-//! minutes before TCP gives up). While the connection is alive, each
-//! symbol's last book is re-published every `confirm_interval_ms` with a
-//! fresh `received_at_us`, so consumers' staleness checks measure the feed,
-//! not the market's quietness. Books are forgotten on reconnect: nothing is
+//! pong) is a sign of life, and a connection silent for `idle_timeout_ms`
+//! is reconnected (a stalled socket can stay open for minutes before TCP
+//! gives up; the check runs every second, not on the ping tick). While the
+//! connection showed life within `confirm_max_silence_ms` (about two ping
+//! round trips), each symbol's last book is re-published every
+//! `confirm_interval_ms` with a fresh `received_at_us`, so consumers'
+//! staleness checks measure the feed, not the market's quietness. A stall
+//! therefore stops being vouched for after `confirm_max_silence_ms`, well
+//! before the reconnect. Books are forgotten on reconnect: nothing is
 //! confirmed that this connection did not deliver.
 
 use std::collections::HashMap;
@@ -30,6 +33,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::config::BinanceConfig;
+
+/// How often the idle timeout is checked, independent of the ping cadence.
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize)]
 struct StreamMessage {
@@ -99,7 +105,10 @@ pub async fn run(
         let mut flush = tokio::time::interval(Duration::from_millis(cfg.flush_interval_ms));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let idle_timeout = Duration::from_millis(cfg.idle_timeout_ms);
+        let confirm_max_silence = Duration::from_millis(cfg.confirm_max_silence_ms);
         let mut last_alive = Instant::now();
+        let mut idle_check = tokio::time::interval(IDLE_CHECK_INTERVAL);
+        idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut ping = tokio::time::interval(Duration::from_millis(cfg.ping_interval_ms.max(100)));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut confirm =
@@ -142,19 +151,22 @@ pub async fn run(
                         break;
                     }
                 },
-                _ = ping.tick() => {
+                _ = idle_check.tick() => {
                     let silent = last_alive.elapsed();
                     if silent >= idle_timeout {
                         metrics::counter!("oracle_binance_idle_reconnects_total").increment(1);
                         warn!(silent_s = silent.as_secs(), "binance connection silent, reconnecting");
                         break;
                     }
+                }
+                _ = ping.tick() => {
                     if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                         break;
                     }
                 }
                 _ = confirm.tick() => {
-                    for point in confirmations(&books, &latest, last_alive.elapsed(), idle_timeout) {
+                    let silent = last_alive.elapsed();
+                    for point in confirmations(&books, &latest, silent, confirm_max_silence) {
                         metrics::counter!("oracle_binance_confirmations_total").increment(1);
                         latest.insert(point.symbol.clone(), point);
                     }
@@ -188,14 +200,15 @@ fn point(symbol: &Symbol, data: PriceData) -> PricePoint {
 
 /// Re-confirmations of unchanged books: one per known symbol without a
 /// pending update, and none unless the connection showed life within
-/// `idle_timeout` (a silent connection proves nothing).
+/// `max_silence` (a silent connection proves nothing, even before the idle
+/// timeout gives up on it).
 fn confirmations(
     books: &HashMap<Symbol, PriceData>,
     pending: &HashMap<Symbol, PricePoint>,
     silent: Duration,
-    idle_timeout: Duration,
+    max_silence: Duration,
 ) -> Vec<PricePoint> {
-    if silent >= idle_timeout {
+    if silent >= max_silence {
         return Vec::new();
     }
     books
@@ -228,8 +241,10 @@ mod tests {
         ]);
         // RAY has a fresh update pending: only JUP is re-confirmed.
         let pending = HashMap::from([(ray.clone(), point(&ray, book("2.1", "2.11")))]);
-        let idle = Duration::from_secs(15);
-        let confirmed = confirmations(&books, &pending, Duration::from_secs(2), idle);
+        let defaults = BinanceConfig::default();
+        let max_silence = Duration::from_millis(defaults.confirm_max_silence_ms);
+        let idle = Duration::from_millis(defaults.idle_timeout_ms);
+        let confirmed = confirmations(&books, &pending, Duration::from_secs(2), max_silence);
         assert_eq!(confirmed.len(), 1);
         assert_eq!(confirmed[0].symbol, jup);
         // PriceData has no PartialEq; its Debug form pins the values.
@@ -237,8 +252,20 @@ mod tests {
             format!("{:?}", confirmed[0].data),
             format!("{:?}", book("0.5", "0.51"))
         );
+        // A quiet book on a connection that just answered a ping (one ping
+        // interval of silence) is still confirmed.
+        let one_ping = Duration::from_millis(defaults.ping_interval_ms);
+        assert_eq!(
+            confirmations(&books, &HashMap::new(), one_ping, max_silence).len(),
+            2
+        );
+        // Silent for 11 s: still short of the 15 s reconnect, but past two
+        // ping round trips, so nothing is vouched for any more.
+        let silent = Duration::from_secs(11);
+        assert!(silent < idle);
+        assert!(confirmations(&books, &HashMap::new(), silent, max_silence).is_empty());
         // A connection silent past the timeout confirms nothing.
-        assert!(confirmations(&books, &HashMap::new(), idle, idle).is_empty());
+        assert!(confirmations(&books, &HashMap::new(), idle, max_silence).is_empty());
     }
 
     #[test]

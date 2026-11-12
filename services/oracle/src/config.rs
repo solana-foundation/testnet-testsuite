@@ -108,6 +108,11 @@ pub struct BinanceConfig {
     /// this often: bookTicker only sends changes, so a thin book would
     /// otherwise age past consumers' staleness limits while still current.
     pub confirm_interval_ms: u64,
+    /// Re-confirm only while the connection showed life within this window
+    /// (about two ping round trips), far tighter than `idle_timeout_ms`: a
+    /// stalled connection stops being vouched for within this bound, which
+    /// is what consumers' staleness limits stack on top of.
+    pub confirm_max_silence_ms: u64,
 }
 
 impl Default for BinanceConfig {
@@ -118,6 +123,7 @@ impl Default for BinanceConfig {
             idle_timeout_ms: 15_000,
             ping_interval_ms: 5_000,
             confirm_interval_ms: 1_000,
+            confirm_max_silence_ms: 10_000,
         }
     }
 }

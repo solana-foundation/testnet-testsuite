@@ -28,13 +28,16 @@ poll_interval_ms = 300000
 # Book updates coalesce to one tick per symbol per flush interval. The client
 # pings every ping_interval_ms; a connection with no sign of life (no frame,
 # no pong) for idle_timeout_ms is reconnected (stalls outlive TCP resets).
-# While it is alive, unchanged books are re-confirmed every
-# confirm_interval_ms, so thin books don't read as stale.
+# While it showed life within confirm_max_silence_ms (about two pings),
+# unchanged books are re-confirmed every confirm_interval_ms, so thin books
+# don't read as stale and a stalled connection stops looking fresh within
+# confirm_max_silence_ms (consumers' max_price_age_ms stacks on top).
 [oracle.binance]
 flush_interval_ms = 250
 idle_timeout_ms = 15000
 ping_interval_ms = 5000
 confirm_interval_ms = 1000
+confirm_max_silence_ms = 10000
 
 [oracle.pusher]
 enabled = false # parked until a testnet oracle program exists
