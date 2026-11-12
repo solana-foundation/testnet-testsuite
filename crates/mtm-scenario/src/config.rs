@@ -311,7 +311,7 @@ fn default_router_url() -> String {
     "http://127.0.0.1:8081".to_owned()
 }
 fn default_max_price_age_ms() -> u64 {
-    30_000
+    15_000
 }
 fn default_orca_tick_spacing() -> u16 {
     64

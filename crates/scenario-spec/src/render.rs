@@ -349,6 +349,12 @@ fn flow(spec: &Spec, prices: &Prices) -> Result<Row, String> {
 }
 
 /// The overlay for `spec`, layered as `MTM_PROFILE=<profile>,scale-<name>`.
+/// Oracle staleness bound for consumers. The oracle stops re-confirming a
+/// silent Binance connection after 10 s (`confirm_max_silence_ms`), so a dead
+/// feed is acted on for at most 10 + 15 = 25 s; 15 s still rides out one
+/// Hermes poll hitting its 10 s HTTP timeout.
+pub const MAX_PRICE_AGE_MS: i64 = 15_000;
+
 pub fn overlay(name: &str, spec: &Spec, prices: &Prices) -> Result<Rendered, String> {
     spec.check()?;
     let pools = spec.pools();
@@ -377,11 +383,13 @@ pub fn overlay(name: &str, spec: &Spec, prices: &Prices) -> Result<Rendered, Str
     if spec.redefines_tokens() {
         let non_usdc: Vec<&str> = tokens.iter().copied().filter(|t| *t != "USDC").collect();
         if !spec.extra_tokens().is_empty() {
-            // Thin Binance books (e.g. RENDER) can go >30 s without a top-of-book change.
+            // Thin Binance books (e.g. RENDER) can go >30 s without a top-of-book
+            // change; the oracle re-confirms them every second while its
+            // connection is alive, so the scenario-wide bound holds for them too.
             table(
                 &mut out,
                 "scenario",
-                &vec![("max_price_age_ms", V::Int(120000))],
+                &vec![("max_price_age_ms", V::Int(MAX_PRICE_AGE_MS))],
             );
         }
         let underlyings: Vec<Row> = non_usdc
@@ -518,6 +526,19 @@ pub(crate) mod tests {
         for (name, spec) in presets() {
             let out = overlay(name, &spec, &prices()).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(spec_of(&out.toml).as_ref(), Some(&spec), "{name}");
+        }
+    }
+
+    #[test]
+    fn rendered_overlays_keep_the_oracle_staleness_bound() {
+        for (name, spec) in presets() {
+            let out = overlay(name, &spec, &prices()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for line in out.toml.lines() {
+                if let Some(age) = line.strip_prefix("max_price_age_ms = ") {
+                    let age: u64 = age.parse().expect("integer");
+                    assert!(age <= 15_000, "{name}: max_price_age_ms = {age}");
+                }
+            }
         }
     }
 

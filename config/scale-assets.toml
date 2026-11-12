@@ -4,7 +4,7 @@
 # (1756 participants); maker capital ×10. Layer: MTM_PROFILE=scenario-local,scale-assets
 
 [scenario]
-max_price_age_ms = 120000
+max_price_age_ms = 15000
 
 [[oracle.underlyings]]
 symbol = "JUP/USDT"
