@@ -44,19 +44,20 @@ What changed relative to the design below:
   that replaces the per-request fetch later; `mtm-market-state` from the stash
   is parked until then. Meanwhile snapshots are cached and shared: a pool's
   snapshot is fresh for `snapshot_ttl_ms` (default 400 ms) after its load
-  completes; past that, quotes keep using it while one background refresh
-  runs (stale-while-revalidate), up to `snapshot_max_age_ms` (3 s, counted
-  from the start of the load, since the data is that old), beyond
-  which the pool is left out of the quote. Loads run detached from the
-  request that triggered them, are bounded by `snapshot_load_timeout_ms`
-  (1 s, also the quote-path RPC client's HTTP timeout), and a failure is
-  reused for one TTL (at least 200 ms, also with a TTL of 0); a quote waits at most `snapshot_wait_ms` (1 s) for a
-  pool with no usable snapshot, and not at all for one whose last load
-  failed (it is left out until a background retry succeeds). The slot (`state_slot`) and the blockhash
-  come from a background refresher (`chain_tip_refresh_ms`, 400 ms, on its
-  own RPC client, each refresh abandoned after `chain_tip_timeout_ms`, 1 s); once
-  that value is older than `chain_tip_max_age_ms` (5 s) quotes answer 502.
-  No quote issues an RPC call of its own. The book holds `Arc` references.
+  completes; past that, quotes keep using it while one background refresh runs
+  (stale-while-revalidate), up to `snapshot_max_age_ms` (3 s, counted from the
+  start of the load, since the data is that old), beyond which the pool is
+  left out of the quote. Loads run detached from the request that triggered
+  them, are bounded by `snapshot_load_timeout_ms` (1 s, also the quote-path
+  RPC client's HTTP timeout), and a failure is reused for one TTL (at least
+  200 ms, also with a TTL of 0); a quote waits at most `snapshot_wait_ms`
+  (1 s) for a pool with no usable snapshot, and not at all for one whose last
+  load failed (it is left out until a background retry succeeds). The slot
+  (`state_slot`) and the blockhash come from a background refresher
+  (`chain_tip_refresh_ms`, 400 ms, on its own RPC client, each refresh
+  abandoned after `chain_tip_timeout_ms`, 1 s); once that value is older than
+  `chain_tip_max_age_ms` (5 s) quotes answer 502. No quote issues an RPC call
+  of its own. The book holds `Arc` references.
 - **Venue trait (§3)** is `mtm_venues::PoolSnapshot` (enum dispatch over the
   three snapshots) plus the engine's `QuoteSource` trait, which lets the
   planner's unit tests run on a constant-product mock.
