@@ -368,8 +368,182 @@ fn observe(shared: &Shared, summary: &BlockSummary, leader_client: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    use axum::extract::State;
+    use axum::{Json, Router};
+    use tokio::sync::Notify;
+
     use super::*;
-    use crate::rpc::RpcError;
+    use crate::block::Known;
+    use crate::rpc::{JsonRpc, RpcError};
+    use crate::store::{self, Store};
+
+    /// A JSON-RPC node whose `getBlocks` knows the blocks in `blocks` up to
+    /// `node_tip`, as a node behind the cluster tip would.
+    struct FakeNode {
+        blocks: BTreeSet<u64>,
+        node_tip: AtomicU64,
+        get_block_calls: AtomicU64,
+    }
+
+    async fn answer(State(node): State<Arc<FakeNode>>, Json(request): Json<Value>) -> Json<Value> {
+        let params = &request["params"];
+        let result = match request["method"].as_str() {
+            Some("getBlocks") => {
+                let (from, to) = (
+                    params[0].as_u64().expect("test setup"),
+                    params[1].as_u64().expect("test setup"),
+                );
+                let to = to.min(node.node_tip.load(Ordering::Relaxed));
+                json!(
+                    node.blocks
+                        .range(from..=to.max(from))
+                        .filter(|s| **s <= to)
+                        .collect::<Vec<_>>()
+                )
+            }
+            Some("getBlock") => {
+                node.get_block_calls.fetch_add(1, Ordering::Relaxed);
+                json!({ "blockHeight": params[0] })
+            }
+            _ => json!([]),
+        };
+        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    /// Shared state against a fake node, with the pipeline at `cursor`
+    /// and the confirmed tip at `tip`.
+    async fn harness(name: &str, node: &Arc<FakeNode>, cursor: u64, tip: u64) -> (Shared, PathBuf) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup");
+        let url = format!("http://{}", listener.local_addr().expect("test setup"));
+        let app = Router::new()
+            .route("/", axum::routing::post(answer))
+            .with_state(Arc::clone(node));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let dir = std::env::temp_dir().join(format!("chain-watch-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let shared = Shared {
+            cfg: serde_json::from_value(json!({ "listen_addr": "127.0.0.1:0" }))
+                .expect("test setup"),
+            rpc: JsonRpc::new(url, None).expect("test setup"),
+            store: Store::open(&dir, &[]).expect("test setup"),
+            run_id: name.to_owned(),
+            rpc_host: "fake".to_owned(),
+            block_details: BlockDetails::Full,
+            public_endpoint: false,
+            known: RwLock::new(Arc::new(Known::default())),
+            our_wallets: AtomicUsize::new(0),
+            processed: AtomicU64::new(tip),
+            confirmed: AtomicU64::new(tip),
+            cursor: AtomicU64::new(cursor),
+            leaders: RwLock::default(),
+            nodes: RwLock::new(HashMap::new()),
+            slot_seconds: RwLock::new(0.4),
+            epoch_changed: Notify::new(),
+        };
+        (shared, dir)
+    }
+
+    async fn rows(shared: &Shared, from: u64, to: u64) -> Vec<(u64, SlotStatus)> {
+        shared.store.flush(Duration::from_secs(5));
+        let rows = shared
+            .store
+            .read(move |conn| store::slots(conn, from, to, u32::MAX))
+            .await
+            .expect("test setup");
+        rows.into_iter().map(|r| (r.slot, r.status)).collect()
+    }
+
+    #[tokio::test]
+    async fn slots_a_lagging_node_has_not_listed_are_not_recorded_skipped() {
+        let node = Arc::new(FakeNode {
+            blocks: BTreeSet::from([1_000, 1_003]),
+            node_tip: AtomicU64::new(1_001),
+            get_block_calls: AtomicU64::new(0),
+        });
+        let (shared, dir) = harness("lagging-node", &node, 1_000, 1_003).await;
+        let mut backfill_to = 0;
+        step(&shared, &dir, &mut backfill_to)
+            .await
+            .expect("test setup");
+        step(&shared, &dir, &mut backfill_to)
+            .await
+            .expect("test setup");
+        // 1_001..=1_003 are past what the node lists: undecided.
+        assert_eq!(shared.cursor.load(Ordering::Relaxed), 1_001);
+        assert_eq!(
+            rows(&shared, 1_000, 1_003).await,
+            vec![(1_000, SlotStatus::Produced)]
+        );
+        node.node_tip.store(1_003, Ordering::Relaxed);
+        step(&shared, &dir, &mut backfill_to)
+            .await
+            .expect("test setup");
+        assert_eq!(
+            rows(&shared, 1_000, 1_003).await,
+            vec![
+                (1_000, SlotStatus::Produced),
+                (1_001, SlotStatus::Skipped),
+                (1_002, SlotStatus::Skipped),
+                (1_003, SlotStatus::Produced),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_gap_is_backfilled_in_slots_mode_then_blocks_are_read_again() {
+        let (cursor, tip) = (10_000, 13_500);
+        let node = Arc::new(FakeNode {
+            blocks: (cursor..=tip + 10).filter(|s| s % 2 == 0).collect(),
+            node_tip: AtomicU64::new(tip),
+            get_block_calls: AtomicU64::new(0),
+        });
+        let (shared, dir) = harness("backfill", &node, cursor, tip).await;
+        let mut backfill_to = 0;
+        for _ in 0..10 {
+            step(&shared, &dir, &mut backfill_to)
+                .await
+                .expect("test setup");
+        }
+        assert_eq!(shared.cursor.load(Ordering::Relaxed), tip + 1);
+        // Every slot of the gap has a row, without one getBlock.
+        let recorded = rows(&shared, cursor, tip).await;
+        assert_eq!(recorded.len() as u64, tip - cursor + 1);
+        assert!(recorded.iter().all(|(slot, status)| {
+            *status
+                == if slot % 2 == 0 {
+                    SlotStatus::Produced
+                } else {
+                    SlotStatus::Skipped
+                }
+        }));
+        assert_eq!(node.get_block_calls.load(Ordering::Relaxed), 0);
+        let events = shared
+            .store
+            .read(|conn| store::events(conn, 0, 10))
+            .await
+            .expect("test setup");
+        let gap = events
+            .iter()
+            .find(|e| e.kind == kind::GAP)
+            .expect("gap event");
+        assert_eq!(gap.detail["backfilled"], json!(true));
+        // Past the gap, blocks are read again.
+        node.node_tip.store(tip + 2, Ordering::Relaxed);
+        shared.confirmed.store(tip + 2, Ordering::Relaxed);
+        step(&shared, &dir, &mut backfill_to)
+            .await
+            .expect("test setup");
+        assert_eq!(node.get_block_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.cursor.load(Ordering::Relaxed), tip + 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn rpc_error(code: i64) -> Result<Value> {
         Err(RpcError {
