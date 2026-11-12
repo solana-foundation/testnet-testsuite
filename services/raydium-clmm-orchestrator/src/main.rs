@@ -1,16 +1,12 @@
-use std::{
-    collections::BTreeSet,
-    env, fs,
-    io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use mtm_chain::{ChainClient, SubmissionConfig, SubmissionOutcome};
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
+use mtm_dex_harness::cli::{
+    Commitment, EphemeralConfig, EphemeralRun, EphemeralTarget, EphemeralUserArgs, TransactionArgs,
+    connected_chain, resolve_pubkey, run_ephemeral_users, signer_from_environment, submission_json,
+    unique_mints, unordered_pairs,
+};
 use mtm_telemetry::init;
 use raydium_clmm_orchestrator::{
     EnsureAmmConfigParams, OrchestrationConfig, PoolCreationOutcome, PoolCreationParams,
@@ -19,38 +15,7 @@ use raydium_clmm_orchestrator::{
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use solana_commitment_config::CommitmentConfig;
-use solana_instruction::{AccountMeta, Instruction};
-use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
-use solana_signer::Signer;
-use spl_token_2022::extension::transfer_fee::TransferFeeAmount;
-use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
-use spl_token_2022::state::{Account as TokenAccount, Mint};
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Commitment {
-    Processed,
-    Confirmed,
-    Finalized,
-}
-
-impl Commitment {
-    fn config(self) -> CommitmentConfig {
-        match self {
-            Self::Processed => CommitmentConfig::processed(),
-            Self::Confirmed => CommitmentConfig::confirmed(),
-            Self::Finalized => CommitmentConfig::finalized(),
-        }
-    }
-    fn name(self) -> &'static str {
-        match self {
-            Self::Processed => "processed",
-            Self::Confirmed => "confirmed",
-            Self::Finalized => "finalized",
-        }
-    }
-}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -111,16 +76,11 @@ struct UserFlowArgs {
     /// Mint public key. Repeat this flag to exercise every unordered pair's existing pool.
     #[arg(long = "mint", value_name = "MINT")]
     mints: Vec<Pubkey>,
-    #[arg(long, default_value = "KEYPAIR_FAUCET")]
-    faucet_keypair_env: String,
-    #[arg(long, default_value = "KEYPAIR_TOKEN_MINT_AUTHORITY")]
-    mint_authority_keypair_env: String,
-    /// Directory for ephemeral user keypairs, retained when a flow or recovery fails.
+    #[command(flatten)]
+    users: EphemeralUserArgs,
+    /// Directory for ephemeral user keypairs, retained when a recovery fails.
     #[arg(long, default_value = ".raydium-clmm-recovery")]
     recovery_dir: PathBuf,
-    /// Lamports sent by the faucet to each ephemeral user before its flow.
-    #[arg(long, default_value_t = 1_000_000_000)]
-    user_lamports: u64,
     #[arg(long, default_value = "10000")]
     funding_a: Decimal,
     #[arg(long, default_value = "10000")]
@@ -141,18 +101,6 @@ struct UserFlowArgs {
     with_metadata: bool,
     #[command(flatten)]
     transaction: TransactionArgs,
-}
-
-#[derive(Debug, Args)]
-struct TransactionArgs {
-    #[arg(long, default_value_t = 50)]
-    slippage_bps: u16,
-    #[arg(long, default_value_t = 1_400_000)]
-    compute_unit_limit: u32,
-    #[arg(long, default_value_t = 0)]
-    priority_fee_micro_lamports: u64,
-    #[arg(long, value_enum, default_value_t = Commitment::Confirmed)]
-    commitment: Commitment,
 }
 
 #[derive(Debug, Args)]
@@ -190,16 +138,6 @@ struct UserPool {
     mint_b: Pubkey,
 }
 
-struct UserFlowRun {
-    pool: UserPool,
-    user: Pubkey,
-    startup_funding: TransactionOutcome,
-    outcome: UserFlowOutcome,
-    token_returns: Vec<TransactionOutcome>,
-    lamports_returned: u64,
-    lamport_return: Option<TransactionOutcome>,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     init("raydium-clmm-orchestrator", None)?;
@@ -212,8 +150,7 @@ async fn main() -> Result<()> {
 
 /// Creates one pool for each unordered pair of mints named by the selected environment variable.
 async fn create_all_pools(args: CreatePoolsArgs) -> Result<()> {
-    let payer: Arc<dyn Signer + Send + Sync> =
-        Arc::new(keypair_from_environment(&args.payer_keypair_env)?);
+    let payer = signer_from_environment(&args.payer_keypair_env)?;
     let program_id = resolve_pubkey(
         args.program_id,
         &args.program_keypair_env,
@@ -246,191 +183,69 @@ async fn create_all_pools(args: CreatePoolsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Runs one independent random user against every existing unordered mint pair.
+/// Runs one independent random user against every existing unordered mint pair
+/// (the shared ephemeral-user lifecycle: fund, run, always reclaim).
 async fn execute_user_flows(args: UserFlowArgs) -> Result<()> {
-    let faucet: Arc<dyn Signer + Send + Sync> =
-        Arc::new(keypair_from_environment(&args.faucet_keypair_env)?);
-    let mint_authority: Arc<dyn Signer + Send + Sync> =
-        Arc::new(keypair_from_environment(&args.mint_authority_keypair_env)?);
+    let faucet = signer_from_environment(&args.users.faucet_keypair_env)?;
+    let mint_authority = signer_from_environment(&args.users.mint_authority_keypair_env)?;
     let program_id = resolve_pubkey(
         args.program_id,
         &args.program_keypair_env,
         "Raydium program",
     )?;
-    let pools = unordered_pairs(&unique_mints(args.mints, "--mint")?)
+    let targets = unordered_pairs(&unique_mints(args.mints, "--mint")?)
         .into_iter()
         .map(|(mint_a, mint_b)| {
-            Ok(UserPool {
-                pool: derive_pool_address(program_id, args.amm_config, mint_a, mint_b)?,
-                mint_a,
-                mint_b,
+            let pool = derive_pool_address(program_id, args.amm_config, mint_a, mint_b)?;
+            Ok(EphemeralTarget {
+                target: UserPool {
+                    pool,
+                    mint_a,
+                    mint_b,
+                },
+                label: pool.to_string(),
+                mints: vec![mint_a, mint_b],
             })
         })
         .collect::<Result<Vec<_>>>()?;
     let chain = connected_chain(&args.rpc_url, args.transaction.commitment).await?;
     let config = orchestration_config(&args.transaction);
-    let submission = submission_config(&args.transaction);
-    fs::create_dir_all(&args.recovery_dir)
-        .with_context(|| format!("create recovery directory {}", args.recovery_dir.display()))?;
-    #[cfg(unix)]
-    fs::set_permissions(&args.recovery_dir, fs::Permissions::from_mode(0o700)).with_context(
-        || {
-            format!(
-                "restrict recovery directory {}",
-                args.recovery_dir.display()
-            )
-        },
-    )?;
-    let users: Vec<(UserPool, Arc<Keypair>)> = pools
-        .into_iter()
-        .map(|pool| (pool, Arc::new(Keypair::new())))
-        .collect();
-    let mut funded_users: Vec<(
-        UserPool,
-        Arc<dyn Signer + Send + Sync>,
-        PathBuf,
-        TransactionOutcome,
-    )> = Vec::with_capacity(users.len());
-    for (pool, user) in users {
-        let user_pubkey = user.pubkey();
-        let recovery_path = args.recovery_dir.join(format!("{user_pubkey}.json"));
-        let bytes = serde_json::to_vec(user.to_bytes().as_slice())?;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&recovery_path)
-            .with_context(|| format!("save recovery keypair to {}", recovery_path.display()))?
-            .write_all(&bytes)
-            .with_context(|| format!("write recovery keypair to {}", recovery_path.display()))?;
-        tracing::info!(pool = %pool.pool, user = %user_pubkey, recovery_file = %recovery_path.display(), "saved ephemeral user recovery keypair");
-        let user: Arc<dyn Signer + Send + Sync> = user;
-        let startup_funding = transfer_lamports(
-            &chain,
-            faucet.as_ref(),
-            faucet.as_ref(),
-            user_pubkey,
-            args.user_lamports,
-            submission,
-        )
-        .await;
-        let startup_funding = match startup_funding {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                for (funded_pool, funded_user, _, _) in funded_users {
-                    let _ = reclaim_user_funds(
-                        &chain,
-                        faucet.as_ref(),
-                        funded_user.as_ref(),
-                        [funded_pool.mint_a, funded_pool.mint_b],
-                        submission,
-                    )
-                    .await;
-                }
-                return Err(error).context("fund ephemeral user from KEYPAIR_FAUCET");
-            }
-        };
-        funded_users.push((pool, user, recovery_path, startup_funding));
-    }
-    let mut runs = Vec::new();
-    // Every funded user is run and reclaimed even after a failure: stopping at
-    // the first error would strand the SOL already sent to the later users.
-    let mut failures = Vec::new();
-    let total = funded_users.len();
-    for (pool, user, recovery_path, startup_funding) in funded_users {
-        let user_pubkey = user.pubkey();
+    let ephemeral = EphemeralConfig {
+        recovery_dir: args.recovery_dir,
+        user_lamports: args.users.user_lamports,
+        submission: args.transaction.submission(),
+    };
+    let runs = run_ephemeral_users(&chain, faucet, &ephemeral, targets, |pool, user| {
         let orchestrator = RaydiumClmmOrchestrator::new(
             chain.clone(),
             program_id,
-            Arc::clone(&user),
+            user,
             Arc::clone(&mint_authority),
             config,
-        )?;
-        tracing::info!(pool = %pool.pool, user = %user_pubkey, "starting Raydium CLMM user flow");
-        let flow = orchestrator
-            .run_user_flow(UserFlowParams {
-                amm_config: args.amm_config,
-                pool: pool.pool,
-                mint_a: pool.mint_a,
-                mint_b: pool.mint_b,
-                funding_a: args.funding_a,
-                funding_b: args.funding_b,
-                lower_price: args.lower_price,
-                upper_price: args.upper_price,
-                open_amount: args.open_amount,
-                increase_amount: args.increase_amount,
-                exact_in_amount: args.exact_in_amount,
-                exact_out_amount: args.exact_out_amount,
-                with_metadata: args.with_metadata,
-            })
-            .await;
-        let recovery = reclaim_user_funds(
-            &chain,
-            faucet.as_ref(),
-            user.as_ref(),
-            [pool.mint_a, pool.mint_b],
-            submission,
-        )
-        .await;
-        if let Err(error) = &recovery {
-            tracing::error!(pool = %pool.pool, user = %user_pubkey, error = %error, "failed to return ephemeral user funds; recovery keypair retained");
-        }
-        if let Err(error) = &flow {
-            tracing::error!(pool = %pool.pool, user = %user_pubkey, error = %error, "ephemeral user flow failed");
-        }
-        if recovery.is_ok()
-            && let Err(error) = fs::remove_file(&recovery_path)
-        {
-            tracing::warn!(path = %recovery_path.display(), %error, "failed to remove recovered keypair");
-        }
-        match (flow, recovery) {
-            (Ok(outcome), Ok((token_returns, lamports_returned, lamport_return))) => {
-                runs.push(UserFlowRun {
-                    pool,
-                    user: user_pubkey,
-                    startup_funding,
-                    outcome,
-                    token_returns,
-                    lamports_returned,
-                    lamport_return,
-                });
-            }
-            (flow, recovery) => {
-                let reason = match (flow.err(), recovery.err()) {
-                    (Some(flow), Some(recovery)) => {
-                        format!("flow: {flow:#}; recovery (keypair retained): {recovery:#}")
-                    }
-                    (Some(flow), None) => format!("flow: {flow:#}"),
-                    (None, Some(recovery)) => {
-                        format!("recovery (keypair retained): {recovery:#}")
-                    }
-                    (None, None) => unreachable!("both succeeded in the arm above"),
-                };
-                failures.push(format!("pool {} user {user_pubkey}: {reason}", pool.pool));
-            }
-        }
-    }
+        );
+        let params = UserFlowParams {
+            amm_config: args.amm_config,
+            pool: pool.pool,
+            mint_a: pool.mint_a,
+            mint_b: pool.mint_b,
+            funding_a: args.funding_a,
+            funding_b: args.funding_b,
+            lower_price: args.lower_price,
+            upper_price: args.upper_price,
+            open_amount: args.open_amount,
+            increase_amount: args.increase_amount,
+            exact_in_amount: args.exact_in_amount,
+            exact_out_amount: args.exact_out_amount,
+            with_metadata: args.with_metadata,
+        };
+        async move { Ok(orchestrator?.run_user_flow(params).await?) }
+    })
+    .await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&runs.iter().map(user_flow_run_json).collect::<Vec<_>>())?
     );
-    if !failures.is_empty() {
-        bail!(
-            "{} of {total} Raydium CLMM user flows failed:\n{}",
-            failures.len(),
-            failures.join("\n")
-        );
-    }
     Ok(())
-}
-
-async fn connected_chain(rpc_url: &str, commitment: Commitment) -> Result<ChainClient> {
-    let chain = ChainClient::new(rpc_url, commitment.name())?;
-    chain
-        .current_slot()
-        .await
-        .with_context(|| format!("connect to {rpc_url}"))?;
-    Ok(chain)
 }
 
 fn orchestration_config(args: &TransactionArgs) -> OrchestrationConfig {
@@ -442,260 +257,13 @@ fn orchestration_config(args: &TransactionArgs) -> OrchestrationConfig {
     }
 }
 
-fn submission_config(args: &TransactionArgs) -> SubmissionConfig {
-    SubmissionConfig {
-        compute_unit_limit: args.compute_unit_limit,
-        compute_unit_price_micro_lamports: args.priority_fee_micro_lamports,
-        commitment: args.commitment.config(),
-        ..SubmissionConfig::default()
-    }
-}
-
-async fn reclaim_user_funds(
-    chain: &ChainClient,
-    faucet: &dyn Signer,
-    user: &dyn Signer,
-    mints: [Pubkey; 2],
-    submission: SubmissionConfig,
-) -> Result<(Vec<TransactionOutcome>, u64, Option<TransactionOutcome>)> {
-    let mut token_returns = Vec::new();
-    for mint in mints {
-        if let Some(transaction) =
-            return_token_balance(chain, faucet, user, mint, submission).await?
-        {
-            token_returns.push(transaction);
-        }
-    }
-    let lamports = chain
-        .rpc()
-        .get_balance(&user.pubkey())
-        .await
-        .context("read ephemeral user balance before recovery")?;
-    let transaction = if lamports == 0 {
-        None
-    } else {
-        Some(transfer_lamports(chain, faucet, user, faucet.pubkey(), lamports, submission).await?)
-    };
-    Ok((token_returns, lamports, transaction))
-}
-
-async fn return_token_balance(
-    chain: &ChainClient,
-    faucet: &dyn Signer,
-    user: &dyn Signer,
-    mint: Pubkey,
-    submission: SubmissionConfig,
-) -> Result<Option<TransactionOutcome>> {
-    let mint_account = chain
-        .rpc()
-        .get_account(&mint)
-        .await
-        .with_context(|| format!("read mint {mint} for recovery"))?;
-    let token_program = mint_account.owner;
-    let source = associated_token_address(user.pubkey(), mint, token_program)?;
-    let Some(source_account) = chain
-        .rpc()
-        .get_account_with_commitment(&source, submission.commitment)
-        .await
-        .context("read ephemeral user token balance")?
-        .value
-    else {
-        return Ok(None);
-    };
-    let source_state = StateWithExtensions::<TokenAccount>::unpack(&source_account.data)
-        .with_context(|| format!("decode ephemeral user token account {source}"))?;
-    let amount = source_state.base.amount;
-    // Token-2022 refuses to close an account still holding withheld transfer
-    // fees; return the balance and leave that account open.
-    let withheld = source_state
-        .get_extension::<TransferFeeAmount>()
-        .map_or(0, |fees| u64::from(fees.withheld_amount));
-    let destination = associated_token_address(faucet.pubkey(), mint, token_program)?;
-    let decimals = StateWithExtensions::<Mint>::unpack(&mint_account.data)
-        .with_context(|| format!("decode mint {mint}"))?
-        .base
-        .decimals;
-    let mut instructions = vec![create_ata_instruction(
-        faucet.pubkey(),
-        faucet.pubkey(),
-        mint,
-        token_program,
-        destination,
-    )?];
-    if amount > 0 {
-        instructions.push(transfer_checked_instruction(
-            source,
-            mint,
-            destination,
-            user.pubkey(),
-            token_program,
-            amount,
-            decimals,
-        ));
-    }
-    // Closing the now-empty ATA returns its rent to the faucet as well as its
-    // token balance, so the generated user does not retain stranded lamports.
-    if withheld == 0 {
-        instructions.push(close_token_account_instruction(
-            source,
-            faucet.pubkey(),
-            user.pubkey(),
-            token_program,
-        ));
-    } else {
-        tracing::warn!(account = %source, withheld, "token account holds withheld transfer fees; leaving it open");
-    }
-    let outcome = chain
-        .submit(instructions, faucet, &[user], submission)
-        .await?;
-    Ok(Some(transaction_outcome(outcome)))
-}
-
-async fn transfer_lamports(
-    chain: &ChainClient,
-    fee_payer: &dyn Signer,
-    source: &dyn Signer,
-    destination: Pubkey,
-    lamports: u64,
-    submission: SubmissionConfig,
-) -> Result<TransactionOutcome> {
-    if lamports == 0 {
-        bail!("lamport transfer amount must be greater than zero")
-    }
-    Ok(transaction_outcome(
-        chain
-            .submit(
-                vec![system_transfer_instruction(
-                    source.pubkey(),
-                    destination,
-                    lamports,
-                )],
-                fee_payer,
-                &[source],
-                submission,
-            )
-            .await?,
-    ))
-}
-
-fn transaction_outcome(outcome: SubmissionOutcome) -> TransactionOutcome {
-    TransactionOutcome {
-        signature: outcome.signature,
-        confirmation_slot: outcome.confirmation_slot,
-        simulated_compute_units: outcome.simulated_compute_units,
-    }
-}
-
-fn system_transfer_instruction(source: Pubkey, destination: Pubkey, lamports: u64) -> Instruction {
-    let mut data = 2_u32.to_le_bytes().to_vec();
-    data.extend_from_slice(&lamports.to_le_bytes());
-    Instruction {
-        program_id: Pubkey::default(),
-        accounts: vec![
-            AccountMeta::new(source, true),
-            AccountMeta::new(destination, false),
-        ],
-        data,
-    }
-}
-
-fn associated_token_address(owner: Pubkey, mint: Pubkey, token_program: Pubkey) -> Result<Pubkey> {
-    let associated_program = pubkey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")?;
-    Ok(Pubkey::find_program_address(
-        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
-        &associated_program,
-    )
-    .0)
-}
-
-fn create_ata_instruction(
-    payer: Pubkey,
-    owner: Pubkey,
-    mint: Pubkey,
-    token_program: Pubkey,
-    ata: Pubkey,
-) -> Result<Instruction> {
-    Ok(Instruction {
-        program_id: pubkey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")?,
-        accounts: vec![
-            AccountMeta::new(payer, true),
-            AccountMeta::new(ata, false),
-            AccountMeta::new_readonly(owner, false),
-            AccountMeta::new_readonly(mint, false),
-            AccountMeta::new_readonly(Pubkey::default(), false),
-            AccountMeta::new_readonly(token_program, false),
-        ],
-        data: vec![1],
-    })
-}
-
-fn transfer_checked_instruction(
-    source: Pubkey,
-    mint: Pubkey,
-    destination: Pubkey,
-    authority: Pubkey,
-    token_program: Pubkey,
-    amount: u64,
-    decimals: u8,
-) -> Instruction {
-    let mut data = vec![12];
-    data.extend_from_slice(&amount.to_le_bytes());
-    data.push(decimals);
-    Instruction {
-        program_id: token_program,
-        accounts: vec![
-            AccountMeta::new(source, false),
-            AccountMeta::new_readonly(mint, false),
-            AccountMeta::new(destination, false),
-            AccountMeta::new_readonly(authority, true),
-        ],
-        data,
-    }
-}
-
-fn close_token_account_instruction(
-    account: Pubkey,
-    destination: Pubkey,
-    authority: Pubkey,
-    token_program: Pubkey,
-) -> Instruction {
-    Instruction {
-        program_id: token_program,
-        accounts: vec![
-            AccountMeta::new(account, false),
-            AccountMeta::new(destination, false),
-            AccountMeta::new_readonly(authority, true),
-        ],
-        data: vec![9],
-    }
-}
-
-fn unique_mints(mints: Vec<Pubkey>, source: &str) -> Result<Vec<Pubkey>> {
-    let mints: BTreeSet<Pubkey> = mints.into_iter().collect();
-    if mints.len() < 2 {
-        bail!("{source} must provide at least two distinct mints")
-    }
-    Ok(mints.into_iter().collect())
-}
-
-fn unordered_pairs(mints: &[Pubkey]) -> Vec<(Pubkey, Pubkey)> {
-    let mut pairs = Vec::new();
-    for (i, mint_a) in mints.iter().enumerate() {
-        for mint_b in &mints[i + 1..] {
-            pairs.push((*mint_a, *mint_b));
-        }
-    }
-    pairs
-}
-
 async fn run_admin(args: AdminArgs) -> Result<()> {
     let program_id = resolve_pubkey(
         args.program_id,
         &args.program_keypair_env,
         "Raydium program",
     )?;
-    let admin: Arc<dyn Signer + Send + Sync> =
-        Arc::new(keypair_from_environment(&args.admin_keypair_env)?);
+    let admin = signer_from_environment(&args.admin_keypair_env)?;
     let orchestrator = RaydiumClmmAdminOrchestrator::new(
         connected_chain(&args.rpc_url, args.commitment).await?,
         program_id,
@@ -722,35 +290,6 @@ async fn run_admin(args: AdminArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_pubkey(value: Option<Pubkey>, keypair_env: &str, label: &str) -> Result<Pubkey> {
-    match value {
-        Some(pubkey) => Ok(pubkey),
-        None => keypair_from_environment(keypair_env)
-            .map(|keypair| keypair.pubkey())
-            .with_context(|| format!("derive {label} address from {keypair_env}")),
-    }
-}
-
-fn keypair_from_environment(name: &str) -> Result<Keypair> {
-    keypair_from_encoded(
-        &env::var(name).with_context(|| format!("environment variable {name} is unset"))?,
-    )
-    .with_context(|| format!("{name} is not a valid keypair"))
-}
-
-fn keypair_from_encoded(encoded: &str) -> Result<Keypair> {
-    let bytes: Vec<u8> =
-        serde_json::from_str(encoded).context("keypair must be a JSON-encoded byte array")?;
-    if bytes.len() != 64 {
-        bail!("keypair must contain exactly 64 byte values")
-    }
-    Keypair::try_from(bytes.as_slice()).context("invalid keypair bytes")
-}
-
-fn pubkey(value: &str) -> Result<Pubkey> {
-    Pubkey::from_str(value).with_context(|| format!("invalid public key {value}"))
-}
-
 fn transaction_json(transaction: &TransactionOutcome) -> Value {
     json!({ "signature": transaction.signature.to_string(), "confirmationSlot": transaction.confirmation_slot, "simulatedComputeUnits": transaction.simulated_compute_units })
 }
@@ -759,10 +298,10 @@ fn pool_creation_json(outcome: &PoolCreationOutcome) -> Value {
     json!({ "pool": outcome.create_pool.accounts.pool.to_string(), "mint0": outcome.create_pool.quote.mint_0.to_string(), "mint1": outcome.create_pool.quote.mint_1.to_string(), "create": transaction_json(&outcome.create_pool.transaction) })
 }
 
-fn user_flow_run_json(run: &UserFlowRun) -> Value {
+fn user_flow_run_json(run: &EphemeralRun<UserPool, UserFlowOutcome>) -> Value {
     json!({
-        "pool": run.pool.pool.to_string(), "mintA": run.pool.mint_a.to_string(), "mintB": run.pool.mint_b.to_string(), "user": run.user.to_string(), "startupFunding": transaction_json(&run.startup_funding),
-        "fundsReturned": { "lamports": run.lamports_returned, "lamportTransaction": run.lamport_return.as_ref().map(transaction_json), "tokenTransactions": run.token_returns.iter().map(transaction_json).collect::<Vec<_>>() }, "flow": user_flow_json(&run.outcome),
+        "pool": run.target.pool.to_string(), "mintA": run.target.mint_a.to_string(), "mintB": run.target.mint_b.to_string(), "user": run.user.to_string(), "startupFunding": submission_json(&run.startup_funding),
+        "fundsReturned": run.recovery.json(), "flow": user_flow_json(&run.outcome),
     })
 }
 
@@ -772,4 +311,14 @@ fn user_flow_json(outcome: &UserFlowOutcome) -> Value {
         "position": { "nftMint": outcome.open_position.accounts.position_nft_mint.to_string(), "personalPosition": outcome.open_position.accounts.personal_position.to_string(), "open": transaction_json(&outcome.open_position.transaction), "increase": transaction_json(&outcome.increase_liquidity.transaction), "decrease": transaction_json(&outcome.decrease_liquidity.transaction), "collect": transaction_json(&outcome.collect_position.transaction), "close": transaction_json(&outcome.close_position.transaction) },
         "swaps": { "exactIn": { "transaction": transaction_json(&outcome.swap_exact_in.transaction), "expectedInputRaw": outcome.swap_exact_in.quote.expected_input_raw, "expectedOutputRaw": outcome.swap_exact_in.quote.expected_output_raw }, "exactOut": { "transaction": transaction_json(&outcome.swap_exact_out.transaction), "expectedInputRaw": outcome.swap_exact_out.quote.expected_input_raw, "expectedOutputRaw": outcome.swap_exact_out.quote.expected_output_raw } },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn command_line_is_well_formed() {
+        super::Cli::command().debug_assert();
+    }
 }

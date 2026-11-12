@@ -7,18 +7,22 @@ the point is generating realistic traffic against it.
 
 ## Layout
 
-| Path | What |
-|---|---|
-| `crates/mtm-common` | Shared leaf types (`Symbol`) + layered config loading |
-| `crates/mtm-math` | Canonical fixed-point `Price` (i128 mantissa × 10^expo) + rust_decimal bridge |
-| `crates/mtm-chain` | Off-chain Solana toolkit: RPC clients, keypairs, (soon) tx pipeline |
-| `crates/oracle-client` | Typed client for the oracle service; owns the API wire types |
-| `crates/raydium-clmm-client` | Async Raydium CLMM pool, position, collection, close, and swap actions |
-| `crates/raydium-clmm-orchestrator` | Reusable funding and full CLMM lifecycle sequencing |
-| `services/oracle` | Polls Hermes → serves `/v1/prices` + `/v1/ws` → pushes on-chain (WIP) |
-| `services/raydium-clmm-orchestrator` | CLI with `admin` setup and complete `flow` lifecycle commands |
-| `programs/` | On-chain programs (empty for now — Anchor workspace lands here later) |
-| `config/` | Layered config: `default.toml` ← `{profile}.toml` ← `MTM_*` env vars |
+| Path                                   | What                                                                                               |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `crates/mtm-common`                    | Shared leaf types (`Symbol`) + layered config loading                                              |
+| `crates/mtm-math`                      | Canonical fixed-point `Price` (i128 mantissa × 10^expo) + rust_decimal bridge                      |
+| `crates/mtm-chain`                     | Off-chain Solana toolkit: RPC clients, keypairs, (soon) tx pipeline                                |
+| `crates/oracle-client`                 | Typed client for the oracle service; owns the API wire types                                       |
+| `crates/mtm-dex-harness`               | SPL builders, test-token funding, and the ephemeral-user CLI lifecycle shared by DEX orchestrators |
+| `crates/orca-whirlpool-client`         | Async Orca Whirlpool pool, tick-array, position, collection, close, and swap actions               |
+| `crates/orca-whirlpool-orchestrator`   | Reusable funding and full Whirlpool lifecycle sequencing                                           |
+| `crates/raydium-clmm-client`           | Async Raydium CLMM pool, position, collection, close, and swap actions                             |
+| `crates/raydium-clmm-orchestrator`     | Reusable funding and full CLMM lifecycle sequencing                                                |
+| `services/oracle`                      | Polls Hermes → serves `/v1/prices` + `/v1/ws` → pushes on-chain (WIP)                              |
+| `services/orca-whirlpool-orchestrator` | CLI with `admin`, `create-pools`, and `user-flow` commands for the Whirlpool fork                  |
+| `services/raydium-clmm-orchestrator`   | CLI with `admin` setup and complete `flow` lifecycle commands                                      |
+| `programs/`                            | On-chain programs (empty for now — Anchor workspace lands here later)                              |
+| `config/`                              | Layered config: `default.toml` ← `{profile}.toml` ← `MTM_*` env vars                               |
 
 ## Quickstart
 
@@ -299,6 +303,54 @@ Run `cargo run -p raydium-clmm-orchestrator-service -- create-pools --help` or
 `user-flow --help` for all options. Pool creation remains intentionally
 non-idempotent; use fresh mints/configuration or a fresh Surfpool when creating
 new pools.
+
+## Orca Whirlpool
+
+The Whirlpool stack mirrors the Raydium one: `orca-whirlpool-client` exposes
+single-pool actions (`ensure_config`, `create_pool`, `ensure_tick_arrays`,
+`open_position`, `increase_liquidity`, `decrease_liquidity`,
+`collect_position`, `close_position`, `swap_exact_in`, `swap_exact_out`, and
+the non-submitting `swap_instructions`), `orca-whirlpool-orchestrator`
+sequences them, and the `orca-whirlpool-orchestrator` CLI injects
+Doppler-provided signers. Every transaction is simulated before submission
+through `mtm-chain`. Quotes use `orca_whirlpools_core`, the same integer math
+the program executes; positions are Token-2022 NFTs.
+
+The program is a fork pinned to Orca's last Apache-2.0 commit, and the client
+crates are pinned to the matching Apache-2.0 releases. Read
+[docs/dex-forks.md](docs/dex-forks.md) before bumping anything.
+
+Unlike Raydium, the program has no compiled-in admin at that commit. The
+`WhirlpoolsConfig` is a keypair account (`KEYPAIR_ORCA_WHIRLPOOLS_CONFIG`);
+`admin` creates it with `KEYPAIR_PROGRAM_AUTHORITY` as fee, protocol-fee, and
+reward authority, then creates one fee tier. Re-running validates and returns
+`createdConfig: false`:
+
+```sh
+NO_DNA=1 just deploy-program-dev "KEYPAIR_ORCA_WHIRLPOOL" "../whirlpools/target/deploy/whirlpool.so"
+NO_DNA=1 just configure-orca-whirlpool-dev   # tick spacing 64, 0.30% fee, 3% protocol share
+```
+
+Override with `--tick-spacing`, `--default-fee-rate` (hundredths of a basis
+point), and `--default-protocol-fee-rate` (basis points of the trade fee).
+
+`create-pools` creates every unordered pair of the bootstrap mints and seeds
+the tick arrays covering `--seed-lower-price`..`--seed-upper-price` (default
+0.5..2, mint B per mint A), so user flows inside that range pay no tick-array
+rent. `user-flow` derives each pair's pool from the config and tick spacing,
+then runs the same fresh-user lifecycle as Raydium (fund → open → increase →
+exact-in → exact-out → withdraw → collect → close → return funds):
+
+```sh
+NO_DNA=1 just orca-whirlpool-create-pools-dev
+NO_DNA=1 just orca-whirlpool-user-flow-dev
+```
+
+Swaps pass five tick arrays around the current tick (three fixed plus two
+supplemental) and rely on the program's sparse-swap support for
+uninitialized ones. Orca core 1.0.4 never terminates when a quote walks past
+the loaded arrays, so the client bounds every quote at the sequence edge and
+reports an unfillable size as a quote error instead.
 
 ## Conventions
 
