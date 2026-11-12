@@ -10,6 +10,7 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
+janitor-interface = { workspace = true }
 manifest-dex-client = { workspace = true }
 manifest-dex-orchestrator = { workspace = true }
 mtm-chain = { workspace = true }

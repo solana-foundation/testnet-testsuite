@@ -579,41 +579,46 @@ pub async fn leftovers(
         );
     }
 
-    // Token accounts of scenario mints: pool / market vaults, plus anything
-    // a participant still holds.
+    // Token accounts of scenario mints, at known addresses (a token-program
+    // scan does not finish on a large cluster): the pool and market vaults,
+    // and every participant's and operator's associated token accounts.
     let wallets: HashSet<Pubkey> = participants(scenario)
         .iter()
         .map(|(_, k)| k.pubkey())
         .collect();
     let mut buckets = BTreeMap::new();
-    for token in scenario.tokens.values() {
-        let accounts = rpc
-            .call(
-                "getProgramAccounts",
-                json!([token.token_program.to_string(), {
-                    "encoding": "base64",
-                    "commitment": rpc.commitment,
-                    "dataSlice": { "offset": 32, "length": 32 },
-                    "filters": [{ "memcmp": { "offset": 0, "bytes": token.mint.to_string() } }],
-                }]),
-            )
-            .await
-            .with_context(|| format!("listing {}'s token accounts", token.name))?;
-        for account in accounts.as_array().into_iter().flatten() {
-            let lamports = account["account"]["lamports"].as_u64().unwrap_or(0);
-            let owner = account["account"]["data"][0]
-                .as_str()
-                .and_then(|b| base64_decode(b).ok())
-                .and_then(|raw| Pubkey::try_from(raw.as_slice()).ok());
-            if owner.is_some_and(|o| o == token.mint) {
-                continue; // the mint itself also matches offset 0 on some layouts
-            }
-            let label = match owner {
-                Some(o) if wallets.contains(&o) => "participant token accounts (not swept)",
-                Some(o) if operators.iter().any(|(_, k)| *k == o) => "operator token accounts",
-                _ => "pool / market vaults",
-            };
-            add(&mut buckets, label.to_owned(), lamports);
+    let mints: Vec<Pubkey> = scenario.tokens.values().map(|token| token.mint).collect();
+    for vault in crate::janitor::vaults(rpc, programs, &mints).await?.0 {
+        add(
+            &mut buckets,
+            "pool / market vaults".to_owned(),
+            vault.lamports,
+        );
+    }
+    let holders: Vec<(&str, Pubkey)> = wallets
+        .iter()
+        .map(|wallet| ("participant token accounts (not swept)", *wallet))
+        .chain(
+            operators
+                .iter()
+                .map(|(_, key)| ("operator token accounts", *key)),
+        )
+        .collect();
+    let atas: Vec<(&str, Pubkey)> = holders
+        .iter()
+        .flat_map(|(label, holder)| {
+            scenario.tokens.values().map(move |token| {
+                (
+                    *label,
+                    spl::associated_token_address(holder, &token.mint, &token.token_program),
+                )
+            })
+        })
+        .collect();
+    let keys: Vec<Pubkey> = atas.iter().map(|(_, key)| *key).collect();
+    for ((label, _), account) in atas.iter().zip(crate::janitor::accounts(rpc, &keys).await?) {
+        if let Some(account) = account {
+            add(&mut buckets, (*label).to_owned(), account.lamports);
         }
     }
     let (rows, total) = render(buckets);

@@ -121,6 +121,23 @@ NO_DNA=1 just scenario-testnet          # bootstrap + run (prd Doppler config)
 NO_DNA=1 just scenario-status-testnet
 ```
 
+Programs are compared by code hash (`scenario check-programs`: sha256 of
+the program data's ELF, trailing zero padding dropped). The expected hash is
+the program's entry in the lock file `deploy` records,
+`bootstrap/scenario/programs-<target>.lock` (`.scenario/programs-local.lock`
+locally; `SCENARIO_PROGRAMS_LOCK` overrides), else the hash of its fork
+artifact. Commit the lock for a shared target: a run-only host then
+verifies without the artifacts, and a rebuilt artifact (SBF builds are not
+reproducible across toolchains) does not turn a healthy deployment into a
+mismatch. `deploy` skips a program that runs its expected code; one running
+anything else (the janitor after a failed teardown, an older fork build) is
+refused, and `SCENARIO_UPGRADE_PROGRAMS=1` upgrades it to the artifact.
+`up` runs the same check before it starts anything and refuses a program
+that is not deployed or does not run its expected code, printing both
+hashes. On a remote target, a program with neither a lock entry nor an
+artifact is refused too (locally it only warns);
+`SCENARIO_SKIP_PROGRAM_CHECK=1` skips the check.
+
 The testnet profile slows every maker 5× and flow to 4 trades/min for the
 public RPC; set `SCENARIO_RPC_URL` (and `SCENARIO_WS_URL`) to a dedicated
 endpoint for sustained runs. `SCENARIO_SEED` is mandatory there.
@@ -339,7 +356,9 @@ transactions failed). The limits, in order:
 
 `scenario.sh teardown` (`just scenario-teardown-dev` / `-testnet`) recovers
 the scenario's SOL into the faucet. Before stopping anything it checks the
-faucet key, the program authority (with `SCENARIO_CLOSE_PROGRAMS`) and
+faucet key, the program authority, the janitor `.so` and the three fork
+artifacts (with `SCENARIO_JANITOR`: each must be readable and be exactly the
+deployed code, or the restore could not put it back) and
 `scenario check` (seed, program ids and mints resolve), so a missing secret
 cannot leave the run half torn down; like `snapshot` and `report` it runs at
 the scale `up` recorded unless `SCENARIO_SCALE` names it:
@@ -353,30 +372,113 @@ the scale `up` recorded unless `SCENARIO_SCALE` names it:
    the faucet, and the remaining SOL follows, leaving each wallet at 0.
    Token accounts holding anything else (e.g. a position NFT whose close
    failed) are left open and listed instead of burned;
-4. with `SCENARIO_CLOSE_PROGRAMS=1`, closes the three DEX programs
-   (programdata rent to the faucet; the pools stop working);
+4. with `SCENARIO_JANITOR=1`, closes every account the DEX programs own
+   (pools, tick arrays, positions, observation and bitmap accounts, venue
+   configs, Manifest markets) with the janitor (below);
 5. sweeps the operator wallets (program / mint / freeze / metadata
    authorities) into the faucet: by default on `local`, opt-in on testnet
    (`SCENARIO_SWEEP_OPERATORS=1`), where those keys are shared;
 6. writes `.scenario/teardown.json` (what moved) and
    `.scenario/leftovers.json` (`scenario leftovers`: the rent still locked,
-   by owner program and account type).
+   by owner program and account type; scenario-mint token accounts are
+   read at known addresses, the pool and market vaults as the janitor finds
+   them plus every participant's and operator's associated token accounts).
 
 Every step is idempotent, so a teardown can be re-run after a partial
 failure; `scenario leftovers` can also be run on its own at any time.
 
-What stays locked has no close instruction in the forked programs (or is a
-mint): pools, tick arrays, observation and bitmap accounts, venue configs,
-Manifest markets, pool/market vaults, the mints and their Metaplex
-metadata, and the 36-byte stubs of closed programs. Measured on the x2000
-chain (33 086 participants, 3 tokens, 7 pools) on 2026-10-13:
+The three DEX programs are never closed: a closed program ID can never be
+deployed to again (`deploy` refuses one), so the next run would need new
+program keypairs and configs. Their programdata (~20.3 SOL) stays locked
+between runs. Once SIMD-0433 is active (an upgrade resizes programdata to
+the new code and refunds the rest), teardown will park them on a no-op
+program instead, which keeps the IDs at almost no rent.
+
+### The janitor (`programs/janitor`)
+
+The forked DEX programs have no instruction that closes pools, tick
+arrays, markets or their vaults, but whatever code runs at a program ID
+owns that ID's accounts and can sign for its PDAs. The janitor is a small
+Pinocchio program, deployed over each DEX program at the end of a run, with
+two permissioned instructions. The signer must be one of the authorities
+compiled into the binary (the program authority and the faucet of the
+Doppler config it was built for), and every account is checked before it is
+touched; any failure fails the whole instruction.
+
+- `Close`: accounts the program owns (writable, not executable); each
+  one's lamports go to the signer, then it is closed.
+- `CloseTokenAccounts`: token accounts (Token or Token-2022) held by one of
+  the program's PDAs. The client passes the PDA's seeds, so one instruction
+  covers every protocol's vault layout; the program derives the address
+  from them and its own ID, checks that each account is an initialized
+  account of the given mint held by that PDA, burns any balance and closes
+  it, signing as the PDA.
+
+```sh
+just build-janitor dev        # target/janitor/dev/janitor.so, dev authorities baked in
+just test-janitor             # LiteSVM tests against a build with test-only authorities
+SCENARIO_JANITOR=1 SCENARIO_JANITOR_SO=target/janitor/dev/janitor.so just scenario-teardown-dev
+```
+
+`teardown` upgrades each DEX program to the janitor (after the participant
+unwind, which still needs the real code) and runs `scenario janitor`, which:
+
+1. refuses to send anything unless every program's on-chain code is
+   byte-for-byte that `.so` (a close sent to a real DEX program would be
+   read as one of its own instructions), then waits until the cluster is
+   past the upgrade slot (an upgraded program runs its new code from the
+   next slot);
+2. closes the vaults, without scanning the token programs (a
+   `getProgramAccounts` over Token does not finish on a large cluster): it
+   reads the vault addresses from every Whirlpool and PoolState account on
+   the program IDs and derives Manifest's, `["vault", market, mint]` for
+   every market and scenario mint, then matches each vault's owner against
+   the venue's vault authority, re-derived from the pool's own seeds (Orca:
+   the whirlpool `["whirlpool", config, mint_a, mint_b, tick_spacing_seed]`;
+   Raydium: the pool `["pool", amm_config, mint_0, mint_1(, seed_index)]`
+   or the vault `["pool_vault", pool, mint]`; Manifest: the vault itself);
+   vaults held by anyone else are left alone and counted
+   (`vaultsNotHeldByTheVenue`);
+3. closes every account the programs own.
+
+Before the first upgrade, `scenario janitor-plan` reads what the run will
+close (`.scenario/janitor-plan.json`) and the script warns when vaults hold
+non-scenario mints (another operator's pools on shared program IDs).
+
+It then upgrades the forks back, empty: `bootstrap` re-creates configs, pools and
+markets on the same chain. The restore runs on every exit once the first
+upgrade to the janitor has started: a failed or interrupted `scenario
+janitor` or upgrade, Ctrl-C (a second one stops only the deploy in flight),
+SIGTERM or a hang-up. Every program whose janitor upgrade was attempted is
+redeployed (whatever a lagging RPC node shows), past a failed one, and all
+three are then checked; if any is left, the run fails listing it, and
+`deploy` / `up` refuse it until `SCENARIO_UPGRADE_PROGRAMS=1 scenario.sh
+deploy` restores it. The restore's deploy output goes to
+`.scenario/logs/janitor-restore.log`; run a testnet teardown under tmux or
+`nohup` all the same. `.scenario/janitor-incomplete` is written before
+`scenario janitor` closes anything and removed only when it finishes with no
+account left: while it exists the forks may hold pools without their
+vaults, the failure message says so, and `up` refuses until a janitor
+teardown finishes. Building needs the Agave platform tools
+(`cargo-build-sbf`, Agave >= 4.x) and `PUBKEY_PROGRAM_AUTHORITY` /
+`PUBKEY_FAUCET` in the Doppler config.
+
+Without the janitor, what stays locked has no close instruction in the
+forked programs (or is a mint): pools, tick arrays, observation and bitmap
+accounts, venue configs, Manifest markets, pool/market vaults, the mints
+and their Metaplex metadata. With `SCENARIO_JANITOR=1` only the mints
+(classic Token mints cannot be closed) with their metadata remain besides
+the programs' ~20.3 SOL of programdata. The figures below were measured
+when teardown still closed the programs (since removed): 0.055 SOL locked
+on the base scenario (from 21.80) on a test validator on 2026-10-14, and on
+the x2000 chain (33 086 participants, 3 tokens, 7 pools) on 2026-10-13:
 
 | recovered into the faucet                   | SOL       |
 | ------------------------------------------- | --------- |
 | participant wallets (33 086, all left at 0) | 16 715.19 |
 | token-account rent (99 222 accounts closed) | 202.34    |
 | operator wallets                            | 200 000   |
-| programdata (`SCENARIO_CLOSE_PROGRAMS=1`)   | 20.29     |
+| programdata (programs closed; now kept)     | 20.29     |
 
 | still locked                                               | accounts | SOL   |
 | ---------------------------------------------------------- | -------- | ----- |

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "services/arb",
+    "crates/janitor-interface",
     "crates/mtm-chain",
     "crates/mtm-common",
     "crates/mtm-dex-harness",
@@ -27,6 +28,8 @@ members = [
     "services/router",
     "services/scenario",
 ]
+# The janitor builds with the SBF toolchain in its own workspace.
+exclude = ["programs/janitor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,6 +38,7 @@ rust-version = "1.97"
 publish = false
 
 [workspace.dependencies]
+janitor-interface = { path = "crates/janitor-interface" }
 mtm-chain = { path = "crates/mtm-chain" }
 mtm-common = { path = "crates/mtm-common" }
 mtm-dex-harness = { path = "crates/mtm-dex-harness" }

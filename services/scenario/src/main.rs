@@ -9,6 +9,7 @@
 //!
 //! `snapshot` and `report` account for every participant (see `pnl`).
 
+mod janitor;
 mod pnl;
 mod rpc;
 mod settle;
@@ -64,6 +65,36 @@ enum Command {
     /// Resolve the scenario (seed, program ids, mints) and change nothing:
     /// the preflight for commands that must not fail halfway.
     Check,
+    /// Fail unless each program runs its expected code, by hash: its
+    /// `--lock` entry, else its fork artifact (`deploy` / `up` / janitor
+    /// preflight: a failed janitor teardown leaves the janitor there).
+    /// Needs no scenario resolution, so it runs before the mints exist.
+    CheckPrograms {
+        /// `<program id>=<artifact .so>`, repeated.
+        #[arg(long = "program", value_parser = parse_program, required = true)]
+        programs: Vec<(Pubkey, PathBuf)>,
+        /// The janitor binary, so a program left running it is named as such.
+        #[arg(long)]
+        janitor_so: Option<PathBuf>,
+        /// A program that is not deployed passes (`deploy` creates it).
+        #[arg(long)]
+        allow_absent: bool,
+        /// `<program id> <sha256>` lines recorded by `deploy`: the expected
+        /// code ahead of the artifact (a missing file has no entries).
+        #[arg(long)]
+        lock: Option<PathBuf>,
+        /// On success, record each matching program's hash in `--lock`.
+        #[arg(long, requires = "lock")]
+        record: bool,
+        /// Fail, rather than warn, when a program has neither a lock entry
+        /// nor an artifact to compare with.
+        #[arg(long)]
+        require_verified: bool,
+        /// Each artifact must exist and be exactly the deployed code (the
+        /// janitor preflight: its restore deploys the artifacts).
+        #[arg(long)]
+        require_artifact: bool,
+    },
     /// Wait until the oracle has a fresh price for every scenario token
     /// (pools are created at oracle prices).
     WaitPrices {
@@ -123,6 +154,19 @@ enum Command {
         #[arg(long = "operator-env", default_values_t = OPERATOR_ENVS.map(String::from))]
         operator_envs: Vec<String>,
     },
+    /// Close every account the DEX programs own, after the janitor program
+    /// was deployed over them; the rent goes to the signing authority.
+    Janitor {
+        /// The janitor binary deployed over the programs (checked on chain).
+        #[arg(long)]
+        janitor_so: PathBuf,
+        /// One of the authorities compiled into that binary.
+        #[arg(long, default_value = "KEYPAIR_FAUCET")]
+        authority_keypair_env: String,
+    },
+    /// What `janitor` would close (vaults by holder and mint, accounts per
+    /// program), read without changing anything: run before the upgrade.
+    JanitorPlan,
 }
 
 /// Operator keypairs the bootstrap funds (each is skipped when unset).
@@ -172,6 +216,28 @@ async fn main() -> Result<()> {
         },
     )?;
     let rpc = rpc::JsonRpc::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    if let Command::CheckPrograms {
+        programs,
+        janitor_so,
+        allow_absent,
+        lock,
+        record,
+        require_verified,
+        require_artifact,
+    } = &cli.command
+    {
+        let options = janitor::CheckOptions {
+            allow_absent: *allow_absent,
+            require_verified: *require_verified,
+            require_artifact: *require_artifact,
+            lock: lock.clone(),
+            record: *record,
+        };
+        let report =
+            janitor::check_programs(&rpc, programs, janitor_so.as_deref(), &options).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let report = match cli.command {
         Command::Bootstrap {
@@ -191,6 +257,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status => status(&chain, &scenario).await?,
+        Command::CheckPrograms { .. } => unreachable!("handled before the scenario resolves"),
         Command::Check => json!({
             "ok": true,
             "participants": scenario.participants().len(),
@@ -260,6 +327,16 @@ async fn main() -> Result<()> {
             };
             teardown::teardown(&chain, &rpc, &scenario, &faucet, operators).await?
         }
+        Command::Janitor {
+            janitor_so,
+            authority_keypair_env,
+        } => {
+            let elf = std::fs::read(&janitor_so)
+                .with_context(|| format!("reading {}", janitor_so.display()))?;
+            let authority = keypair_from_environment(&authority_keypair_env)?;
+            janitor::run(&chain, &rpc, &scenario, &authority, &elf).await?
+        }
+        Command::JanitorPlan => janitor::plan(&rpc, &scenario).await?,
         Command::Leftovers {
             faucet_keypair_env,
             operator_envs,
@@ -588,4 +665,14 @@ fn round_sf(value: Decimal, digits: u32) -> Result<Decimal> {
         .map(|rounded| rounded.normalize())
         .filter(|rounded| !rounded.is_zero())
         .with_context(|| format!("price {value} does not round to a usable value"))
+}
+
+fn parse_program(spec: &str) -> Result<(Pubkey, PathBuf), String> {
+    let (program, path) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("expected <program id>=<artifact .so>, got {spec}"))?;
+    let program = program
+        .parse()
+        .map_err(|error| format!("program id {program}: {error}"))?;
+    Ok((program, PathBuf::from(path)))
 }
