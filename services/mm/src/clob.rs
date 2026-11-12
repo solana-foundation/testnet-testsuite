@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use manifest_dex_client::{ManifestClient, OrderSpec, Side, TokenAmount};
@@ -22,8 +23,8 @@ pub struct Clob {
     client: ManifestClient,
     /// Mid and `(sequence, base atoms)` of the ladder last placed.
     last: Option<(Decimal, Vec<(u64, u64)>)>,
-    /// Whether the ladder was pulled for a stale oracle (and not re-quoted).
-    pulled: bool,
+    /// When to pull the ladder for an untrustworthy oracle.
+    guard: OracleGuard,
 }
 
 impl Clob {
@@ -58,7 +59,7 @@ impl Clob {
         Ok(Self {
             client,
             last: None,
-            pulled: false,
+            guard: OracleGuard::default(),
         })
     }
 
@@ -83,26 +84,36 @@ impl Clob {
             skew_bps,
             target_base_ratio,
         };
-        let prices = ctx.prices().await?;
-        let mid = match prices.pair(&ctx.base, &ctx.quote) {
-            Ok(mid) => mid,
-            Err(error) => {
+        let now = Instant::now();
+        let read = match ctx.prices().await {
+            Ok(prices) => match prices.pair(&ctx.base, &ctx.quote) {
+                Ok(mid) => Ok((prices, mid)),
+                Err(error) => Err((error, true)),
+            },
+            Err(error) => Err((error, false)),
+        };
+        let (prices, mid) = match read {
+            Ok(read) => {
+                self.guard.good(now);
+                read
+            }
+            Err((error, stale)) => {
                 // Orders quoted on an old price get picked off: pull them
-                // once until the oracle is fresh again (also orders left
-                // from before a restart).
-                if !self.pulled {
+                // once until the oracle is back (also orders left from
+                // before a restart), whether it serves old prices or none.
+                let max_age = Duration::from_millis(ctx.scenario.config.max_price_age_ms);
+                if self.guard.failed(now, stale, max_age) {
                     self.client
                         .cancel_all_orders(ctx.pool)
                         .await
-                        .context("pulling quotes on a stale oracle")?;
-                    self.pulled = true;
+                        .context("pulling quotes without a fresh oracle price")?;
+                    self.guard.pulled();
                     self.last = None;
                     ctx.action("pull");
                 }
                 return Err(error);
             }
         };
-        self.pulled = false;
         let snapshot = self.client.load_market(ctx.pool).await?;
         let seat = snapshot
             .book
@@ -189,6 +200,8 @@ const MIN_LEVEL_SHARE: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
 /// Quote atoms reserved per bid: its lock rounds up by up to one, and the
 /// client keeps one more as margin.
 const BID_RESERVE_ATOMS: i64 = 2;
+/// Consecutive failed oracle reads before the ladder is pulled.
+const PULL_AFTER_FAILURES: u32 = 3;
 
 /// The `clob-ladder` strategy's shape.
 #[derive(Debug, Clone)]
@@ -307,6 +320,44 @@ fn ladder(
         }
     }
     Ladder { orders, lean }
+}
+
+/// Whether the oracle can be trusted to keep the ladder resting.
+#[derive(Debug, Default)]
+struct OracleGuard {
+    /// Consecutive failed price reads.
+    failures: u32,
+    /// When the last fresh mid was read.
+    last_good: Option<Instant>,
+    /// The ladder was pulled and not re-quoted since.
+    pulled: bool,
+}
+
+impl OracleGuard {
+    fn good(&mut self, now: Instant) {
+        self.failures = 0;
+        self.last_good = Some(now);
+        self.pulled = false;
+    }
+
+    /// Record a failed read; whether to pull the ladder now. A stale or
+    /// missing price pulls at once. An unreachable oracle pulls after
+    /// [`PULL_AFTER_FAILURES`] consecutive failures, or once the last good
+    /// mid is `max_age` old (or there was none), so one dropped request
+    /// does not empty the book.
+    fn failed(&mut self, now: Instant, stale: bool, max_age: Duration) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        !self.pulled
+            && (stale
+                || self.failures >= PULL_AFTER_FAILURES
+                || self
+                    .last_good
+                    .is_none_or(|at| now.saturating_duration_since(at) >= max_age))
+    }
+
+    fn pulled(&mut self) {
+        self.pulled = true;
+    }
 }
 
 #[cfg(test)]
@@ -428,5 +479,32 @@ mod tests {
             );
             assert!(ladder.orders.len() <= 2 * p.levels as usize);
         }
+    }
+
+    #[test]
+    fn one_dropped_oracle_read_does_not_pull() {
+        let max_age = Duration::from_secs(30);
+        let start = Instant::now();
+        let mut guard = OracleGuard::default();
+        // No good mid yet (startup, or left from a restart): pull.
+        assert!(guard.failed(start, false, max_age));
+        guard.pulled();
+        assert!(!guard.failed(start, false, max_age), "pulled once only");
+        guard.good(start);
+        let later = |secs| start + Duration::from_secs(secs);
+        assert!(!guard.failed(later(1), false, max_age));
+        assert!(!guard.failed(later(2), false, max_age));
+        assert!(
+            guard.failed(later(3), false, max_age),
+            "third failure in a row"
+        );
+        // A good read resets the count; the age alone also pulls.
+        guard.good(later(4));
+        assert!(!guard.failed(later(5), false, max_age));
+        guard.good(later(6));
+        assert!(guard.failed(later(36), false, max_age));
+        // A reachable oracle serving a stale price pulls at once.
+        guard.good(later(40));
+        assert!(guard.failed(later(41), true, max_age));
     }
 }
