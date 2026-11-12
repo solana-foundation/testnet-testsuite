@@ -800,6 +800,23 @@ async fn a_hanging_rebroadcast_does_not_delay_the_verdict() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn rebroadcasts_back_off() {
+    // Valid until height 60 (about 20 s); every 2 s would be 11 sends.
+    let mock = MockRpc::new(scripted(60, |_| Value::Null));
+    let payer = Keypair::new();
+    let error = client(&mock)
+        .submit(vec![noop(&payer)], &payer, &[], SubmissionConfig::default())
+        .await
+        .expect_err("never lands");
+    assert!(
+        matches!(error, SubmissionError::Expired { .. }),
+        "{error:?}"
+    );
+    // At 0, 2, 6 and 14 s, then every 8 s.
+    assert_eq!(mock.count("sendTransaction"), 4);
+}
+
+#[tokio::test(start_paused = true)]
 async fn heights_are_read_before_statuses() {
     let mock = MockRpc::new(scripted(1000, after(3, mock::status(9, "confirmed", None))));
     client(&mock)

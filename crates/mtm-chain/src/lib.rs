@@ -504,7 +504,7 @@ impl ChainClient {
             skip_preflight: true,
             ..delivery.send
         };
-        let interval = delivery.rebroadcast_interval;
+        let mut interval = delivery.rebroadcast_interval;
         let verdict = loop {
             let wait = interval;
             // Raced against the verdict, so a slow resend never delays it.
@@ -527,7 +527,11 @@ impl ChainClient {
                 () = &mut cap => {
                     break Ok(Verdict::Ambiguous(format!("no confirmation within {timeout:?}")));
                 }
-                () = rebroadcast => {}
+                () = rebroadcast => {
+                    interval = interval.map(|interval| {
+                        (interval * 2).min(MAX_REBROADCAST_INTERVAL.max(interval))
+                    });
+                }
             }
         };
         match verdict {
@@ -554,6 +558,9 @@ impl ChainClient {
 /// How long past the hard cap a caller still waits for the confirmer's
 /// verdict before giving up on its own.
 const CAP_SLACK: Duration = Duration::from_secs(2);
+
+/// Rebroadcasts back off (doubling) up to this interval.
+const MAX_REBROADCAST_INTERVAL: Duration = Duration::from_secs(8);
 
 /// Smallest limit [`sized_compute_unit_limit`] requests.
 pub const MIN_SIZED_COMPUTE_UNITS: u32 = 10_000;
