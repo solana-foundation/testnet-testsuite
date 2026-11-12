@@ -9,6 +9,7 @@
 #                                       "mtm — market-making scenario")
 #   scenario.sh down                    stop every service started by `up`/`observe`
 #                                       (TERM, then KILL after 30 s)
+#   scenario.sh supervise NAME CMD...   (internal) rerun CMD whenever it exits
 #
 # Secrets come from the environment (normally `doppler run --`; see
 # bootstrap/scenario/README.md). Every step is idempotent, so `up` can be
@@ -16,6 +17,44 @@
 # SCENARIO_SEED, pools are only created when missing, and wallets are only
 # topped up to their targets.
 set -euo pipefail
+
+supervise() { # name, command...: rerun the command whenever it exits, with bounded backoff
+  # `up` runs the oracle under this (`scenario.sh supervise oracle <bin>`):
+  # the oracle exits on any dead task and must come back on its own. TERM
+  # (from `stop`) goes to the child and ends the loop. Backoff doubles from
+  # 1 s to 30 s while the command keeps dying within a minute, and resets
+  # after a longer run; after SCENARIO_MAX_FAST_RESTARTS (default 5) fast
+  # exits in a row it gives up, so a broken config fails `up` instead of
+  # looping forever.
+  local name="$1"; shift
+  local child="" delay=1 fast=0 restarts=0 started ran status
+  local max_fast="${SCENARIO_MAX_FAST_RESTARTS:-5}"
+  trap '[[ -n "$child" ]] && kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT
+  while true; do
+    started=$SECONDS
+    "$@" &
+    child=$!
+    status=0; wait "$child" || status=$?
+    child=""
+    ran=$(( SECONDS - started ))
+    if (( ran >= 60 )); then delay=1 fast=0; else fast=$(( fast + 1 )); fi
+    if (( fast > max_fast )); then
+      echo "$(date -Is) supervise: $name exited (status $status) $fast times in a row within 60 s; giving up"
+      exit 1
+    fi
+    restarts=$(( restarts + 1 ))
+    echo "$(date -Is) supervise: $name exited (status $status) after ${ran}s; restart #$restarts in ${delay}s"
+    sleep "$delay" & child=$!
+    wait "$child" || true
+    child=""
+    delay=$(( delay * 2 > 30 ? 30 : delay * 2 ))
+  done
+}
+
+if [[ "${1:-}" == supervise ]]; then
+  shift
+  supervise "$@"
+fi
 
 cmd="${1:-up}"
 target="${2:-local}"
@@ -221,13 +260,14 @@ case "$cmd" in
   up)
     build
     tokens
-    start oracle "$bin/oracle"
-    wait_http http://127.0.0.1:8180/health oracle
-    # Pools are created at live oracle prices: wait for the first prices.
-    for _ in $(seq 1 60); do
-      [[ "$(curl -sf http://127.0.0.1:8180/v1/prices | grep -o '"symbol"' | wc -l)" -ge 3 ]] && break
-      sleep 1
-    done
+    # Supervised: the oracle exits when any of its tasks dies, and comes
+    # back (restarts are logged in .scenario/logs/oracle.log). Its synthetic
+    # generator state survives the restart.
+    (export MTM_ORACLE__STATE_PATH="$state/state/oracle-pricing.json"
+      start oracle "$root/bootstrap/scenario/scenario.sh" supervise oracle "$bin/oracle")
+    # Pools are created at live oracle prices: wait until every instrument
+    # has a fresh price, not just a listening socket.
+    wait_http http://127.0.0.1:8180/ready oracle
     "$bin/scenario" bootstrap | tee "$state/bootstrap.json"
     (router_env; start router "$bin/router")
     wait_http http://127.0.0.1:8181/health router

@@ -68,6 +68,9 @@ just scenario-down                   # stop services (Surfpool state is in memor
 
 Grafana: <http://127.0.0.1:3100> (admin/admin), dashboard **mtm — market-making
 scenario**. Prometheus: <http://127.0.0.1:9190>. Logs: `.scenario/logs/`.
+The oracle runs under a restart loop (it exits when any of its tasks dies);
+each restart is a `supervise:` line in `.scenario/logs/oracle.log`, and `up`
+waits on its `/ready` before bootstrapping pools.
 Scenario ports (oracle 8180, router 8181, metrics 9180–9183, Prometheus 9190,
 Grafana 3100) are chosen so the default `just up` stack can run alongside.
 
