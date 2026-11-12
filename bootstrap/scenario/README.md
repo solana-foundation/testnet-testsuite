@@ -105,7 +105,7 @@ endpoint for sustained runs. `SCENARIO_SEED` is mandatory there.
 | `mm_oracle_price`                                                                    | pair                        | oracle pair price the makers use                    |
 | `mm_venue_price`, `mm_deviation_bps`                                                 | maker, venue                | venue price and its gap to the oracle               |
 | `mm_inventory`, `mm_inventory_value_usd`                                             | maker, token                | holdings (wallet + seat) and USD value              |
-| `mm_actions_total`                                                                   | maker, action               | requote / open / close / arb_buy / arb_sell         |
+| `mm_actions_total`                                                                   | maker, action               | requote(\_trimmed/\_empty) pull open close arb\_\*  |
 | `mm_errors_total`, `mm_panics_total`, `venue_quote_panics_total`                     | maker, stage / venue        | failures (ticks retry)                              |
 | `mm_skew_bps`, `mm_arb_volume_micro_usd_total`, `mm_tick_seconds`                    | maker                       | skew, arbitrage volume (µUSD), tick latency         |
 | `flow_swaps_total`                                                                   | pair, status, outcome, size | routed swaps landed/failed, why, normal/large       |

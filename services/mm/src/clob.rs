@@ -15,7 +15,7 @@ use mtm_scenario::Strategy;
 use mtm_scenario::venue::to_ui;
 use rust_decimal::{Decimal, RoundingStrategy};
 use solana_commitment_config::CommitmentConfig;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::maker::Ctx;
 
@@ -163,32 +163,93 @@ impl Clob {
         // Size from the snapshot the batch is built on (again on its
         // stale-cancel retry, after the fill that caused it), not this one.
         let lean = Cell::new(Decimal::ZERO);
+        // The ladder of the attempt that landed (the closure runs again on
+        // a retry), to compare with what the client could fund.
+        let requested = std::cell::RefCell::new(Vec::new());
         let outcome = self
             .client
             .replace_orders_with(ctx.pool, |snapshot, seat| {
                 let Ok((base_atoms, quote_atoms)) = snapshot.book.holdings(seat) else {
+                    requested.borrow_mut().clear();
                     return vec![];
                 };
                 let ladder = ladder(mid, base_atoms, quote_atoms, decimals, &params);
                 lean.set(ladder.lean);
+                requested.borrow_mut().clone_from(&ladder.orders);
                 ladder.orders
             })
             .await?;
-        ctx.action("requote");
+        let placement = placement(&requested.borrow(), &outcome.placed);
+        match placement {
+            Placement::Full => ctx.action("requote"),
+            Placement::Trimmed => {
+                ctx.action("requote");
+                ctx.action("requote_trimmed");
+                warn!(maker = %ctx.maker.name, requested = requested.borrow().len(), placed = outcome.placed.len(), "ladder trimmed to the seat's balance");
+            }
+            Placement::Nothing => {
+                ctx.action("requote_empty");
+                warn!(maker = %ctx.maker.name, requested = requested.borrow().len(), "batch placed nothing: the seat could fund no order");
+            }
+        }
         metrics::gauge!("mm_skew_bps", "maker" => ctx.name()).set(
             rust_decimal::prelude::ToPrimitive::to_f64(&(lean.get() * Decimal::from(skew_bps)))
                 .unwrap_or_default(),
         );
-        self.last = Some((
+        self.last = next_last(placement, mid, &outcome.resting);
+        Ok(())
+    }
+}
+
+/// How the orders a batch placed compare with the ladder it asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Full,
+    /// Smaller or fewer orders than asked (the client fits a batch to the
+    /// seat's balance).
+    Trimmed,
+    /// Nothing placed: the batch only cancelled.
+    Nothing,
+}
+
+fn placement(requested: &[OrderSpec], placed: &[OrderSpec]) -> Placement {
+    let total = |orders: &[OrderSpec], side| -> Decimal {
+        orders
+            .iter()
+            .filter(|o| o.side == side)
+            .map(|o| o.base_amount)
+            .sum()
+    };
+    if placed.is_empty() {
+        Placement::Nothing
+    } else if placed.len() == requested.len()
+        && [Side::Bid, Side::Ask]
+            .into_iter()
+            .all(|side| total(placed, side) == total(requested, side))
+    {
+        Placement::Full
+    } else {
+        Placement::Trimmed
+    }
+}
+
+/// The ladder to compare the next tick against. A batch that placed
+/// nothing leaves no ladder, so the next tick requotes instead of waiting
+/// for the mid to move `refresh_bps` with an empty book.
+fn next_last(
+    placement: Placement,
+    mid: Decimal,
+    resting: &[manifest_dex_client::BookOrder],
+) -> Option<(Decimal, Vec<(u64, u64)>)> {
+    (placement != Placement::Nothing).then(|| {
+        (
             mid,
-            outcome
-                .resting
+            resting
                 .iter()
                 .map(|o| (o.sequence_number, o.base_atoms))
                 .collect(),
-        ));
-        Ok(())
-    }
+        )
+    })
 }
 
 /// Share of each side's inventory the ladder quotes: the rest absorbs a
@@ -479,6 +540,29 @@ mod tests {
             );
             assert!(ladder.orders.len() <= 2 * p.levels as usize);
         }
+    }
+
+    #[test]
+    fn a_trimmed_or_empty_batch_is_not_a_normal_requote() {
+        let order = |side, base: &str| OrderSpec {
+            side,
+            price: d("1"),
+            base_amount: d(base),
+        };
+        let asked = [order(Side::Bid, "10"), order(Side::Ask, "10")];
+        assert_eq!(placement(&asked, &asked), Placement::Full);
+        // A fitted bid, or a dropped one.
+        let shrunk = [order(Side::Ask, "10"), order(Side::Bid, "4")];
+        assert_eq!(placement(&asked, &shrunk), Placement::Trimmed);
+        assert_eq!(placement(&asked, &asked[1..]), Placement::Trimmed);
+        assert_eq!(placement(&asked, &[]), Placement::Nothing);
+
+        // A cancel-only batch leaves no ladder: the next tick requotes.
+        assert_eq!(next_last(Placement::Nothing, d("1"), &[]), None);
+        assert_eq!(
+            next_last(Placement::Trimmed, d("1"), &[]),
+            Some((d("1"), vec![]))
+        );
     }
 
     #[test]
