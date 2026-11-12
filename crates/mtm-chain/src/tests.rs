@@ -139,6 +139,7 @@ async fn send_versioned_rpc_rejection_is_not_polled() {
         .await
         .expect_err("rejected");
     assert!(matches!(error, SubmissionError::Submission(_)), "{error:?}");
+    assert_eq!(mock.count("sendTransaction"), 1);
     assert_eq!(mock.count("getSignatureStatuses"), 0);
 }
 
@@ -914,6 +915,65 @@ async fn a_short_status_answer_is_a_failed_read() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_caller_that_stops_waiting_is_dropped() {
+    let mock = MockRpc::new(node(Value::Null));
+    let chain = client(&mock);
+    let tx = signed(&Keypair::new());
+    let wait = chain.send_versioned(&tx, VersionedSendConfig::default());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_000), wait)
+            .await
+            .is_err()
+    );
+    let reads = mock.count("getSignatureStatuses");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(mock.count("getSignatureStatuses"), reads);
+}
+
+#[test]
+fn the_confirmer_outlives_its_runtime() {
+    let mock = MockRpc::new(node(mock::status(9, "confirmed", None)));
+    let chain = client(&mock);
+    let tx = signed(&Keypair::new());
+    for _ in 0..2 {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let outcome = runtime
+            .block_on(chain.send_versioned(&tx, VersionedSendConfig::default()))
+            .expect("confirmed on each runtime");
+        assert_eq!(outcome.confirmation_slot, 9);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_commitment_reads_its_height_once_per_tick() {
+    let mock = MockRpc::new(node(mock::status(9, "finalized", None)));
+    let chain = client(&mock);
+    let finalized = chain.with_commitment(CommitmentConfig::finalized());
+    let (a, b) = (signed(&Keypair::new()), signed(&Keypair::new()));
+    let (x, y, z) = tokio::join!(
+        chain.send_versioned(&a, VersionedSendConfig::default()),
+        chain.send_versioned(&b, VersionedSendConfig::default()),
+        finalized.send_versioned(&a, VersionedSendConfig::default()),
+    );
+    assert!(x.is_ok() && y.is_ok() && z.is_ok());
+    let heights = mock.calls("getBlockHeight");
+    assert_eq!(heights.len(), 2, "{heights:?}");
+    for level in ["confirmed", "finalized"] {
+        assert!(
+            heights
+                .iter()
+                .any(|params| params.to_string().contains(level)),
+            "{level}: {heights:?}"
+        );
+    }
+    assert_eq!(mock.count("getSignatureStatuses"), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn heights_are_read_before_statuses() {
     let mock = MockRpc::new(scripted(1000, after(3, mock::status(9, "confirmed", None))));
     client(&mock)
@@ -933,4 +993,27 @@ async fn heights_are_read_before_statuses() {
             .all(|tick| tick == &["getBlockHeight", "getSignatureStatuses"]),
         "{polls:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_versioned_rebroadcasts_until_the_verdict() {
+    // Landed at the 6th read (2.4 s): sends at 0, 1 and 3 s... but 3 s is
+    // after the verdict, so two.
+    let mock = MockRpc::new(scripted(1000, after(5, mock::status(9, "confirmed", None))));
+    let tx = signed(&Keypair::new());
+    client(&mock)
+        .send_versioned(
+            &tx,
+            VersionedSendConfig {
+                rebroadcast_interval: Some(Duration::from_secs(1)),
+                ..VersionedSendConfig::default()
+            },
+        )
+        .await
+        .expect("landed");
+    let sent = mock.calls("sendTransaction");
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|params| params[0] == sent[0][0]));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(mock.count("sendTransaction"), 2);
 }
