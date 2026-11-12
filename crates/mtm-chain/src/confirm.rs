@@ -6,8 +6,9 @@
 //! - one `getSignatureStatuses` per [`MAX_STATUS_BATCH`] signatures.
 //!
 //! The height is read before the statuses, so a status read in the tick
-//! that sees the blockhash expire is the final check: nothing found then
-//! means the transaction can no longer land.
+//! that sees the blockhash expire is a final check; `Expired` takes two
+//! such ticks in a row (the height and the statuses can come from
+//! different nodes behind a load balancer).
 //!
 //! The confirmer's requests use their own permits (see `transport`), and a
 //! tick's status batches go out concurrently.
@@ -70,6 +71,8 @@ struct Pending {
     errors: u32,
     /// When the current run of failed status reads began.
     failing_since: Option<Instant>,
+    /// The last tick saw the blockhash expired and no status.
+    expiry_seen: bool,
     reply: oneshot::Sender<Verdict>,
 }
 
@@ -90,6 +93,9 @@ impl Pending {
     ) -> Option<Verdict> {
         self.errors = 0;
         self.failing_since = None;
+        if status.is_some() {
+            self.expiry_seen = false;
+        }
         match status {
             Some(Seen {
                 slot,
@@ -108,7 +114,10 @@ impl Pending {
                         height + BLOCKHASH_VALIDITY_BLOCKS + UNKNOWN_EXPIRY_MARGIN_BLOCKS,
                     );
                     if height > last_valid {
-                        return Some(Verdict::Expired);
+                        if self.expiry_seen {
+                            return Some(Verdict::Expired);
+                        }
+                        self.expiry_seen = true;
                     }
                 }
                 self.past_deadline(now)
@@ -159,6 +168,7 @@ impl Confirmer {
             watch,
             errors: 0,
             failing_since: None,
+            expiry_seen: false,
             reply,
         };
         let mut queue = self.queue.lock().expect("confirmer queue lock");
@@ -245,14 +255,24 @@ async fn tick(rpc: &RpcClient, mut pending: Vec<Pending>) -> Vec<Pending> {
         .zip(responses)
     {
         let statuses = response
-            .map(|response| response.value)
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())
+            .and_then(|response| {
+                // A short answer would read as "not found" for the missing ones.
+                if response.value.len() == entries.len() {
+                    Ok(response.value)
+                } else {
+                    Err(format!(
+                        "{} statuses for {} signatures",
+                        response.value.len(),
+                        entries.len()
+                    ))
+                }
+            });
         match statuses {
             Ok(statuses) => {
-                let mut statuses = statuses.into_iter();
-                for (entry, verdict) in entries.iter_mut().zip(verdicts) {
+                for ((entry, verdict), status) in entries.iter_mut().zip(verdicts).zip(statuses) {
                     let commitment = entry.watch.commitment;
-                    let status = statuses.next().flatten().map(|status| Seen {
+                    let status = status.map(|status| Seen {
                         slot: status.slot,
                         at_commitment: status.satisfies_commitment(commitment),
                         error: status.err.map(|error| format!("{error:?}")),

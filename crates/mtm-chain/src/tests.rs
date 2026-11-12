@@ -867,6 +867,53 @@ async fn rebroadcasts_back_off() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn one_tick_past_expiry_is_not_expired() {
+    // Height 21 is first read in the 11th tick and nothing is found; the
+    // 12th tick (a lagging status node caught up) finds it landed.
+    let mock = MockRpc::new(scripted(20, after(11, mock::status(30, "confirmed", None))));
+    let outcome = client(&mock)
+        .send_versioned(
+            &signed(&Keypair::new()),
+            VersionedSendConfig {
+                last_valid_block_height: Some(20),
+                ..VersionedSendConfig::default()
+            },
+        )
+        .await
+        .expect("landed in the last valid blocks");
+    assert_eq!(outcome.confirmation_slot, 30);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_status_answer_is_a_failed_read() {
+    // Already past expiry; the first three answers leave the signature
+    // out, which must not read as "not found".
+    let reads = AtomicUsize::new(0);
+    let landed = mock::status(30, "confirmed", None);
+    let mock = MockRpc::new(move |method, params| match method {
+        "sendTransaction" => Ok(mock::sent_signature(params)),
+        "getBlockHeight" => Ok(json!(25)),
+        "getSignatureStatuses" => Ok(if reads.fetch_add(1, Ordering::SeqCst) < 3 {
+            mock::with_context(json!([]))
+        } else {
+            mock::statuses(params, &landed)
+        }),
+        other => panic!("unexpected {other}"),
+    });
+    let outcome = client(&mock)
+        .send_versioned(
+            &signed(&Keypair::new()),
+            VersionedSendConfig {
+                last_valid_block_height: Some(20),
+                ..VersionedSendConfig::default()
+            },
+        )
+        .await
+        .expect("landed");
+    assert_eq!(outcome.confirmation_slot, 30);
+}
+
+#[tokio::test(start_paused = true)]
 async fn heights_are_read_before_statuses() {
     let mock = MockRpc::new(scripted(1000, after(3, mock::status(9, "confirmed", None))));
     client(&mock)
