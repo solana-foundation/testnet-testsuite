@@ -148,6 +148,9 @@ impl Default for CoinGeckoConfig {
 #[serde(default)]
 pub struct BinanceConfig {
     pub ws_url: String,
+    /// REST host for the book snapshot that seeds each new connection
+    /// (bookTicker streams only changes).
+    pub rest_url: String,
     pub flush_interval_ms: u64,
     /// Reconnect when the connection has shown no sign of life (no frame,
     /// no pong to our pings) for this long: a stalled connection can stay
@@ -170,6 +173,7 @@ impl Default for BinanceConfig {
     fn default() -> Self {
         Self {
             ws_url: "wss://stream.binance.com:9443".to_string(),
+            rest_url: "https://api.binance.com".to_string(),
             flush_interval_ms: 250,
             idle_timeout_ms: 15_000,
             ping_interval_ms: 5_000,

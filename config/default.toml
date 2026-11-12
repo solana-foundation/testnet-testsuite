@@ -36,7 +36,10 @@ poll_interval_ms = 300000
 # unchanged books are re-confirmed every confirm_interval_ms, so thin books
 # don't read as stale and a stalled connection stops looking fresh within
 # confirm_max_silence_ms (consumers' max_price_age_ms stacks on top).
+# Each connection is seeded from one REST bookTicker snapshot at rest_url
+# (the stream sends only changes, so quiet books would otherwise be missing).
 [oracle.binance]
+rest_url = "https://api.binance.com"
 flush_interval_ms = 250
 idle_timeout_ms = 15000
 ping_interval_ms = 5000
