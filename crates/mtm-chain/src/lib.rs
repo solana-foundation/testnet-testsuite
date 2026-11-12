@@ -1,6 +1,10 @@
 //! Off-chain Solana toolkit shared by every service that touches the chain.
 
 pub mod keys;
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,7 +13,10 @@ use anyhow::Context;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
+use solana_rpc_client::http_sender::HttpSender;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_rpc_client::rpc_client::RpcClientConfig;
+use solana_rpc_client::rpc_sender::RpcSender;
 use solana_rpc_client_api::client_error::ErrorKind as RpcErrorKind;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
@@ -115,9 +122,23 @@ pub struct ChainClient {
 impl ChainClient {
     pub fn new(http_url: impl Into<String>, commitment: &str) -> anyhow::Result<Self> {
         let commitment = parse_commitment(commitment)?;
-        Ok(Self {
-            rpc: Arc::new(RpcClient::new_with_commitment(http_url.into(), commitment)),
-        })
+        Ok(Self::from_sender(
+            HttpSender::new(http_url.into()),
+            commitment,
+        ))
+    }
+
+    /// A client over any transport (the seam the state machine tests use).
+    pub(crate) fn from_sender(
+        sender: impl RpcSender + Send + Sync + 'static,
+        commitment: CommitmentConfig,
+    ) -> Self {
+        Self {
+            rpc: Arc::new(RpcClient::new_sender(
+                sender,
+                RpcClientConfig::with_commitment(commitment),
+            )),
+        }
     }
 
     /// Like [`ChainClient::new`], but every RPC request fails after `timeout`
