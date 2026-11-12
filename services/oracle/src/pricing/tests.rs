@@ -231,3 +231,24 @@ fn unknown_feed_and_duplicate_symbol_rejected() {
     );
     assert!(Engine::from_config(&dupes, &[sol()]).is_err());
 }
+
+#[tokio::test]
+async fn clock_driven_instruments_outlive_a_closed_feed_channel() {
+    let cfg = instruments(r#"[{"symbol": "tUSD/USD", "base": {"kind": "peg", "target": "1.0"}}]"#);
+    let engine = Engine::from_config(&cfg, &[]).expect("builds");
+    let state = AppState::new(
+        Vec::new(),
+        crate::state::ReadyLimits::uniform(std::time::Duration::from_secs(15)),
+    );
+    // No feeds: the input is closed before the engine starts.
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    let task = tokio::spawn(run(engine, rx, state.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(
+        !task.is_finished(),
+        "engine stopped on a closed feed channel"
+    );
+    assert!(state.get(&Symbol::new("tUSD/USD")).await.is_some());
+    task.abort();
+}

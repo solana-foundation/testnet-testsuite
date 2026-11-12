@@ -11,6 +11,10 @@ commitment = "confirmed"
 [oracle]
 listen_addr = "127.0.0.1:8080"
 metrics_addr = "127.0.0.1:9100"
+# /ready is 503 until every instrument was published within this window
+# (instruments on a slower source cadence get twice that cadence instead).
+# /health is liveness only.
+ready_max_age_ms = 15000
 
 [oracle.hermes]
 base_url = "https://hermes.pyth.network"

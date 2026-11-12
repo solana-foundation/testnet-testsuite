@@ -63,6 +63,10 @@ one, `gbm` synthesizes it from its configured vol, and `peg` has none.
 
 - `GET /v1/price?symbol=…` or `?mint=…`
 - `GET /v1/instruments` — symbol, mint, base kind, transform kinds
+- `GET /health` — liveness (constant `ok`); `GET /ready` — 200 once every
+  registered instrument was published within `oracle.ready_max_age_ms`
+  (twice the source cadence for slower sources), else 503 listing the
+  missing or stale instruments
 
 ## Later
 

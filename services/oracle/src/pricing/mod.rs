@@ -21,7 +21,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use spec::{BaseSourceConfig, InstrumentConfig, TransformConfig};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
@@ -551,20 +551,26 @@ fn max_conf_ratio(ratios: impl IntoIterator<Item = Option<Decimal>>) -> Option<D
 }
 
 /// Engine task: consumes underlying ticks, drives the clock, publishes into
-/// the shared state.
+/// the shared state. Runs until dropped: with no feeds (a purely synthetic
+/// registry) the input closes at once, and clock-driven instruments must
+/// keep publishing. A feed that dies is reported by the task supervisor.
 pub async fn run(mut engine: Engine, mut ticks: mpsc::Receiver<PricePoint>, state: Arc<AppState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(ENGINE_TICK_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut feeds_closed = false;
     loop {
         tokio::select! {
-            maybe = ticks.recv() => match maybe {
+            maybe = ticks.recv(), if !feeds_closed => match maybe {
                 Some(point) => {
                     let now = mtm_common::time::now_us();
                     for out in engine.on_underlying(&point, now) {
                         state.update(out).await;
                     }
                 }
-                None => break,
+                None => {
+                    feeds_closed = true;
+                    debug!("pricing engine input closed; clock-driven instruments continue");
+                }
             },
             _ = interval.tick() => {
                 let now = mtm_common::time::now_us();
@@ -574,7 +580,6 @@ pub async fn run(mut engine: Engine, mut ticks: mpsc::Receiver<PricePoint>, stat
             }
         }
     }
-    warn!("pricing engine input channel closed, engine stopping");
 }
 
 #[cfg(test)]

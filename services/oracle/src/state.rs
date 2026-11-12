@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mtm_common::Symbol;
 use oracle_client::{InstrumentInfo, PricePoint};
@@ -12,10 +13,48 @@ pub struct AppState {
     tx: broadcast::Sender<PricePoint>,
     instruments: Vec<InstrumentInfo>,
     mint_to_symbol: HashMap<String, Symbol>,
+    ready: ReadyLimits,
+}
+
+/// How recently each instrument must have been published for `/ready`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyLimits {
+    pub default: Duration,
+    /// Overrides for instruments on a slower cadence than `default` allows.
+    pub per_symbol: HashMap<Symbol, Duration>,
+}
+
+impl ReadyLimits {
+    pub fn uniform(default: Duration) -> Self {
+        Self {
+            default,
+            per_symbol: HashMap::new(),
+        }
+    }
+
+    fn for_symbol(&self, symbol: &Symbol) -> Duration {
+        self.per_symbol.get(symbol).copied().unwrap_or(self.default)
+    }
+}
+
+/// Why an instrument is not ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotReady {
+    Missing(Symbol),
+    Stale { symbol: Symbol, age_ms: i64 },
+}
+
+impl std::fmt::Display for NotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotReady::Missing(symbol) => write!(f, "{symbol}: no price"),
+            NotReady::Stale { symbol, age_ms } => write!(f, "{symbol}: {age_ms} ms old"),
+        }
+    }
 }
 
 impl AppState {
-    pub fn new(instruments: Vec<InstrumentInfo>) -> Arc<Self> {
+    pub fn new(instruments: Vec<InstrumentInfo>, ready: ReadyLimits) -> Arc<Self> {
         let (tx, _) = broadcast::channel(1024);
         let mint_to_symbol = instruments
             .iter()
@@ -26,7 +65,29 @@ impl AppState {
             tx,
             instruments,
             mint_to_symbol,
+            ready,
         })
+    }
+
+    /// Registered instruments whose latest point is missing or was published
+    /// (`received_at_us`) longer ago than its readiness limit. Empty = ready.
+    pub async fn not_ready(&self, now_us: i64) -> Vec<NotReady> {
+        let prices = self.prices.read().await;
+        self.instruments
+            .iter()
+            .filter_map(|info| {
+                let Some(point) = prices.get(&info.symbol) else {
+                    return Some(NotReady::Missing(info.symbol.clone()));
+                };
+                let age_us = now_us.saturating_sub(point.received_at_us);
+                let limit_us = i64::try_from(self.ready.for_symbol(&info.symbol).as_micros())
+                    .unwrap_or(i64::MAX);
+                (age_us > limit_us).then(|| NotReady::Stale {
+                    symbol: info.symbol.clone(),
+                    age_ms: age_us / 1000,
+                })
+            })
+            .collect()
     }
 
     pub async fn update(&self, point: PricePoint) {

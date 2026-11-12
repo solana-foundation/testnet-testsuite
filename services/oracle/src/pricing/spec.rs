@@ -100,6 +100,16 @@ impl BaseSourceConfig {
             BaseSourceConfig::Gbm { .. } => "gbm",
         }
     }
+
+    /// The underlying feeds this base reads (none for synthetic bases).
+    pub fn feeds(&self) -> Vec<&Symbol> {
+        match self {
+            BaseSourceConfig::Underlying { feed } => vec![feed],
+            BaseSourceConfig::Cross { base, quote } => vec![base, quote],
+            BaseSourceConfig::Basket { legs, .. } => legs.iter().map(|l| &l.feed).collect(),
+            BaseSourceConfig::Peg { .. } | BaseSourceConfig::Gbm { .. } => Vec::new(),
+        }
+    }
 }
 
 impl TransformConfig {
