@@ -5,11 +5,20 @@
 //! immediately via `Price::from_f64_lossy`; everything else stays in
 //! Decimal/fixed-point. All randomness is seeded per instrument, so a config
 //! file plus an underlying tick tape defines a reproducible price world.
+//!
+//! Restarts: with `oracle.state_path` set, the state a restart would
+//! otherwise re-anchor (each GBM's price and RNG position, each rebased
+//! basket's factor) is saved every few seconds and restored at startup, for
+//! instruments whose base config is unchanged. A restarted oracle then
+//! carries on where pools on-chain were left instead of jumping back to
+//! `initial` or re-basing on the current legs.
 
 pub mod spec;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use mtm_common::Symbol;
@@ -19,13 +28,45 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use serde::{Deserialize, Serialize};
 use spec::{BaseSourceConfig, InstrumentConfig, TransformConfig};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
 const ENGINE_TICK_MS: u64 = 250;
+
+/// How often `run` writes the saved state (when `state_path` is set).
+const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Generator state that survives a restart, per instrument symbol.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedState {
+    pub instruments: BTreeMap<Symbol, SavedInstrument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedInstrument {
+    /// The instrument's base config (JSON) when saved: state from a
+    /// different config is not restored.
+    pub base_config: String,
+    pub state: SavedBase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SavedBase {
+    /// `price` is the generator's f64 in its shortest round-trip form;
+    /// `word_pos` the ChaCha word position (u128), both as strings.
+    Gbm {
+        price: String,
+        word_pos: String,
+    },
+    Basket {
+        factor: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 struct Snapshot {
@@ -102,6 +143,8 @@ enum TransformState {
 
 struct InstrumentRuntime {
     symbol: Symbol,
+    /// `base_config` of `SavedInstrument`.
+    base_config: String,
     expo: i32,
     base: BaseState,
     transforms: Vec<TransformState>,
@@ -258,6 +301,8 @@ impl Engine {
             }
             runtimes.push(InstrumentRuntime {
                 symbol,
+                base_config: serde_json::to_string(&cfg.base)
+                    .context("instrument base config serializes")?,
                 expo: cfg.expo,
                 base,
                 transforms,
@@ -276,6 +321,82 @@ impl Engine {
             timed,
             latest: HashMap::new(),
         })
+    }
+
+    /// The state a restart would otherwise lose: GBM price and RNG
+    /// position, and the factor of a basket that has been rebased.
+    pub fn saved_state(&self) -> SavedState {
+        let instruments = self
+            .instruments
+            .iter()
+            .filter_map(|inst| {
+                let state = match &inst.base {
+                    BaseState::Gbm { price, rng, .. } => SavedBase::Gbm {
+                        price: price.to_string(),
+                        word_pos: rng.get_word_pos().to_string(),
+                    },
+                    BaseState::Basket {
+                        rebase: Some(_),
+                        factor: Some(factor),
+                        ..
+                    } => SavedBase::Basket {
+                        factor: factor.to_string(),
+                    },
+                    _ => return None,
+                };
+                Some((
+                    inst.symbol.clone(),
+                    SavedInstrument {
+                        base_config: inst.base_config.clone(),
+                        state,
+                    },
+                ))
+            })
+            .collect();
+        SavedState { instruments }
+    }
+
+    /// Applies `saved` to instruments whose base config is unchanged;
+    /// returns how many were restored.
+    pub fn restore(&mut self, saved: &SavedState) -> usize {
+        let mut restored = 0;
+        for inst in &mut self.instruments {
+            let Some(entry) = saved.instruments.get(&inst.symbol) else {
+                continue;
+            };
+            if entry.base_config != inst.base_config {
+                info!(symbol = %inst.symbol, "base config changed; saved state not restored");
+                continue;
+            }
+            let applied = match (&mut inst.base, &entry.state) {
+                (BaseState::Gbm { price, rng, .. }, SavedBase::Gbm { price: p, word_pos }) => {
+                    match (p.parse::<f64>(), word_pos.parse::<u128>()) {
+                        (Ok(p), Ok(pos)) if p.is_finite() && p > 0.0 => {
+                            *price = p;
+                            rng.set_word_pos(pos);
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                (BaseState::Basket { factor, .. }, SavedBase::Basket { factor: f }) => {
+                    match f.parse::<Decimal>() {
+                        Ok(f) => {
+                            *factor = Some(f);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                _ => false,
+            };
+            if applied {
+                restored += 1;
+            } else {
+                warn!(symbol = %inst.symbol, "unusable saved state ignored");
+            }
+        }
+        restored
     }
 
     pub fn on_underlying(&mut self, point: &PricePoint, now_us: i64) -> Vec<PricePoint> {
@@ -550,31 +671,95 @@ fn max_conf_ratio(ratios: impl IntoIterator<Item = Option<Decimal>>) -> Option<D
     ratios.into_iter().flatten().max()
 }
 
+/// Reads a state file written by `save_state`. A missing file is `None`
+/// silently; an unreadable one is `None` with a warning (a corrupt file must
+/// not keep the oracle from starting).
+pub fn load_state(path: &Path) -> Option<SavedState> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "cannot read saved pricing state");
+            return None;
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(saved) => Some(saved),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "ignoring unparseable saved pricing state");
+            None
+        }
+    }
+}
+
+/// Writes `saved` atomically (temp file + rename), so a crash mid-write
+/// leaves the previous state.
+pub fn save_state(path: &Path, saved: &SavedState) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(saved)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Engine task: consumes underlying ticks, drives the clock, publishes into
-/// the shared state.
-pub async fn run(mut engine: Engine, mut ticks: mpsc::Receiver<PricePoint>, state: Arc<AppState>) {
+/// the shared state. Runs until dropped: with no feeds (a purely synthetic
+/// registry) the input closes at once, and clock-driven instruments must
+/// keep publishing. A feed that dies is reported by the task supervisor.
+/// With `state_path`, the engine's `saved_state` is written there every
+/// `STATE_SAVE_INTERVAL` when it changed.
+pub async fn run(
+    mut engine: Engine,
+    mut ticks: mpsc::Receiver<PricePoint>,
+    state: Arc<AppState>,
+    state_path: Option<PathBuf>,
+) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(ENGINE_TICK_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut feeds_closed = false;
+    // When the state was last saved (None: not yet, save on the first tick).
+    let mut last_saved: Option<(Instant, SavedState)> = None;
     loop {
         tokio::select! {
-            maybe = ticks.recv() => match maybe {
+            maybe = ticks.recv(), if !feeds_closed => match maybe {
                 Some(point) => {
                     let now = mtm_common::time::now_us();
                     for out in engine.on_underlying(&point, now) {
                         state.update(out).await;
                     }
                 }
-                None => break,
+                None => {
+                    feeds_closed = true;
+                    debug!("pricing engine input closed; clock-driven instruments continue");
+                }
             },
             _ = interval.tick() => {
                 let now = mtm_common::time::now_us();
                 for out in engine.on_tick(now) {
                     state.update(out).await;
                 }
+                if let Some(path) = &state_path
+                    && last_saved
+                        .as_ref()
+                        .is_none_or(|(at, _)| at.elapsed() >= STATE_SAVE_INTERVAL)
+                {
+                    let saved = engine.saved_state();
+                    if last_saved.as_ref().is_none_or(|(_, last)| *last != saved) {
+                        // A few hundred bytes every few seconds: blocking
+                        // std::fs is fine on the engine task.
+                        if let Err(e) = save_state(path, &saved) {
+                            metrics::counter!("oracle_state_save_failures_total").increment(1);
+                            warn!(path = %path.display(), error = %e, "saving pricing state failed");
+                        }
+                    }
+                    last_saved = Some((Instant::now(), saved));
+                }
             }
         }
     }
-    warn!("pricing engine input channel closed, engine stopping");
 }
 
 #[cfg(test)]

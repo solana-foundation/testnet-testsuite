@@ -231,3 +231,139 @@ fn unknown_feed_and_duplicate_symbol_rejected() {
     );
     assert!(Engine::from_config(&dupes, &[sol()]).is_err());
 }
+
+#[tokio::test]
+async fn clock_driven_instruments_outlive_a_closed_feed_channel() {
+    let cfg = instruments(r#"[{"symbol": "tUSD/USD", "base": {"kind": "peg", "target": "1.0"}}]"#);
+    let engine = Engine::from_config(&cfg, &[]).expect("builds");
+    let state = AppState::new(
+        Vec::new(),
+        crate::state::ReadyLimits::uniform(std::time::Duration::from_secs(15)),
+    );
+    // No feeds: the input is closed before the engine starts.
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    let task = tokio::spawn(run(engine, rx, state.clone(), None));
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(
+        !task.is_finished(),
+        "engine stopped on a closed feed channel"
+    );
+    assert!(state.get(&Symbol::new("tUSD/USD")).await.is_some());
+    task.abort();
+}
+
+fn mantissas(points: &[PricePoint]) -> Vec<(String, i128)> {
+    points
+        .iter()
+        .map(|p| {
+            let PriceData::Aggregate { price, .. } = &p.data else {
+                panic!("aggregate")
+            };
+            (p.symbol.as_str().to_string(), price.mantissa)
+        })
+        .collect()
+}
+
+const RESTART_JSON: &str = r#"[
+    {"symbol": "tMEME/USD",
+     "base": {"kind": "gbm", "initial": "0.02", "daily_vol_bps": 1500, "seed": 42, "tick_ms": 250}},
+    {"symbol": "tIDX/USD", "base": {"kind": "basket", "rebase": "100",
+        "legs": [{"feed": "SOL/USD", "weight": "1"}]}}
+]"#;
+
+#[test]
+fn a_restart_carries_on_from_the_saved_state() {
+    let cfg = instruments(RESTART_JSON);
+    let mut before = Engine::from_config(&cfg, &[sol()]).expect("builds");
+    // Walk the GBM and rebase the basket at SOL = 97.
+    for step in 0..20i64 {
+        before.on_tick(step * 250_000);
+    }
+    before.on_underlying(&tick(9_700_000_000, 1), 1);
+    let saved = before.saved_state();
+    assert_eq!(saved.instruments.len(), 2);
+
+    // Through the file, as a restart would.
+    let dir = std::env::temp_dir().join(format!("oracle-state-{}", std::process::id()));
+    let path = dir.join("pricing.json");
+    save_state(&path, &saved).expect("saves");
+    let loaded = load_state(&path).expect("loads");
+    assert_eq!(loaded, saved);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut after = Engine::from_config(&cfg, &[sol()]).expect("builds");
+    assert_eq!(after.restore(&loaded), 2);
+
+    // The next GBM step and the basket at a new SOL price are what the
+    // engine that kept running would have produced (no jump to `initial`,
+    // no rebase to 100 at the new SOL price).
+    let now = 20 * 250_000;
+    assert_eq!(
+        mantissas(&after.on_tick(now)),
+        mantissas(&before.on_tick(now))
+    );
+    let moved = tick(10_670_000_000, 2);
+    let a = mantissas(&after.on_underlying(&moved, 2));
+    assert_eq!(a, mantissas(&before.on_underlying(&moved, 2)));
+    assert_eq!(a, vec![("tIDX/USD".to_string(), 11_000_000_000)]);
+
+    // Without the restore, a fresh engine re-anchors: the check above is
+    // not vacuous.
+    let mut fresh = Engine::from_config(&cfg, &[sol()]).expect("builds");
+    assert_eq!(
+        mantissas(&fresh.on_underlying(&moved, 2)),
+        vec![("tIDX/USD".to_string(), 10_000_000_000)]
+    );
+}
+
+#[test]
+fn saved_state_for_a_changed_config_is_not_restored() {
+    let mut before = Engine::from_config(&instruments(RESTART_JSON), &[sol()]).expect("builds");
+    before.on_tick(0);
+    let saved = before.saved_state();
+    let changed = RESTART_JSON.replace(r#""initial": "0.02""#, r#""initial": "0.05""#);
+    let mut after = Engine::from_config(&instruments(&changed), &[sol()]).expect("builds");
+    // The basket has no factor yet, so only the GBM was saved; its config
+    // changed, so nothing is restored.
+    assert_eq!(after.restore(&saved), 0);
+    let out = mantissas(&after.on_tick(0));
+    let mut fresh = Engine::from_config(&instruments(&changed), &[sol()]).expect("builds");
+    assert_eq!(out, mantissas(&fresh.on_tick(0)));
+}
+
+#[test]
+fn a_missing_or_corrupt_state_file_is_ignored() {
+    let dir = std::env::temp_dir().join(format!("oracle-state-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    assert!(load_state(&dir.join("absent.json")).is_none());
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, b"{not json").expect("write");
+    assert!(load_state(&bad).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_engine_task_saves_its_state() {
+    let cfg = instruments(RESTART_JSON);
+    let engine = Engine::from_config(&cfg, &[sol()]).expect("builds");
+    let state = AppState::new(
+        Vec::new(),
+        crate::state::ReadyLimits::uniform(std::time::Duration::from_secs(15)),
+    );
+    let dir = std::env::temp_dir().join(format!("oracle-state-run-{}", std::process::id()));
+    let path = dir.join("pricing.json");
+    let (_tx, rx) = mpsc::channel(1);
+    let task = tokio::spawn(run(engine, rx, state, Some(path.clone())));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    task.abort();
+    let saved = load_state(&path).expect("saved on the first tick");
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(SavedInstrument {
+        state: SavedBase::Gbm { .. },
+        ..
+    }) = saved.instruments.get(&Symbol::new("tMEME/USD"))
+    else {
+        panic!("gbm state saved: {saved:?}");
+    };
+}

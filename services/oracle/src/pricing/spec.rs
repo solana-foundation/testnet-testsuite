@@ -1,7 +1,7 @@
 //! Instrument registry config types. Design: docs/instrument-pricing.md.
 
 use mtm_common::Symbol;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstrumentConfig {
@@ -30,7 +30,9 @@ impl InstrumentConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Serialize: the saved generator state is keyed by it (see
+/// `pricing::SavedState`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BaseSourceConfig {
     /// Passthrough of a real feed (1:1 majors).
@@ -61,7 +63,7 @@ fn default_tick_ms() -> u64 {
     1000
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BasketLeg {
     pub feed: Symbol,
     pub weight: String,
@@ -98,6 +100,16 @@ impl BaseSourceConfig {
             BaseSourceConfig::Basket { .. } => "basket",
             BaseSourceConfig::Peg { .. } => "peg",
             BaseSourceConfig::Gbm { .. } => "gbm",
+        }
+    }
+
+    /// The underlying feeds this base reads (none for synthetic bases).
+    pub fn feeds(&self) -> Vec<&Symbol> {
+        match self {
+            BaseSourceConfig::Underlying { feed } => vec![feed],
+            BaseSourceConfig::Cross { base, quote } => vec![base, quote],
+            BaseSourceConfig::Basket { legs, .. } => legs.iter().map(|l| &l.feed).collect(),
+            BaseSourceConfig::Peg { .. } | BaseSourceConfig::Gbm { .. } => Vec::new(),
         }
     }
 }

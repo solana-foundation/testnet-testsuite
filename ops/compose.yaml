@@ -23,19 +23,35 @@ services:
       # optional; keyless works at the default 5-min cadence
       MTM_ORACLE__COINGECKO__API_KEY: ${COINGECKO_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
+      # restarts carry synthetic prices on instead of re-anchoring them
+      MTM_ORACLE__STATE_PATH: /app/state/pricing.json
     volumes:
       - ../config:/app/config:ro
+      - oracle-state:/app/state
     ports:
       # host loopback only — the oracle has no auth
       - "127.0.0.1:8080:8080"
-    # no healthcheck: distroless image has no shell/curl; rely on restart policy
+    # Readiness: every instrument published recently (the distroless image
+    # has no curl; the binary probes itself). A dead task already exits the
+    # process and `restart` brings it back; this catches a feed that retries
+    # forever, shows it in `docker compose ps`, and gates `depends_on:
+    # condition: service_healthy` for the bots. Compose does not restart an
+    # unhealthy container; the oracle_ready gauge carries the same signal.
+    healthcheck:
+      test:
+        ["CMD", "/usr/local/bin/oracle", "ready", "http://127.0.0.1:8080/ready"]
+      interval: 15s
+      timeout: 12s
+      retries: 3
+      start_period: 60s
 
   # --- bots: uncomment when arb/mm rejoin the workspace --------------------------
   # arb:
   #   image: mtm:latest
   #   entrypoint: ["/usr/local/bin/arb"]
   #   restart: unless-stopped
-  #   depends_on: [oracle]
+  #   depends_on:
+  #     oracle: { condition: service_healthy }
   #   environment:
   #     MTM_PROFILE: ${MTM_PROFILE:-testnet}
   #     MTM_ARB__ORACLE_HTTP_URL: http://oracle:8080
@@ -65,5 +81,6 @@ services:
       - "127.0.0.1:3000:3000"
 
 volumes:
+  oracle-state:
   prometheus-data:
   grafana-data:

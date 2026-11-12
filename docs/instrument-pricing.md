@@ -63,6 +63,21 @@ one, `gbm` synthesizes it from its configured vol, and `peg` has none.
 
 - `GET /v1/price?symbol=…` or `?mint=…`
 - `GET /v1/instruments` — symbol, mint, base kind, transform kinds
+- `GET /health` — liveness (constant `ok`); `GET /ready` — 200 once every
+  registered instrument was published within `oracle.ready_max_age_ms`
+  (twice the source cadence for slower sources), else 503 listing the
+  missing or stale instruments. The same answer is exported every second as
+  the `oracle_ready` (0/1) and `oracle_not_ready_instruments` gauges, and
+  `oracle ready [URL]` (default `http://127.0.0.1:8080/ready`) exits 0 only
+  on a 200, for container healthchecks
+
+## Restarts
+
+With `oracle.state_path` set, each GBM's price and RNG position and each
+rebased basket's factor are saved every 5 s and restored on start (for
+instruments whose base config is unchanged), so a restart continues the
+synthetic path instead of jumping back to `initial` or re-basing on the
+current legs. Transform state (noise, lag buffers) is not saved.
 
 ## Later
 

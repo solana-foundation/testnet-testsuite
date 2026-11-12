@@ -5,6 +5,8 @@
 
 pub mod types;
 
+use std::time::Duration;
+
 use futures::StreamExt;
 use futures::stream::BoxStream;
 pub use mtm_common::Symbol;
@@ -30,8 +32,14 @@ pub struct OracleClient {
 
 impl OracleClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        // A stuck oracle fails the request instead of hanging its caller.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }

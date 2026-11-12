@@ -1,7 +1,6 @@
 //! Off-chain Solana toolkit shared by every service that touches the chain.
 
 pub mod keys;
-pub mod tx;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

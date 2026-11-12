@@ -11,6 +11,14 @@ commitment = "confirmed"
 [oracle]
 listen_addr = "127.0.0.1:8080"
 metrics_addr = "127.0.0.1:9100"
+# /ready is 503 until every instrument was published within this window
+# (instruments on a slower source cadence get twice that cadence instead).
+# /health is liveness only.
+ready_max_age_ms = 15000
+# Optional: save synthetic generator state (GBM price + RNG position, rebased
+# basket factors) here and restore it on restart, so a restart does not
+# re-anchor prices away from where pools sit. Unset: every start re-anchors.
+# state_path = ".state/oracle-pricing.json"
 
 [oracle.hermes]
 base_url = "https://hermes.pyth.network"
@@ -25,9 +33,22 @@ poll_interval_ms = 1000
 poll_interval_ms = 300000
 
 # Binance: real-time top-of-book websocket — keyless, no monthly caps.
-# Book updates coalesce to one tick per symbol per flush interval.
+# Book updates coalesce to one tick per symbol per flush interval. The client
+# pings every ping_interval_ms; a connection with no sign of life (no frame,
+# no pong) for idle_timeout_ms is reconnected (stalls outlive TCP resets).
+# While it showed life within confirm_max_silence_ms (about two pings),
+# unchanged books are re-confirmed every confirm_interval_ms, so thin books
+# don't read as stale and a stalled connection stops looking fresh within
+# confirm_max_silence_ms (consumers' max_price_age_ms stacks on top).
+# Each connection is seeded from one REST bookTicker snapshot at rest_url
+# (the stream sends only changes, so quiet books would otherwise be missing).
 [oracle.binance]
+rest_url = "https://api.binance.com"
 flush_interval_ms = 250
+idle_timeout_ms = 15000
+ping_interval_ms = 5000
+confirm_interval_ms = 1000
+confirm_max_silence_ms = 10000
 
 [oracle.pusher]
 enabled = false # parked until a testnet oracle program exists
