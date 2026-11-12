@@ -53,9 +53,16 @@ pub struct SubmissionConfig {
     /// Resend the same signed bytes this often until the transaction lands
     /// or its blockhash expires (`None`: send once).
     pub rebroadcast_interval: Option<Duration>,
-    /// Give up as ambiguous after this many consecutive failed status reads.
+    /// Give up as ambiguous after this many consecutive failed status reads,
+    /// once they also span [`Self::status_error_window`].
     pub max_status_errors: u32,
+    /// How long status reads must keep failing before giving up as
+    /// ambiguous: an RPC restart or a load-balancer blip is not final.
+    pub status_error_window: Duration,
 }
+
+/// Default for `status_error_window`.
+pub const DEFAULT_STATUS_ERROR_WINDOW: Duration = Duration::from_secs(15);
 
 impl Default for SubmissionConfig {
     fn default() -> Self {
@@ -68,6 +75,7 @@ impl Default for SubmissionConfig {
             confirmation_timeout: Duration::from_secs(120),
             rebroadcast_interval: Some(Duration::from_secs(2)),
             max_status_errors: 5,
+            status_error_window: DEFAULT_STATUS_ERROR_WINDOW,
         }
     }
 }
@@ -129,8 +137,11 @@ pub struct VersionedSendConfig {
     pub max_send_attempts: usize,
     /// Hard cap on the wait. Expiry of the blockhash normally decides first.
     pub confirmation_timeout: Duration,
-    /// Give up as ambiguous after this many consecutive failed status reads.
+    /// Give up as ambiguous after this many consecutive failed status reads,
+    /// once they also span [`Self::status_error_window`].
     pub max_status_errors: u32,
+    /// See [`SubmissionConfig::status_error_window`].
+    pub status_error_window: Duration,
     /// The blockhash's `last_valid_block_height` when the caller has it;
     /// otherwise expiry is estimated conservatively from the first block
     /// height read after sending.
@@ -147,6 +158,7 @@ impl Default for VersionedSendConfig {
             max_send_attempts: 3,
             confirmation_timeout: Duration::from_secs(90),
             max_status_errors: 5,
+            status_error_window: DEFAULT_STATUS_ERROR_WINDOW,
             last_valid_block_height: None,
             rebroadcast_interval: None,
         }
@@ -382,6 +394,7 @@ impl ChainClient {
                         last_valid_block_height: Some(last_valid_block_height),
                         timeout: config.confirmation_timeout,
                         max_status_errors: config.max_status_errors,
+                        status_error_window: config.status_error_window,
                     },
                 },
             )
@@ -435,6 +448,7 @@ impl ChainClient {
                         last_valid_block_height: config.last_valid_block_height,
                         timeout: config.confirmation_timeout,
                         max_status_errors: config.max_status_errors,
+                        status_error_window: config.status_error_window,
                     },
                 },
             )

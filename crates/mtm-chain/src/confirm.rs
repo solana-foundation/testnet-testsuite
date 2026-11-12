@@ -42,8 +42,10 @@ pub(crate) struct Watch {
     pub last_valid_block_height: Option<u64>,
     /// Hard cap, whatever the blockhash says.
     pub timeout: Duration,
-    /// Consecutive failed status reads before giving up as ambiguous.
+    /// Consecutive failed status reads before giving up as ambiguous...
     pub max_status_errors: u32,
+    /// ...once the failures also span this long.
+    pub status_error_window: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +68,8 @@ struct Pending {
     watch: Watch,
     deadline: Instant,
     errors: u32,
+    /// When the current run of failed status reads began.
+    failing_since: Option<Instant>,
     reply: oneshot::Sender<Verdict>,
 }
 
@@ -85,6 +89,7 @@ impl Pending {
         now: Instant,
     ) -> Option<Verdict> {
         self.errors = 0;
+        self.failing_since = None;
         match status {
             Some(Seen {
                 slot,
@@ -113,7 +118,10 @@ impl Pending {
 
     fn on_error(&mut self, error: &str, now: Instant) -> Option<Verdict> {
         self.errors += 1;
-        if self.errors >= self.watch.max_status_errors.max(1) {
+        let since = *self.failing_since.get_or_insert(now);
+        if self.errors >= self.watch.max_status_errors.max(1)
+            && now.duration_since(since) >= self.watch.status_error_window
+        {
             return Some(Verdict::Ambiguous(error.to_owned()));
         }
         self.past_deadline(now)
@@ -150,6 +158,7 @@ impl Confirmer {
             deadline: Instant::now() + watch.timeout,
             watch,
             errors: 0,
+            failing_since: None,
             reply,
         };
         let mut queue = self.queue.lock().expect("confirmer queue lock");

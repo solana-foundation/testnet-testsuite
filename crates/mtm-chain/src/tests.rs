@@ -333,6 +333,7 @@ async fn persistent_status_failures_are_ambiguous() {
         "getSignatureStatuses" => Err(mock::io_error()),
         _ => healthy(method, params),
     });
+    let started = tokio::time::Instant::now();
     let error = client(&mock)
         .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
         .await
@@ -341,7 +342,30 @@ async fn persistent_status_failures_are_ambiguous() {
         matches!(error, SubmissionError::AmbiguousConfirmation { .. }),
         "{error:?}"
     );
-    assert_eq!(mock.count("getSignatureStatuses"), 5);
+    // Five failures at least, spanning the 15 s window: 38 reads at 400 ms.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(15) && elapsed < Duration::from_secs(17),
+        "{elapsed:?}"
+    );
+    assert!(mock.count("getSignatureStatuses") >= 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_status_outage_is_tolerated() {
+    // Three seconds of failed reads (an RPC restart) are not final.
+    let start = tokio::time::Instant::now();
+    let healthy = node(mock::status(7, "confirmed", None));
+    let mock = MockRpc::new(move |method, params| match method {
+        "getSignatureStatuses" if start.elapsed() < Duration::from_secs(3) => Err(mock::io_error()),
+        _ => healthy(method, params),
+    });
+    let outcome = client(&mock)
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect("landed after the outage");
+    assert_eq!(outcome.confirmation_slot, 7);
+    assert!(mock.count("getSignatureStatuses") > 5);
 }
 
 #[tokio::test(start_paused = true)]
