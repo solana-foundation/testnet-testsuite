@@ -6,11 +6,15 @@ members = [
     "crates/mtm-dex-harness",
     "crates/mtm-math",
     "crates/mtm-telemetry",
+    "crates/manifest-dex-client",
+    "crates/manifest-dex-orchestrator",
     "crates/oracle-client",
     "crates/orca-whirlpool-client",
     "crates/orca-whirlpool-orchestrator",
     "crates/raydium-clmm-client",
     "crates/raydium-clmm-orchestrator",
+    "crates/sdks/manifest",
+    "services/manifest-dex-orchestrator",
     "services/oracle",
     "services/orca-whirlpool-orchestrator",
     "services/raydium-clmm-orchestrator",
@@ -27,6 +31,9 @@ mtm-chain = { path = "crates/mtm-chain" }
 mtm-common = { path = "crates/mtm-common" }
 mtm-dex-harness = { path = "crates/mtm-dex-harness" }
 mtm-math = { path = "crates/mtm-math" }
+manifest-dex-client = { path = "crates/manifest-dex-client" }
+manifest-dex-orchestrator = { path = "crates/manifest-dex-orchestrator" }
+manifest-sdk = { path = "crates/sdks/manifest" }
 mtm-telemetry = { path = "crates/mtm-telemetry" }
 oracle-client = { path = "crates/oracle-client" }
 orca-whirlpool-client = { path = "crates/orca-whirlpool-client" }
@@ -46,6 +53,16 @@ rand = "0.10"
 rand_chacha = "0.10"
 rand_distr = "0.6"
 rust_decimal = "1"
+
+# codama-generated SDK deps (crates/sdks/*)
+borsh = { version = "1", features = ["derive"] }
+num-derive = "0.5"
+num-traits = "0.2"
+solana-account-info = "3"
+solana-address = { version = "2", features = ["borsh", "curve25519"] }
+solana-cpi = "3"
+solana-program-error = "3"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 solana-rpc-client = "4.2.1"
@@ -61,6 +78,7 @@ solana-signer = "3"
 solana-transaction = "4"
 solana-account = "4.3"
 solana-rpc-client-api = "4.2.1"
+solana-account-decoder-client-types = "4"
 anchor-lang = "0.32.1"
 spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }
 spl-memo = "6"

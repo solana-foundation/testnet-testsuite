@@ -141,6 +141,40 @@ configure-orca-whirlpool-dev *ARGS:
 configure-orca-whirlpool-prd *ARGS:
     just configure-orca-whirlpool-with prd "KEYPAIR_PROGRAM_AUTHORITY" https://api.testnet.solana.com {{ARGS}}
 
+# --- manifest (doppler-managed secrets) ---------------------------------------------
+
+# Ensure a market exists for every unordered pair of mints supplied with repeated --mint flags.
+manifest-create-markets *ARGS:
+    cargo run -p manifest-dex-orchestrator-service -- create-markets \
+        --mint $(echo $PUBKEY_TOKEN_JUP_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_RAY_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_USDC_MINT) \
+        {{ARGS}}
+
+manifest-create-markets-dev *ARGS:
+    doppler run --project testnet-testsuite --config dev -- \
+        just manifest-create-markets --rpc-url http://localhost:8899 {{ARGS}}
+
+manifest-create-markets-testnet *ARGS:
+    doppler run --project testnet-testsuite --config prd -- \
+        just manifest-create-markets --rpc-url https://api.testnet.solana.com {{ARGS}}
+
+# Make and take on every pair's existing market using a new faucet-funded user.
+manifest-user-flow *ARGS:
+    cargo run -p manifest-dex-orchestrator-service -- user-flow \
+        --mint $(echo $PUBKEY_TOKEN_JUP_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_RAY_MINT) \
+        --mint $(echo $PUBKEY_TOKEN_USDC_MINT) \
+        {{ARGS}}
+
+manifest-user-flow-dev *ARGS:
+    doppler run --project testnet-testsuite --config dev -- \
+        just manifest-user-flow --rpc-url http://localhost:8899 {{ARGS}}
+
+manifest-user-flow-testnet *ARGS:
+    doppler run --project testnet-testsuite --config prd -- \
+        just manifest-user-flow --rpc-url https://api.testnet.solana.com {{ARGS}}
+
 # --- program deployments (doppler-managed secrets) ----------------------------------
 
 # Deploy a program using a Doppler-injected keypair.
@@ -195,6 +229,13 @@ down:
 
 logs service="oracle":
     {{compose}} -f ops/compose.yaml logs -f {{service}}
+
+# --- codegen ----------------------------------------------------------------------
+
+# regenerate program SDKs from the IDLs in crates/sdks/*/idl (codama)
+gen-sdks:
+    cd codegen && pnpm install && pnpm run generate
+    cargo fmt --all
 
 # --- ops ------------------------------------------------------------------------
 
