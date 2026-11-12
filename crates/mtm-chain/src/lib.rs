@@ -97,7 +97,9 @@ pub enum SubmissionError {
     #[error("transaction send rate-limited by the RPC: {0}")]
     RateLimited(String),
     /// The send never reached the RPC (connection failed) or the RPC
-    /// answered with another HTTP error status (5xx): not taken.
+    /// refused it with HTTP 503 or a 4xx status: not taken. Other 5xx
+    /// (500, 502, 504, ...) can come from a gateway that forwarded the
+    /// send, so they are resent and the status decides.
     #[error("RPC unavailable for the transaction send: {0}")]
     Unavailable(String),
     /// Failed on chain, seen at the requested commitment.
@@ -590,7 +592,7 @@ enum SendFailure {
     Rejected,
     /// HTTP 429: the request was refused before the node looked at it.
     RateLimited,
-    /// The connection failed, or another HTTP error status: not taken.
+    /// The connection failed, HTTP 503, or a 4xx: not taken.
     Unavailable,
     /// The request may have reached the node.
     Ambiguous,
@@ -608,11 +610,14 @@ fn classify_send_error(error: &ClientError) -> SendFailure {
                 .map_or_else(|| error.to_string(), |err| format!("{err:?}")),
             logs: result.logs.clone().unwrap_or_default(),
         },
-        RpcErrorKind::Reqwest(error) if error.status().is_some_and(|status| status.as_u16() == 429) => {
-            SendFailure::RateLimited
-        }
         RpcErrorKind::Reqwest(error) if error.is_status() || error.is_connect() => {
-            SendFailure::Unavailable
+            match error.status().map(|status| status.as_u16()) {
+                Some(429) => SendFailure::RateLimited,
+                // A gateway's 502/504 (or a 500, 52x) can follow a send
+                // the node took.
+                Some(status @ 500..=599) if status != 503 => SendFailure::Ambiguous,
+                _ => SendFailure::Unavailable,
+            }
         }
         // Timeouts, broken bodies and undecodable answers: the request may
         // have been read.

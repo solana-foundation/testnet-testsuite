@@ -618,6 +618,32 @@ async fn http_5xx_on_send_is_unavailable_and_not_polled() {
 }
 
 #[tokio::test]
+async fn a_gateway_timeout_on_send_is_resent_and_polled() {
+    // The proxy gave up on a node that may have taken it: the status decides.
+    let tx = signed(&Keypair::new());
+    let (url, methods) = http_endpoint(|method| match method {
+        "sendTransaction" => ("504 Gateway Timeout", "", String::new()),
+        "getBlockHeight" => http_ok(json!(10)),
+        "getSignatureStatuses" => http_ok(json!({
+            "context": { "slot": 1 },
+            "value": [mock::status(9, "confirmed", None)],
+        })),
+        other => panic!("unexpected {other}"),
+    })
+    .await;
+    let outcome = ChainClient::new(url, "confirmed")
+        .expect("client")
+        .send_versioned(&tx, VersionedSendConfig::default())
+        .await
+        .expect("landed despite the 504s");
+    assert_eq!(outcome.confirmation_slot, 9);
+    let methods = methods.lock().expect("methods lock");
+    let sends = methods.iter().filter(|m| *m == "sendTransaction").count();
+    assert_eq!(sends, 3, "{methods:?}");
+    assert!(methods.iter().any(|m| m == "getSignatureStatuses"));
+}
+
+#[tokio::test]
 async fn a_rate_limited_request_does_not_hold_its_permit() {
     // One permit. The send's 429s make `HttpSender` sleep 500 ms between
     // retries; a read issued meanwhile goes through at once.
