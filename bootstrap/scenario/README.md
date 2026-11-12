@@ -64,13 +64,15 @@ large JUP↔RAY flow also exercises bridging), `exact_out_probability` exact-out
 trades. The RNG is seeded (`rng_seed`), so the trade sequence replays.
 Each trade ends in one `outcome` of `flow_swaps_total`: `landed`,
 `unaffordable`, `no_price`, `quote_failed`, `preflight_rejected`,
-`send_failed`, `rpc_rejected` (the RPC refused the balance read or the send:
-HTTP 429/5xx or no connection; nothing reached the cluster), `landed_failed`,
-`expired`, `rpc_ambiguous` (status unknown: the swap may have landed) or
-`error`. Swaps are sent without the router's `last_valid_block_height`, so a
-dropped one is `expired` after 150 + 32 blocks past the first height read
-(about 73 s at 400 ms blocks), or `rpc_ambiguous` when the client's 90 s cap
-comes first. A taker whose trade was `rpc_rejected` skips its refill and
+`send_failed`, `rpc_rejected` (the RPC refused the balance read, or refused
+the send with HTTP 429/503 or no connection; nothing reached the cluster),
+`landed_failed`, `expired`, `rpc_ambiguous` (status unknown: the swap may have
+landed; a gateway 502/504 on the send ends here unless the status settles it)
+or `error`. Swaps carry the router's `last_valid_block_height`, so a dropped
+one is `expired` once the chain passes it (about 60 s at 400 ms blocks).
+Against an older router that doesn't send it, expiry is estimated as 150 + 32
+blocks past the first height read, and a slow chain can reach the client's
+90 s cap first (`rpc_ambiguous`). A taker whose trade was `rpc_rejected` skips its refill and
 backs off (0.5 s doubling to 30 s, jittered).
 
 ## Replay

@@ -668,15 +668,16 @@ impl Flow<'_> {
     /// Sends with preflight (the RPC's simulation catches stale quotes
     /// before they cost a fee) and waits for the client's commitment.
     /// Returns the signature and the slot it landed in.
+    /// `last_valid_block_height` is the router's expiry for the transaction's
+    /// blockhash (older routers don't send it).
     async fn send_and_confirm(
         &self,
         transaction: &VersionedTransaction,
-        // The router's expiry for the blockhash; `send_versioned` does not take it yet.
-        _last_valid_block_height: Option<u64>,
+        last_valid_block_height: Option<u64>,
     ) -> std::result::Result<(Signature, u64), TradeError> {
         match self
             .chain
-            .send_versioned(transaction, VersionedSendConfig::default())
+            .send_versioned(transaction, send_config(last_valid_block_height))
             .await
         {
             Ok(outcome) => Ok((outcome.signature, outcome.confirmation_slot)),
@@ -763,6 +764,17 @@ impl Backoff {
     }
 }
 
+/// The send settings for a routed swap. With the router's
+/// `last_valid_block_height` a dropped swap is `expired` as soon as the chain
+/// passes it; without it the client estimates expiry from the first height it
+/// reads, which can leave a slow chain's swap `rpc_ambiguous` at the cap.
+fn send_config(last_valid_block_height: Option<u64>) -> VersionedSendConfig {
+    VersionedSendConfig {
+        last_valid_block_height,
+        ..VersionedSendConfig::default()
+    }
+}
+
 /// USD to whole micro-USD for the notional counter (counters are integers;
 /// whole USD would drop most of a small trade's volume).
 fn micro_usd(usd: Decimal) -> u64 {
@@ -824,6 +836,16 @@ mod tests {
         // exact-out: quoted 1000 in, spent 1010 -> 100 bps worse
         assert!((-ratio_bps(1_000, 1_010) - 100.0).abs() < 1e-9);
         assert!(ratio_bps(0, 5).abs() < 1e-9);
+    }
+
+    /// R2-FLOWARB-2: the router's expiry reaches the client.
+    #[test]
+    fn the_routers_expiry_is_passed_to_the_send() {
+        assert_eq!(
+            send_config(Some(1_234)).last_valid_block_height,
+            Some(1_234)
+        );
+        assert_eq!(send_config(None).last_valid_block_height, None);
     }
 
     #[test]

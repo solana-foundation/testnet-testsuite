@@ -733,8 +733,12 @@ async fn read_over_http(url: &str) -> anyhow::Error {
 
 #[tokio::test]
 async fn reads_the_rpc_refused_are_told_apart() {
-    for status in ["429 Too Many Requests", "503 Service Unavailable"] {
-        let (url, _) = http_endpoint(status).await;
+    for status in [
+        "429 Too Many Requests",
+        "502 Bad Gateway",
+        "503 Service Unavailable",
+    ] {
+        let (url, _) = http_endpoint(every(status)).await;
         let error = read_over_http(&url).await;
         assert!(crate::refused_by_rpc(&error), "{status}: {error:#}");
     }
@@ -743,7 +747,7 @@ async fn reads_the_rpc_refused_are_told_apart() {
     drop(listener);
     assert!(crate::refused_by_rpc(&read_over_http(&url).await));
     // Served, but the answer is unreadable: not a refusal.
-    let (url, _) = http_endpoint("200 OK").await;
+    let (url, _) = http_endpoint(every("200 OK")).await;
     let error = read_over_http(&url).await;
     assert!(!crate::refused_by_rpc(&error), "{error:#}");
     assert!(!crate::refused_by_rpc(&anyhow::anyhow!("other")));
