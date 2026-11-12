@@ -88,7 +88,8 @@ impl Hub {
 }
 
 /// Follow chain-watch: health, new slots, new events. A new run id (it was
-/// restarted) resets the buffers.
+/// restarted), or its cursor well behind what was already read (restarted
+/// under the same run id against a reset chain), resets the buffers.
 pub async fn pump_chain(app: Arc<App>) {
     let mut run_id: Option<String> = None;
     let mut next_slot = 0_u64;
@@ -114,8 +115,15 @@ pub async fn pump_chain(app: Arc<App>) {
             info!("chain-watch reachable again");
             reachable = true;
         }
-        if run_id.as_deref() != Some(health.run_id.as_str()) {
-            if run_id.is_some() {
+        let same_run = run_id.as_deref() == Some(health.run_id.as_str());
+        let rewound = same_run && went_back(next_slot, health.cursor_slot);
+        if !same_run || rewound {
+            if rewound {
+                info!(
+                    cursor = health.cursor_slot,
+                    next_slot, "chain-watch cursor moved back under the same run; following it"
+                );
+            } else if run_id.is_some() {
                 info!(run_id = %health.run_id, "chain-watch run changed");
             }
             app.hub.reset_chain(&health.run_id);
@@ -164,9 +172,20 @@ where
     if cursor_slot <= *next_slot {
         return Ok(Vec::new());
     }
-    let slots = fetch(*next_slot, SLOT_BATCH).await?;
+    let mut slots = fetch(*next_slot, SLOT_BATCH).await?;
+    // Rows at or past the cursor are not this pipeline's yet: left over
+    // from before a restart under the same run id (or committed after the
+    // health read, and read next time).
+    slots.retain(|s| s.slot < cursor_slot);
     *next_slot = next_after(*next_slot, &slots);
     Ok(slots)
+}
+
+/// chain-watch's cursor is further behind what was already read than any
+/// commit lag explains: it restarted from a lower slot (a reset local
+/// chain) under the same run id, so the feed must start over from there.
+fn went_back(next_slot: u64, cursor_slot: u64) -> bool {
+    cursor_slot.saturating_add(SLOT_BUFFER as u64) < next_slot
 }
 
 /// The next slot to ask for after a `/slots` reply. chain-watch commits in
@@ -284,5 +303,24 @@ mod tests {
         let seen = follow(&mut next_slot, 1_200 + hole, &rows).await;
         assert_eq!(seen, rows);
         assert_eq!(next_slot, 1_200 + hole);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_moving_back_under_the_same_run_is_followed() {
+        // Followed to 300_000_000; then the local chain is reset and
+        // chain-watch restarts (same run id, same run.db) at slot 40.
+        let old: Vec<u64> = (299_999_990..300_000_000).collect();
+        let mut next_slot = 299_999_990;
+        assert_eq!(follow(&mut next_slot, 300_000_000, &old).await, old);
+        let cursor = 51;
+        assert!(!went_back(next_slot, 300_000_000));
+        assert!(went_back(next_slot, cursor));
+        // What pump_chain then does.
+        next_slot = cursor.saturating_sub(SLOT_BUFFER as u64);
+        let rows: Vec<u64> = (40..cursor).chain(old.iter().copied()).collect();
+        let seen = follow(&mut next_slot, cursor, &rows).await;
+        assert_eq!(seen, (40..cursor).collect::<Vec<_>>());
+        assert_eq!(next_slot, cursor);
+        assert!(!went_back(next_slot, cursor));
     }
 }
