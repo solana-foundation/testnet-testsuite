@@ -162,6 +162,8 @@ pub struct ChainOptions {
     pub max_in_flight: usize,
     /// How often the shared confirmer polls pending transactions.
     pub confirm_interval: Duration,
+    /// Per-request HTTP timeout (the HTTP client's 30 s default when `None`).
+    pub request_timeout: Option<Duration>,
 }
 
 /// Default for [`ChainOptions::max_in_flight`].
@@ -172,6 +174,7 @@ impl Default for ChainOptions {
         Self {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             confirm_interval: Duration::from_millis(400),
+            request_timeout: None,
         }
     }
 }
@@ -231,11 +234,11 @@ impl ChainClient {
         options: ChainOptions,
     ) -> anyhow::Result<Self> {
         let commitment = parse_commitment(commitment)?;
-        Ok(Self::from_sender(
-            HttpSender::new(http_url.into()),
-            commitment,
-            options,
-        ))
+        let sender = match options.request_timeout {
+            Some(timeout) => HttpSender::new_with_timeout(http_url.into(), timeout),
+            None => HttpSender::new(http_url.into()),
+        };
+        Ok(Self::from_sender(sender, commitment, options))
     }
 
     /// A client over any transport (the seam the state machine tests use).
@@ -281,14 +284,14 @@ impl ChainClient {
         commitment: &str,
         timeout: Duration,
     ) -> anyhow::Result<Self> {
-        let commitment = parse_commitment(commitment)?;
-        Ok(Self {
-            rpc: Arc::new(RpcClient::new_with_timeout_and_commitment(
-                http_url.into(),
-                timeout,
-                commitment,
-            )),
-        })
+        Self::with_options(
+            http_url,
+            commitment,
+            ChainOptions {
+                request_timeout: Some(timeout),
+                ..ChainOptions::default()
+            },
+        )
     }
 
     pub fn rpc(&self) -> &RpcClient {
