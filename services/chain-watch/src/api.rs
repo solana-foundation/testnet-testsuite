@@ -101,26 +101,29 @@ async fn slots(
     State(shared): State<Arc<Shared>>,
     Query(query): Query<SlotsQuery>,
 ) -> Result<Response, ApiError> {
-    let (to, limit) = match (query.to, query.limit) {
-        (Some(to), _) if to < query.from || to - query.from > MAX_SLOT_SPAN => {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                format!("from..=to must be ordered and span at most {MAX_SLOT_SPAN} slots"),
-            )
-                .into_response());
-        }
-        (Some(to), limit) => (to, limit.unwrap_or(u32::MAX)),
-        (None, None) => {
-            return Ok((StatusCode::BAD_REQUEST, "give `to` or `limit`").into_response());
-        }
-        (None, Some(limit)) => (u64::MAX, limit),
+    let (from, (to, limit)) = match slot_bounds(&query) {
+        Ok(bounds) => (query.from, bounds),
+        Err(message) => return Ok((StatusCode::BAD_REQUEST, message).into_response()),
     };
-    let limit = limit.min(MAX_SLOT_SPAN as u32);
     let rows = shared
         .store
-        .read(move |conn| store::slots(conn, query.from, to, limit))
+        .read(move |conn| store::slots(conn, from, to, limit))
         .await?;
     Ok(Json(rows).into_response())
+}
+
+/// The `to` and row limit a `/slots` query reads with. `from..=to` holds
+/// up to `MAX_SLOT_SPAN + 1` slots, all returned; a bare `limit` is capped
+/// at `MAX_SLOT_SPAN`.
+fn slot_bounds(query: &SlotsQuery) -> Result<(u64, u32), String> {
+    match (query.to, query.limit) {
+        (Some(to), _) if to < query.from || to - query.from > MAX_SLOT_SPAN => Err(format!(
+            "from..=to must be ordered and span at most {MAX_SLOT_SPAN} slots"
+        )),
+        (Some(to), limit) => Ok((to, limit.unwrap_or(u32::MAX).min(MAX_SLOT_SPAN as u32 + 1))),
+        (None, None) => Err("give `to` or `limit`".to_owned()),
+        (None, Some(limit)) => Ok((u64::MAX, limit.min(MAX_SLOT_SPAN as u32))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -138,4 +141,32 @@ async fn txs(
             .read(move |conn| store::txs(conn, query.slot))
             .await?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query(from: u64, to: Option<u64>, limit: Option<u32>) -> SlotsQuery {
+        SlotsQuery { from, to, limit }
+    }
+
+    #[test]
+    fn a_full_width_range_returns_every_slot() {
+        // 0..=18_000 is 18_001 slots.
+        let (to, limit) = slot_bounds(&query(0, Some(MAX_SLOT_SPAN), None)).expect("valid");
+        assert_eq!((to, limit), (MAX_SLOT_SPAN, MAX_SLOT_SPAN as u32 + 1));
+        assert!(slot_bounds(&query(0, Some(MAX_SLOT_SPAN + 1), None)).is_err());
+        assert!(slot_bounds(&query(5, Some(4), None)).is_err());
+        assert_eq!(
+            slot_bounds(&query(0, Some(10), Some(3))).expect("valid"),
+            (10, 3)
+        );
+        // `from` + `limit`: capped at the span.
+        assert_eq!(
+            slot_bounds(&query(7, None, Some(u32::MAX))).expect("valid"),
+            (u64::MAX, MAX_SLOT_SPAN as u32)
+        );
+        assert!(slot_bounds(&query(7, None, None)).is_err());
+    }
 }
