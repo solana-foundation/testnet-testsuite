@@ -121,13 +121,22 @@ NO_DNA=1 just scenario-testnet          # bootstrap + run (prd Doppler config)
 NO_DNA=1 just scenario-status-testnet
 ```
 
-`deploy` skips a program only when its on-chain code is byte-for-byte its
-fork artifact (`scenario check-programs`); a deployed program running
+Programs are compared by code hash (`scenario check-programs`: sha256 of
+the program data's ELF, trailing zero padding dropped). The expected hash is
+the program's entry in the lock file `deploy` records,
+`bootstrap/scenario/programs-<target>.lock` (`.scenario/programs-local.lock`
+locally; `SCENARIO_PROGRAMS_LOCK` overrides), else the hash of its fork
+artifact. Commit the lock for a shared target: a run-only host then
+verifies without the artifacts, and a rebuilt artifact (SBF builds are not
+reproducible across toolchains) does not turn a healthy deployment into a
+mismatch. `deploy` skips a program that runs its expected code; one running
 anything else (the janitor after a failed teardown, an older fork build) is
-refused, and `SCENARIO_UPGRADE_PROGRAMS=1` upgrades it to the artifact. `up`
-runs the same check before it starts anything and refuses a program that is
-not deployed or does not run its artifact (a missing artifact file only
-warns: nothing to compare with).
+refused, and `SCENARIO_UPGRADE_PROGRAMS=1` upgrades it to the artifact.
+`up` runs the same check before it starts anything and refuses a program
+that is not deployed or does not run its expected code, printing both
+hashes. On a remote target, a program with neither a lock entry nor an
+artifact is refused too (locally it only warns);
+`SCENARIO_SKIP_PROGRAM_CHECK=1` skips the check.
 
 The testnet profile slows every maker 5× and flow to 4 trades/min for the
 public RPC; set `SCENARIO_RPC_URL` (and `SCENARIO_WS_URL`) to a dedicated
@@ -347,8 +356,9 @@ transactions failed). The limits, in order:
 
 `scenario.sh teardown` (`just scenario-teardown-dev` / `-testnet`) recovers
 the scenario's SOL into the faucet. Before stopping anything it checks the
-faucet key, the program authority and the janitor `.so` (with
-`SCENARIO_JANITOR`) and
+faucet key, the program authority, the janitor `.so` and the three fork
+artifacts (with `SCENARIO_JANITOR`: each must be readable and be exactly the
+deployed code, or the restore could not put it back) and
 `scenario check` (seed, program ids and mints resolve), so a missing secret
 cannot leave the run half torn down; like `snapshot` and `report` it runs at
 the scale `up` recorded unless `SCENARIO_SCALE` names it:
@@ -434,11 +444,18 @@ unwind, which still needs the real code) and runs `scenario janitor`, which:
 It then upgrades the forks back, empty: `bootstrap` re-creates configs, pools and
 markets on the same chain. The restore runs on every exit once the first
 upgrade to the janitor has started: a failed or interrupted `scenario
-janitor` or upgrade, or Ctrl-C (a second one stops only the deploy in
-flight). Each program that does not run its fork is redeployed, past a
-failed one; if any is left, the run fails listing it, and `deploy` / `up`
-refuse it until `SCENARIO_UPGRADE_PROGRAMS=1 scenario.sh deploy` restores
-it. Building needs the Agave platform tools
+janitor` or upgrade, Ctrl-C (a second one stops only the deploy in flight),
+SIGTERM or a hang-up. Every program whose janitor upgrade was attempted is
+redeployed (whatever a lagging RPC node shows), past a failed one, and all
+three are then checked; if any is left, the run fails listing it, and
+`deploy` / `up` refuse it until `SCENARIO_UPGRADE_PROGRAMS=1 scenario.sh
+deploy` restores it. The restore's deploy output goes to
+`.scenario/logs/janitor-restore.log`; run a testnet teardown under tmux or
+`nohup` all the same. `.scenario/janitor-incomplete` is written before
+`scenario janitor` closes anything and removed only when it finishes with no
+account left: while it exists the forks may hold pools without their
+vaults, the failure message says so, and `up` refuses until a janitor
+teardown finishes. Building needs the Agave platform tools
 (`cargo-build-sbf`, Agave >= 4.x) and `PUBKEY_PROGRAM_AUTHORITY` /
 `PUBKEY_FAUCET` in the Doppler config.
 

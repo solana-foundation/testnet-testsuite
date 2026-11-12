@@ -65,7 +65,8 @@ enum Command {
     /// Resolve the scenario (seed, program ids, mints) and change nothing:
     /// the preflight for commands that must not fail halfway.
     Check,
-    /// Fail unless each program runs its fork artifact (`deploy` / `up`
+    /// Fail unless each program runs its expected code, by hash: its
+    /// `--lock` entry, else its fork artifact (`deploy` / `up` / janitor
     /// preflight: a failed janitor teardown leaves the janitor there).
     /// Needs no scenario resolution, so it runs before the mints exist.
     CheckPrograms {
@@ -78,6 +79,21 @@ enum Command {
         /// A program that is not deployed passes (`deploy` creates it).
         #[arg(long)]
         allow_absent: bool,
+        /// `<program id> <sha256>` lines recorded by `deploy`: the expected
+        /// code ahead of the artifact (a missing file has no entries).
+        #[arg(long)]
+        lock: Option<PathBuf>,
+        /// On success, record each matching program's hash in `--lock`.
+        #[arg(long, requires = "lock")]
+        record: bool,
+        /// Fail, rather than warn, when a program has neither a lock entry
+        /// nor an artifact to compare with.
+        #[arg(long)]
+        require_verified: bool,
+        /// Each artifact must exist and be exactly the deployed code (the
+        /// janitor preflight: its restore deploys the artifacts).
+        #[arg(long)]
+        require_artifact: bool,
     },
     /// Wait until the oracle has a fresh price for every scenario token
     /// (pools are created at oracle prices).
@@ -201,10 +217,21 @@ async fn main() -> Result<()> {
         programs,
         janitor_so,
         allow_absent,
+        lock,
+        record,
+        require_verified,
+        require_artifact,
     } = &cli.command
     {
+        let options = janitor::CheckOptions {
+            allow_absent: *allow_absent,
+            require_verified: *require_verified,
+            require_artifact: *require_artifact,
+            lock: lock.clone(),
+            record: *record,
+        };
         let report =
-            janitor::check_programs(&rpc, programs, janitor_so.as_deref(), *allow_absent).await?;
+            janitor::check_programs(&rpc, programs, janitor_so.as_deref(), &options).await?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }

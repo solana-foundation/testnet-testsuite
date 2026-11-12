@@ -15,6 +15,7 @@
 //! unless its on-chain code is byte-for-byte the janitor binary given here.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -25,6 +26,7 @@ use mtm_chain::{ChainClient, SubmissionConfig};
 use mtm_dex_harness::spl;
 use mtm_scenario::{Programs, Scenario};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -85,11 +87,26 @@ async fn ensure_janitor(chain: &ChainClient, program: &Pubkey, elf: &[u8]) -> Re
     deployment_slot(&data).with_context(|| format!("{program}'s program data has no slot"))
 }
 
-/// What a program ID runs, compared with the artifact it should run.
+/// sha256 (hex) of a program's code with its trailing zero bytes dropped: a
+/// ProgramData account pads the ELF with zeros up to its allocated length,
+/// so the deployed code and the artifact it came from hash the same, and a
+/// rebuilt artifact passes exactly when it is the same binary.
+pub fn code_hash(code: &[u8]) -> String {
+    let end = code
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last + 1);
+    Sha256::digest(&code[..end])
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// What a program ID runs, compared with the code it should run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Code {
-    /// Exactly the artifact.
+    /// Exactly the expected code.
     Matches,
     /// The janitor binary (a janitor teardown did not restore it).
     Janitor,
@@ -99,21 +116,25 @@ pub enum Code {
     Absent,
     /// An upgradeable program with no program data: closed for good.
     Closed,
-    /// The artifact file is missing, so nothing could be compared.
+    /// No expected code (no lock entry and no artifact file): nothing was
+    /// compared.
     Unverified,
 }
 
-/// Classify one program's on-chain code. `program` and its program data
-/// are read with the batched raw reader, so an absent account is a
-/// definite answer and an RPC error is an error.
-pub async fn code_of(
-    rpc: &JsonRpc,
-    program: &Pubkey,
-    artifact: Option<&[u8]>,
-    janitor: Option<&[u8]>,
-) -> Result<Code> {
+/// What a program ID holds: the hash of its code, unless absent or closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Deployed {
+    Absent,
+    Closed,
+    Code(String),
+}
+
+/// Read one program's code. `program` and its program data are read with
+/// the batched raw reader, so an absent account is a definite answer and an
+/// RPC error is an error.
+pub async fn deployed(rpc: &JsonRpc, program: &Pubkey) -> Result<Deployed> {
     let Some(account) = accounts(rpc, &[*program]).await?.pop().flatten() else {
-        return Ok(Code::Absent);
+        return Ok(Deployed::Absent);
     };
     // Upgradeable program account: u32 tag + ProgramData address.
     let program_data = account
@@ -122,60 +143,214 @@ pub async fn code_of(
         .and_then(|raw| Pubkey::try_from(raw).ok())
         .with_context(|| format!("{program} is not an upgradeable program"))?;
     let Some(data) = accounts(rpc, &[program_data]).await?.pop().flatten() else {
-        return Ok(Code::Closed);
+        return Ok(Deployed::Closed);
     };
-    Ok(classify(&data.data, artifact, janitor))
+    Ok(Deployed::Code(code_hash(
+        data.data.get(PROGRAM_DATA_HEADER..).unwrap_or_default(),
+    )))
 }
 
-fn classify(program_data: &[u8], artifact: Option<&[u8]>, janitor: Option<&[u8]>) -> Code {
-    if janitor.is_some_and(|elf| runs(program_data, elf)) {
+/// `on_chain` against the expected code hash and the janitor's.
+fn classify(on_chain: &str, expected: Option<&str>, janitor: Option<&str>) -> Code {
+    if janitor == Some(on_chain) {
         return Code::Janitor;
     }
-    match artifact {
+    match expected {
         None => Code::Unverified,
-        Some(elf) if runs(program_data, elf) => Code::Matches,
+        Some(expected) if expected == on_chain => Code::Matches,
         Some(_) => Code::Differs,
     }
 }
 
-/// `deploy` / `up` preflight: every program must run its fork artifact.
-/// Fails listing the programs that run the janitor or other code, are
-/// closed, or (unless `allow_absent`) are not deployed; a missing artifact
-/// file is only a warning.
+/// The lock file `deploy` records: one `<program id> <code sha256>` line
+/// per program (`#` comments). A missing file has no entries.
+pub fn read_lock(path: &Path) -> Result<BTreeMap<Pubkey, String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let (program, hash) = line
+                .split_once(char::is_whitespace)
+                .with_context(|| format!("{}: bad line {line:?}", path.display()))?;
+            let hash = hash.trim();
+            anyhow::ensure!(
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{}: bad sha256 in {line:?}",
+                path.display()
+            );
+            Ok((
+                program
+                    .parse()
+                    .with_context(|| format!("{}: bad program id in {line:?}", path.display()))?,
+                hash.to_ascii_lowercase(),
+            ))
+        })
+        .collect()
+}
+
+fn write_lock(path: &Path, entries: &BTreeMap<Pubkey, String>) -> Result<()> {
+    let mut text = String::from(
+        "# Code sha256 (trailing zeros dropped) each DEX program ID runs, recorded by\n\
+         # `scenario.sh deploy`; `up`, `deploy` and the janitor teardown check against it.\n",
+    );
+    for (program, hash) in entries {
+        text.push_str(&format!("{program} {hash}\n"));
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+/// How strict [`check_programs`] is.
+#[derive(Debug, Clone, Default)]
+pub struct CheckOptions {
+    /// A program that is not deployed passes (`deploy` creates it).
+    pub allow_absent: bool,
+    /// No expected code (no lock entry, no artifact) fails instead of
+    /// warning: a remote target, where a program left as anything else must
+    /// not pass unnoticed.
+    pub require_verified: bool,
+    /// Each artifact must exist and be exactly the deployed code: the
+    /// janitor's restore deploys it, so it must be the code to restore.
+    pub require_artifact: bool,
+    /// The lock file (`<program id> <sha256>` lines); its entry, when there
+    /// is one, is the expected code, ahead of the artifact.
+    pub lock: Option<PathBuf>,
+    /// On success, record each matching program's hash in `lock`. A
+    /// program running exactly its artifact matches (and is recorded)
+    /// whatever the lock held: `deploy` records what it just deployed.
+    pub record: bool,
+}
+
+/// `deploy` / `up` / janitor preflight: every program must run its expected
+/// code, the lock-file hash when there is one, else its artifact's. Fails
+/// listing the programs that run the janitor or other code (with both
+/// hashes), are closed, or (unless `allow_absent`) are not deployed; with
+/// nothing to compare against, it warns (fails with `require_verified`).
 pub async fn check_programs(
     rpc: &JsonRpc,
-    programs: &[(Pubkey, std::path::PathBuf)],
-    janitor_so: Option<&std::path::Path>,
-    allow_absent: bool,
+    programs: &[(Pubkey, PathBuf)],
+    janitor_so: Option<&Path>,
+    options: &CheckOptions,
 ) -> Result<Value> {
     let janitor = janitor_so
-        .map(|path| std::fs::read(path).with_context(|| format!("reading {}", path.display())))
+        .map(|path| {
+            std::fs::read(path)
+                .map(|elf| code_hash(&elf))
+                .with_context(|| format!("reading {}", path.display()))
+        })
         .transpose()?;
+    let mut lock = options
+        .lock
+        .as_deref()
+        .map(read_lock)
+        .transpose()?
+        .unwrap_or_default();
+    let lock_name = options.lock.as_deref().map_or_else(
+        || "no lock file".to_owned(),
+        |path| path.display().to_string(),
+    );
     let mut rows = Vec::new();
     let mut bad = Vec::new();
+    let mut matched = Vec::new();
     for (program, path) in programs {
         let artifact = match std::fs::read(path) {
-            Ok(elf) => Some(elf),
+            Ok(elf) => Some(code_hash(&elf)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(error).with_context(|| format!("reading {}", path.display()));
             }
         };
-        let code = code_of(rpc, program, artifact.as_deref(), janitor.as_deref()).await?;
+        let locked = lock.get(program).cloned();
+        let on_chain = deployed(rpc, program).await?;
+        // Recording after a deploy: the artifact just deployed is the code
+        // to record, whatever the lock held before.
+        let deployed_artifact = options.record
+            && matches!((&on_chain, &artifact), (Deployed::Code(code), Some(hash)) if code == hash);
+        let (expected, source) = match (&locked, &artifact) {
+            (_, Some(hash)) if deployed_artifact => {
+                (Some(hash.as_str()), path.display().to_string())
+            }
+            (Some(hash), _) => (Some(hash.as_str()), lock_name.clone()),
+            (None, Some(hash)) => (Some(hash.as_str()), path.display().to_string()),
+            (None, None) => (None, String::new()),
+        };
+        let (code, on_chain) = match on_chain {
+            Deployed::Absent => (Code::Absent, None),
+            Deployed::Closed => (Code::Closed, None),
+            Deployed::Code(hash) => (classify(&hash, expected, janitor.as_deref()), Some(hash)),
+        };
+        let on_chain_text = on_chain.as_deref().unwrap_or("-");
         match code {
-            Code::Matches => {}
-            Code::Absent if allow_absent => {}
+            Code::Matches => {
+                if options.require_artifact && artifact != on_chain {
+                    bad.push(match &artifact {
+                        None => format!(
+                            "{program}: artifact {} is missing, so the forks could not be restored",
+                            path.display()
+                        ),
+                        Some(hash) => format!(
+                            "{program}: artifact {} (sha256 {hash}) is not the deployed code \
+                             (sha256 {on_chain_text}), so a restore would deploy another build",
+                            path.display()
+                        ),
+                    });
+                } else {
+                    if let Some(hash) = &artifact
+                        && Some(hash) != on_chain.as_ref()
+                    {
+                        tracing::warn!(%program, artifact = %path.display(), artifact_sha256 = %hash, deployed_sha256 = %on_chain_text,
+                            "the local artifact is another build than the deployed (locked) code");
+                    }
+                    matched.push((*program, on_chain.clone().unwrap_or_default()));
+                }
+            }
+            Code::Absent if options.allow_absent => {}
+            Code::Unverified if options.require_verified || options.require_artifact => {
+                bad.push(format!(
+                    "{program}: nothing to compare its code (sha256 {on_chain_text}) with: artifact \
+                     {} is missing and {lock_name} has no entry for it",
+                    path.display()
+                ));
+            }
             Code::Unverified => {
-                tracing::warn!(%program, artifact = %path.display(), "artifact missing: the program's code was not checked")
+                tracing::warn!(%program, artifact = %path.display(), deployed_sha256 = %on_chain_text,
+                    "no artifact and no lock entry: the program's code was not checked")
             }
             Code::Janitor => bad.push(format!("{program} runs the janitor")),
-            Code::Differs => bad.push(format!("{program} does not run {}", path.display())),
+            Code::Differs => bad.push(format!(
+                "{program} runs code sha256 {on_chain_text}, expected sha256 {} (from {source})",
+                expected.unwrap_or_default()
+            )),
             Code::Absent => bad.push(format!("{program} is not deployed")),
             Code::Closed => bad.push(format!("{program} was closed")),
         }
-        rows.push(json!({ "program": program.to_string(), "artifact": path, "code": code }));
+        rows.push(json!({
+            "program": program.to_string(),
+            "artifact": path,
+            "code": code,
+            "sha256": on_chain,
+            "artifactSha256": artifact,
+            "lockedSha256": locked,
+        }));
     }
     anyhow::ensure!(bad.is_empty(), "{}", bad.join("; "));
+    if options.record
+        && let Some(path) = &options.lock
+    {
+        lock.extend(matched);
+        write_lock(path, &lock)?;
+    }
     Ok(json!({ "programs": rows }))
 }
 
@@ -668,35 +843,268 @@ mod tests {
 
     #[test]
     fn program_code_is_the_fork_the_janitor_or_other() {
-        let program_data = |elf: &[u8]| {
-            let mut data = vec![3, 0, 0, 0];
-            data.extend_from_slice(&[0; 41]);
-            data.extend_from_slice(elf);
-            data.extend_from_slice(&[0; 64]);
-            data
-        };
-        let (fork, janitor) = (b"\x7fELF fork".as_slice(), b"\x7fELF janitor".as_slice());
+        let (fork, janitor) = (code_hash(b"\x7fELF fork"), code_hash(b"\x7fELF janitor"));
+        // Zero padding up to the account's length hashes away.
+        assert_eq!(code_hash(b"\x7fELF fork\0\0\0\0"), fork);
+        assert_ne!(code_hash(b"\x7fELF for"), fork);
+        assert_eq!(classify(&fork, Some(&fork), Some(&janitor)), Code::Matches);
         assert_eq!(
-            classify(&program_data(fork), Some(fork), Some(janitor)),
-            Code::Matches
-        );
-        assert_eq!(
-            classify(&program_data(janitor), Some(fork), Some(janitor)),
+            classify(&janitor, Some(&fork), Some(&janitor)),
             Code::Janitor
         );
-        // Without the fork artifact the janitor is still recognised.
+        // Without the expected code the janitor is still recognised.
+        assert_eq!(classify(&janitor, None, Some(&janitor)), Code::Janitor);
+        assert_eq!(classify(&fork, None, Some(&janitor)), Code::Unverified);
         assert_eq!(
-            classify(&program_data(janitor), None, Some(janitor)),
-            Code::Janitor
-        );
-        assert_eq!(
-            classify(&program_data(fork), None, Some(janitor)),
-            Code::Unverified
-        );
-        assert_eq!(
-            classify(&program_data(b"\x7fELF v2"), Some(fork), None),
+            classify(&code_hash(b"\x7fELF v2"), Some(&fork), None),
             Code::Differs
         );
+    }
+
+    /// A scratch directory, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mtm-janitor-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            Self(dir)
+        }
+
+        fn file(&self, name: &str, data: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, data).expect("write");
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn check_programs_compares_code_hashes() {
+        let elf = |name: &str| format!("\x7fELF {name}").into_bytes();
+        // program → its program data account, holding `code` (padded).
+        let mut accounts: HashMap<Pubkey, (Pubkey, u64, Vec<u8>)> = HashMap::new();
+        let loader = Pubkey::new_unique();
+        let mut deploy = |code: Option<&[u8]>| {
+            let (program, program_data) = (Pubkey::new_unique(), Pubkey::new_unique());
+            let mut data = vec![2, 0, 0, 0];
+            data.extend_from_slice(program_data.as_ref());
+            accounts.insert(program, (loader, 1, data));
+            if let Some(code) = code {
+                let mut data = vec![3, 0, 0, 0];
+                data.extend_from_slice(&[0; 41]);
+                data.extend_from_slice(code);
+                data.extend_from_slice(&[0; 32]);
+                accounts.insert(program_data, (loader, 1, data));
+            }
+            program
+        };
+        let matches = deploy(Some(&elf("fork")));
+        let janitor = deploy(Some(&elf("janitor")));
+        let closed = deploy(None);
+        let rebuilt = deploy(Some(&elf("release build")));
+        let unverified = deploy(Some(&elf("unknown")));
+        let differs = deploy(Some(&elf("v1")));
+        let absent = Pubkey::new_unique();
+        let (url, _) = stub_rpc(move |method, params| {
+            assert_eq!(method, "getMultipleAccounts");
+            let value: Vec<Value> = params[0]
+                .as_array()
+                .expect("keys")
+                .iter()
+                .map(|key| {
+                    let key: Pubkey = key.as_str().and_then(|k| k.parse().ok()).expect("key");
+                    accounts.get(&key).map_or(Value::Null, |(owner, lamports, data)| {
+                        json!({ "owner": owner.to_string(), "lamports": lamports, "data": [b64(data), "base64"] })
+                    })
+                })
+                .collect();
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "context": { "slot": 1 }, "value": value } })
+        })
+        .await;
+        let rpc = JsonRpc::new(url, "confirmed").expect("client");
+        let dir = Scratch::new("check");
+        let janitor_so = dir.file("janitor.so", &elf("janitor"));
+        let lock = dir.0.join("programs.lock");
+        std::fs::write(
+            &lock,
+            format!(
+                "# recorded\n{rebuilt} {}\n",
+                code_hash(&elf("release build"))
+            ),
+        )
+        .expect("lock");
+        let fork = dir.file("fork.so", &elf("fork"));
+        // Another build of the locked program: the lock decides.
+        let other_build = dir.file("rebuilt.so", &elf("local build"));
+        let missing = dir.0.join("missing.so");
+        let v2 = dir.file("v2.so", &elf("v2"));
+        let check = |programs: Vec<(Pubkey, PathBuf)>, options: CheckOptions| {
+            let (rpc, janitor_so) = (&rpc, janitor_so.clone());
+            async move {
+                check_programs(rpc, &programs, Some(&janitor_so), &options)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            }
+        };
+        let locked = || CheckOptions {
+            lock: Some(lock.clone()),
+            ..CheckOptions::default()
+        };
+
+        let healthy = vec![
+            (matches, fork.clone()),
+            (rebuilt, other_build.clone()),
+            (unverified, missing.clone()),
+        ];
+        let report = check(healthy.clone(), locked()).await.expect("healthy");
+        assert_eq!(report["programs"][0]["code"], "matches");
+        assert_eq!(report["programs"][1]["code"], "matches");
+        assert_eq!(report["programs"][2]["code"], "unverified");
+        // A remote target refuses what it cannot verify.
+        let error = check(
+            healthy.clone(),
+            CheckOptions {
+                require_verified: true,
+                ..locked()
+            },
+        )
+        .await
+        .expect_err("unverified");
+        assert!(
+            error.contains(&format!("{unverified}: nothing to compare")),
+            "{error}"
+        );
+        assert!(!error.contains(&rebuilt.to_string()), "{error}");
+        // The janitor preflight needs every artifact to be the deployed code.
+        let error = check(
+            healthy,
+            CheckOptions {
+                require_artifact: true,
+                ..locked()
+            },
+        )
+        .await
+        .expect_err("artifacts");
+        assert!(
+            error.contains(&format!("{rebuilt}: artifact"))
+                && error.contains("is not the deployed code"),
+            "{error}"
+        );
+        assert!(error.contains(&unverified.to_string()), "{error}");
+        assert!(!error.contains(&matches.to_string()), "{error}");
+        let error = check(
+            vec![(matches, missing.clone())],
+            CheckOptions {
+                require_artifact: true,
+                ..locked()
+            },
+        )
+        .await
+        .expect_err("missing artifact");
+        assert!(error.contains("is missing"), "{error}");
+
+        for (program, artifact, want) in [
+            (janitor, fork.clone(), "runs the janitor".to_owned()),
+            (closed, fork.clone(), "was closed".to_owned()),
+            (absent, fork.clone(), "is not deployed".to_owned()),
+            (
+                differs,
+                v2.clone(),
+                format!(
+                    "runs code sha256 {}, expected sha256 {}",
+                    code_hash(&elf("v1")),
+                    code_hash(&elf("v2"))
+                ),
+            ),
+        ] {
+            let error = check(vec![(program, artifact)], locked())
+                .await
+                .expect_err(&want);
+            assert!(error.contains(&want), "{error}");
+        }
+        check(
+            vec![(absent, fork.clone())],
+            CheckOptions {
+                allow_absent: true,
+                ..locked()
+            },
+        )
+        .await
+        .expect("absent allowed");
+
+        // `deploy` records what it verified; existing entries stay.
+        check(
+            vec![(matches, fork.clone())],
+            CheckOptions {
+                record: true,
+                ..locked()
+            },
+        )
+        .await
+        .expect("recorded");
+        let recorded = read_lock(&lock).expect("lock");
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[&matches], code_hash(&elf("fork")));
+        assert_eq!(recorded[&rebuilt], code_hash(&elf("release build")));
+        // After an upgrade to the artifact, recording replaces a stale entry
+        // (a plain check refuses it).
+        std::fs::write(&lock, format!("{differs} {}\n", code_hash(&elf("v0")))).expect("lock");
+        let v1 = dir.file("v1.so", &elf("v1"));
+        check(vec![(differs, v1.clone())], locked())
+            .await
+            .expect_err("stale lock");
+        check(
+            vec![(differs, v1)],
+            CheckOptions {
+                record: true,
+                ..locked()
+            },
+        )
+        .await
+        .expect("recorded over the stale entry");
+        assert_eq!(
+            read_lock(&lock).expect("lock")[&differs],
+            code_hash(&elf("v1"))
+        );
+        std::fs::write(
+            &lock,
+            format!(
+                "{matches} {}\n{rebuilt} {}\n",
+                code_hash(&elf("fork")),
+                code_hash(&elf("release build"))
+            ),
+        )
+        .expect("lock");
+        // A program running the janitor fails the check and records nothing.
+        check(
+            vec![(janitor, fork)],
+            CheckOptions {
+                record: true,
+                ..locked()
+            },
+        )
+        .await
+        .expect_err("janitor");
+        assert_eq!(read_lock(&lock).expect("lock").len(), 2);
+        assert!(
+            read_lock(&dir.0.join("none.lock"))
+                .expect("missing")
+                .is_empty()
+        );
+        assert!(read_lock(&dir.file("bad.lock", b"abc 12\n")).is_err());
     }
 
     #[test]
@@ -921,11 +1329,15 @@ mod tests {
         assert!(orca_pool(fixture.programs.orca_whirlpool, fixture.raydium_pool, data).is_none());
     }
 
-    #[tokio::test]
-    async fn vaults_come_from_the_pools_without_scanning_a_token_program() {
-        let fixture = fixture();
-        let accounts = fixture.accounts.clone();
-        let (url, calls) = stub_rpc(move |method, params| match method {
+    /// A stub RPC serving `accounts` (`getProgramAccounts` refuses a
+    /// token-program scan).
+    async fn accounts_rpc(
+        accounts: HashMap<Pubkey, (Pubkey, u64, Vec<u8>)>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        stub_rpc(move |method, params| match method {
             "getProgramAccounts" => {
                 let program: Pubkey = params[0].as_str().and_then(|p| p.parse().ok()).expect("program");
                 if spl::is_token_program(&program) {
@@ -958,7 +1370,13 @@ mod tests {
             }
             other => panic!("unexpected {other}"),
         })
-        .await;
+        .await
+    }
+
+    #[tokio::test]
+    async fn vaults_come_from_the_pools_without_scanning_a_token_program() {
+        let fixture = fixture();
+        let (url, calls) = accounts_rpc(fixture.accounts.clone()).await;
         let rpc = JsonRpc::new(url, "confirmed").expect("client");
         let (found, authorities) = vaults(&rpc, &fixture.programs, &fixture.mints)
             .await
