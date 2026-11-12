@@ -73,7 +73,11 @@ pub struct Plan {
 }
 
 pub struct Searcher<'s> {
+    /// Sends, confirms and accounts at the configured commitment.
     chain: ChainClient,
+    /// The same client reading at the search commitment: snapshots and
+    /// the pre-send simulation.
+    reader: ChainClient,
     scenario: &'s Scenario,
     oracle: OracleClient,
     pools: Vec<(Venue, Pubkey)>,
@@ -132,9 +136,11 @@ impl<'s> Searcher<'s> {
             counter!("arb_loss_micro_usd_total", "bot" => name.clone()).absolute(0);
             counter!("arb_fees_lamports_total", "bot" => name).absolute(0);
         }
+        let reader = chain.with_commitment(mtm_chain::parse_commitment(&config.search_commitment)?);
         Ok(Self {
             oracle: OracleClient::new(&scenario.config.oracle_url),
             chain,
+            reader,
             scenario,
             cache: Mutex::new(vec![None; pools.len()]),
             dirty: Mutex::new(HashSet::new()),
@@ -213,7 +219,7 @@ impl<'s> Searcher<'s> {
                 }
                 let started = std::time::Instant::now();
                 let load = PoolSnapshot::load(
-                    &self.chain,
+                    &self.reader,
                     Scenario::venue_kind(*venue),
                     self.scenario.programs.of(*venue),
                     *pool,
@@ -344,7 +350,11 @@ impl<'s> Searcher<'s> {
             .filter_map(|mint| self.scenario.token_by_mint(&mint))
             .collect();
         let before = wallet_balances(&self.chain, &owner, &touched, None).await?;
-        let blockhash = self.chain.rpc().get_latest_blockhash().await?;
+        let (blockhash, last_valid_block_height) = self
+            .chain
+            .rpc()
+            .get_latest_blockhash_with_commitment(self.chain.rpc().commitment())
+            .await?;
         let mut config = TransactionConfig::empty()
             .with_compute_unit_limit(cu.min(MAX_COMPUTE_UNIT_LIMIT))
             .with_loaded_accounts_data_size_limit(64 * 1024 * 1024);
@@ -355,7 +365,8 @@ impl<'s> Searcher<'s> {
             v1::Message::try_compile_with_config(&owner, &instructions, blockhash, config)
                 .context("compiling v1 message")?;
         let tx = VersionedTransaction::try_new(VersionedMessage::V1(message), &[&bot.wallet])?;
-        let simulation = self.chain.rpc().simulate_transaction(&tx).await?;
+        // At the search commitment, like the snapshots it was planned on.
+        let simulation = self.reader.rpc().simulate_transaction(&tx).await?;
         if let Some(error) = simulation.value.err {
             debug!(?error, route = ?route, "cycle simulation failed");
             status("simulation_failed");
@@ -364,6 +375,7 @@ impl<'s> Searcher<'s> {
         // Already simulated: preflight would only run it a second time.
         let send = VersionedSendConfig {
             skip_preflight: true,
+            last_valid_block_height: Some(last_valid_block_height),
             ..VersionedSendConfig::default()
         };
         let (signature, slot) = match self.chain.send_versioned(&tx, send).await {

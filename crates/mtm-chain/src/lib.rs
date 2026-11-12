@@ -619,7 +619,8 @@ fn classify_send_error(error: &ClientError) -> SendFailure {
     }
 }
 
-fn parse_commitment(s: &str) -> anyhow::Result<CommitmentConfig> {
+/// `processed` / `confirmed` / `finalized`.
+pub fn parse_commitment(s: &str) -> anyhow::Result<CommitmentConfig> {
     match s {
         "processed" => Ok(CommitmentConfig::processed()),
         "confirmed" => Ok(CommitmentConfig::confirmed()),

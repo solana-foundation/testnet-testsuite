@@ -38,6 +38,7 @@ use mtm_common::config::RpcConfig;
 use mtm_scenario::{Scenario, ScenarioConfig};
 use serde::Deserialize;
 use solana_account_decoder_client_types::UiAccountEncoding;
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
@@ -93,8 +94,14 @@ async fn main() -> Result<()> {
 
     // One websocket subscription per pool; every update is a scan trigger.
     let (tx, mut rx) = mpsc::unbounded_channel::<Pubkey>();
+    let search_commitment = mtm_chain::parse_commitment(&arb.search_commitment)?;
     for (_, address) in &pools {
-        spawn_subscription(cfg.rpc.ws_url.clone(), *address, tx.clone());
+        spawn_subscription(
+            cfg.rpc.ws_url.clone(),
+            *address,
+            search_commitment,
+            tx.clone(),
+        );
     }
     drop(tx);
     let searcher = search::Searcher::new(chain, &scenario, pools, &arb)?;
@@ -162,11 +169,16 @@ async fn main() -> Result<()> {
     }
 }
 
-fn spawn_subscription(ws_url: String, address: Pubkey, tx: mpsc::UnboundedSender<Pubkey>) {
+fn spawn_subscription(
+    ws_url: String,
+    address: Pubkey,
+    commitment: CommitmentConfig,
+    tx: mpsc::UnboundedSender<Pubkey>,
+) {
     tokio::spawn(async move {
         let mut failures: u32 = 0;
         loop {
-            match subscribe(&ws_url, &address, &tx).await {
+            match subscribe(&ws_url, &address, commitment, &tx).await {
                 Ok(()) if tx.is_closed() => return,
                 Ok(()) => {
                     failures = 0;
@@ -190,24 +202,29 @@ fn backoff(failures: u32) -> Duration {
     Duration::from_millis(base_ms + rand::random_range(0..base_ms.max(1)))
 }
 
+/// Notifications only (no data), at the searcher's commitment: left
+/// unset, `accountSubscribe` notifies at `finalized`, ~32 slots late.
+fn subscription_config(commitment: CommitmentConfig) -> RpcAccountInfoConfig {
+    RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::Base64),
+        data_slice: Some(solana_account_decoder_client_types::UiDataSliceConfig {
+            offset: 0,
+            length: 0,
+        }),
+        commitment: Some(commitment),
+        ..RpcAccountInfoConfig::default()
+    }
+}
+
 async fn subscribe(
     ws_url: &str,
     address: &Pubkey,
+    commitment: CommitmentConfig,
     tx: &mpsc::UnboundedSender<Pubkey>,
 ) -> Result<()> {
     let client = PubsubClient::new(ws_url).await?;
     let (mut stream, _unsubscribe) = client
-        .account_subscribe(
-            address,
-            Some(RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                data_slice: Some(solana_account_decoder_client_types::UiDataSliceConfig {
-                    offset: 0,
-                    length: 0,
-                }),
-                ..RpcAccountInfoConfig::default()
-            }),
-        )
+        .account_subscribe(address, Some(subscription_config(commitment)))
         .await?;
     // Updates during the gap before this subscription are lost: treat the
     // pool as changed so the next scan reloads it.
@@ -221,4 +238,15 @@ async fn subscribe(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscriptions_notify_at_the_search_commitment() {
+        let config = subscription_config(CommitmentConfig::processed());
+        assert_eq!(config.commitment, Some(CommitmentConfig::processed()));
+    }
 }

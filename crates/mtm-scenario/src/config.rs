@@ -195,6 +195,12 @@ pub struct ArbConfig {
     /// Coalesce bursts of pool updates into one scan.
     #[serde(default = "default_arb_debounce_ms")]
     pub debounce_ms: u64,
+    /// Commitment of the searcher's view: pool subscriptions, snapshots
+    /// and the pre-send simulation. The cycle executes at the tip, so a
+    /// view at `confirmed` plans on gaps already closed. Confirmation and
+    /// accounting stay at `rpc.commitment`.
+    #[serde(default = "default_arb_search_commitment")]
+    pub search_commitment: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,6 +253,8 @@ impl ArbConfig {
                 return fail("max_trade_usd must be positive and min_profit_usd non-negative");
             }
         }
+        mtm_chain::parse_commitment(&self.search_commitment)
+            .map_err(|error| anyhow::anyhow!("arb search_commitment: {error}"))?;
         Ok(())
     }
 }
@@ -256,6 +264,9 @@ fn default_arb_poll_ms() -> u64 {
 }
 fn default_arb_debounce_ms() -> u64 {
     250
+}
+fn default_arb_search_commitment() -> String {
+    "processed".to_owned()
 }
 fn default_max_legs() -> usize {
     3
@@ -449,6 +460,7 @@ mod tests {
             bots,
             poll_ms: 5_000,
             debounce_ms: 250,
+            search_commitment: "processed".to_owned(),
         };
         assert!(arb(vec![bot("a"), bot("b")]).validate().is_ok());
         assert!(arb(vec![bot("a"), bot("a")]).validate().is_err());
@@ -458,6 +470,9 @@ mod tests {
         let mut size = bot("a");
         size.max_trade_usd = Decimal::ZERO;
         assert!(arb(vec![size]).validate().is_err());
+        let mut view = arb(vec![bot("a")]);
+        view.search_commitment = "tip".to_owned();
+        assert!(view.validate().is_err());
     }
 
     #[test]

@@ -433,6 +433,7 @@ dependencies = [
  "rustls",
  "serde",
  "solana-account-decoder-client-types",
+ "solana-commitment-config",
  "solana-instruction 3.5.1",
  "solana-keypair",
  "solana-message 4.6.0",
