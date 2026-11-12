@@ -31,6 +31,7 @@ const LIMIT_LABEL = {
   host: "host execution",
   block: "block compute",
   account: "busiest pool",
+  rpc: "RPC request bound",
 } as const;
 
 /** Whole numbers with separators: rates here span 1 to 10,000s. */

@@ -352,7 +352,9 @@ fn flow(spec: &Spec, prices: &Prices) -> Result<Row, String> {
 /// Oracle staleness bound for consumers. The oracle stops re-confirming a
 /// silent Binance connection after 10 s (`confirm_max_silence_ms`), so a dead
 /// feed is acted on for at most 10 + 15 = 25 s; 15 s still rides out one
-/// Hermes poll hitting its 10 s HTTP timeout.
+/// Hermes poll hitting its 10 s HTTP timeout. The bound gates decisions
+/// only: arb values a cycle at the prices it resolved before the send, so a
+/// verdict that arrives after 15 s is still accounted.
 pub const MAX_PRICE_AGE_MS: i64 = 15_000;
 
 pub fn overlay(name: &str, spec: &Spec, prices: &Prices) -> Result<Rendered, String> {

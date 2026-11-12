@@ -283,6 +283,9 @@ export interface Chain {
   account_cu_limit: number;
   host_cu_per_s: number | null;
   shared: boolean;
+  /** flow's RPC request bound for the whole process (rpc.max_in_flight) */
+  rpc_max_in_flight: number | null;
+  rpc_latency_s: number;
 }
 
 export type Calibration = Record<string, unknown>;
@@ -295,7 +298,7 @@ export interface ComposeInfo {
   calibration: Calibration;
 }
 
-export type Limit = "host" | "block" | "account";
+export type Limit = "host" | "block" | "account" | "rpc";
 
 export interface Estimate {
   chain: Chain;
@@ -307,6 +310,8 @@ export interface Estimate {
   capital: string;
   offered_swaps_per_s: number;
   trade_seconds: number;
+  flow_rpc_per_s: number;
+  rpc_max_in_flight: number | null;
   taker_tx_per_s: number;
   maker_tx_per_s: number;
   arb_tx_per_s: number;

@@ -162,10 +162,12 @@ endpoint for sustained runs. `SCENARIO_SEED` is mandatory there.
 `rpc.max_in_flight` bounds the RPC requests each service process keeps in
 flight; the rest queue in the client. It is per process: flow divides it over
 its shards (one per core), and mm, arb and scenario each hold the whole
-bound, so the stack's total is about four times the value. The testnet
-profiles set 8 to stay under the public endpoint's per-IP connection limit;
+bound, so the stack's total is about four times the value. The testnet and
+devnet profiles set 8 to stay under the public endpoint's per-IP connection limit;
 the local profile sets 2048. With a dedicated endpoint raise it with
-`MTM_RPC__MAX_IN_FLIGHT`.
+`MTM_RPC__MAX_IN_FLIGHT`. The estimator (`scenario estimate`, the Compose panel) assumes
+the same bounds and reports an `rpc` limit when flow's requests (four per
+trade) would need more than `max_in_flight / latency` per second.
 
 ### The dashboard (control)
 

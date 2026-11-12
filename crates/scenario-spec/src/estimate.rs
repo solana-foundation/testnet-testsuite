@@ -9,6 +9,11 @@
 //! - **Makers**: Manifest ladders requote on most ticks under heavy flow;
 //!   LP ranges and pool-arbs send a few hundredths of a transaction a second.
 //! - **Arb bots** trade on opportunities the flow creates: small.
+//! - **The RPC request bound**: flow keeps at most `rpc.max_in_flight`
+//!   requests in flight for the whole process (split over its shards), so
+//!   it can make at most `max_in_flight / latency` requests a second; at
+//!   [`Calibration::rpc_requests_per_trade`] each, that caps its trades.
+//!   mm, arb and scenario each have their own bound of the same size.
 //! - **Venue shares** are emergent (the router picks the best price) and
 //!   calibrated; a cross pair trades on its Orca pool, a pair without a
 //!   pool bridges through USDC (2 legs).
@@ -35,7 +40,23 @@ pub struct Chain {
     pub host_cu_per_s: Option<f64>,
     /// Shared cluster: other users' traffic competes for the same blocks.
     pub shared: bool,
+    /// Flow's RPC request bound for the whole process: `rpc.max_in_flight`
+    /// of the profile the run uses. `None`: unbounded.
+    #[serde(default)]
+    pub rpc_max_in_flight: Option<f64>,
+    /// Mean RPC round trip under load (s).
+    #[serde(default = "default_rpc_latency_s")]
+    pub rpc_latency_s: f64,
 }
+
+fn default_rpc_latency_s() -> f64 {
+    0.01
+}
+
+/// `rpc.max_in_flight` in `config/scenario-local.toml`.
+pub const LOCAL_MAX_IN_FLIGHT: f64 = 2048.0;
+/// `rpc.max_in_flight` in the testnet and devnet profiles (public endpoints).
+pub const PUBLIC_MAX_IN_FLIGHT: f64 = 8.0;
 
 impl Chain {
     /// solana-test-validator with 1024-slot epochs (200 ms slots after the first).
@@ -47,6 +68,8 @@ impl Chain {
             account_cu_limit: 40e6,
             host_cu_per_s: Some(147e6),
             shared: false,
+            rpc_max_in_flight: Some(LOCAL_MAX_IN_FLIGHT),
+            rpc_latency_s: 0.01,
         }
     }
 
@@ -67,6 +90,9 @@ impl Chain {
             account_cu_limit: 40e6,
             host_cu_per_s: None,
             shared: true,
+            // The public endpoint; a dedicated RPC raises the bound.
+            rpc_max_in_flight: Some(PUBLIC_MAX_IN_FLIGHT),
+            rpc_latency_s: 0.15,
         }
     }
 
@@ -100,6 +126,9 @@ pub struct Calibration {
     pub burst: f64,
     /// Wallet top-ups in flight during bootstrap (`SCENARIO_FUNDING_CONCURRENCY`).
     pub funding_concurrency: f64,
+    /// RPC requests flow makes per trade: the balance read, the send, the
+    /// fill read and the refill read (confirmation polls are batched).
+    pub rpc_requests_per_trade: f64,
 }
 
 impl Default for Calibration {
@@ -120,6 +149,7 @@ impl Default for Calibration {
             ],
             burst: 1.4,
             funding_concurrency: 32.0,
+            rpc_requests_per_trade: 4.0,
         }
     }
 }
@@ -132,6 +162,8 @@ pub enum Limit {
     Block,
     /// The busiest pool's per-account compute.
     Account,
+    /// Flow's RPC request bound (`rpc.max_in_flight`).
+    Rpc,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,6 +216,10 @@ pub struct Estimate {
     pub offered_swaps_per_s: f64,
     /// Seconds per trade (overhead + settle).
     pub trade_seconds: f64,
+    /// RPC requests per second flow makes at `taker_tx_per_s`.
+    pub flow_rpc_per_s: f64,
+    /// Flow's request bound the estimate assumed (`Chain::rpc_max_in_flight`).
+    pub rpc_max_in_flight: Option<f64>,
     pub taker_tx_per_s: f64,
     pub maker_tx_per_s: f64,
     pub arb_tx_per_s: f64,
@@ -375,6 +411,18 @@ pub fn estimate(spec: &Spec, chain: &Chain, cal: &Calibration) -> Estimate {
             ),
         });
     }
+    let flow_rpc_per_s = taker_tx * cal.rpc_requests_per_trade;
+    if let Some(bound) = chain.rpc_max_in_flight.filter(|b| *b > 0.0) {
+        let capacity = bound / chain.rpc_latency_s.max(1e-6);
+        headroom.push(Headroom {
+            limit: Limit::Rpc,
+            utilisation: flow_rpc_per_s / capacity,
+            detail: format!(
+                "flow: {flow_rpc_per_s:.0} of ~{capacity:.0} RPC requests/s ({bound:.0} in flight at {:.0} ms; rpc.max_in_flight)",
+                chain.rpc_latency_s * 1000.0
+            ),
+        });
+    }
     let tightest = headroom
         .iter()
         .max_by(|a, b| a.utilisation.total_cmp(&b.utilisation))
@@ -392,7 +440,12 @@ pub fn estimate(spec: &Spec, chain: &Chain, cal: &Calibration) -> Estimate {
         .filter(|h| h.utilisation * cal.burst >= 1.0 && h.utilisation < 1.0)
     {
         warnings.push(format!(
-            "busy blocks will reach the {} limit ({:.0}% on average, bursts ~{:.1}× that)",
+            "{} will reach the {} limit ({:.0}% on average, bursts ~{:.1}× that)",
+            if h.limit == Limit::Rpc {
+                "flow bursts"
+            } else {
+                "busy blocks"
+            },
             limit_name(h.limit),
             100.0 * h.utilisation,
             cal.burst
@@ -458,6 +511,8 @@ pub fn estimate(spec: &Spec, chain: &Chain, cal: &Calibration) -> Estimate {
         capital: spec.capital().to_string(),
         offered_swaps_per_s: spec.offered_swaps_per_s(),
         trade_seconds: d,
+        flow_rpc_per_s,
+        rpc_max_in_flight: chain.rpc_max_in_flight,
         taker_tx_per_s: taker_tx,
         maker_tx_per_s: maker_tx,
         arb_tx_per_s: arb_tx,
@@ -491,6 +546,7 @@ fn limit_name(limit: Limit) -> &'static str {
         Limit::Host => "host execution",
         Limit::Block => "block compute",
         Limit::Account => "per-pool compute",
+        Limit::Rpc => "RPC request bound",
     }
 }
 
@@ -592,6 +648,64 @@ mod tests {
         let e = estimate(&spec, &Chain::local(), &Calibration::default());
         assert_eq!(e.bottleneck, Some(Limit::Host));
         assert!(e.tps_capped < e.tps);
+    }
+
+    /// `rpc.max_in_flight` as a profile sets it (the `[rpc]` table only).
+    fn profile_max_in_flight(profile: &str) -> Option<f64> {
+        let path = format!("{}/../../config/{profile}.toml", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut in_rpc = false;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_rpc = line == "[rpc]";
+            } else if in_rpc && let Some(value) = line.strip_prefix("max_in_flight = ") {
+                return Some(value.parse().expect("integer"));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn chain_presets_assume_the_profiles_request_bound() {
+        for profile in ["testnet", "scenario-testnet", "devnet", "scenario-devnet"] {
+            assert_eq!(
+                profile_max_in_flight(profile),
+                Chain::testnet().rpc_max_in_flight,
+                "{profile}"
+            );
+        }
+        assert_eq!(
+            profile_max_in_flight("scenario-local"),
+            Chain::local().rpc_max_in_flight
+        );
+    }
+
+    #[test]
+    fn the_request_bound_caps_flow_on_a_public_rpc() {
+        let spec = preset("x100").expect("preset");
+        let cal = Calibration::default();
+        let e = estimate(&spec, &Chain::testnet(), &cal);
+        assert_eq!(e.bottleneck, Some(Limit::Rpc), "{:?}", e.headroom);
+        assert!(e.tps_capped < e.tps);
+        assert!((e.flow_rpc_per_s - e.taker_tx_per_s * 4.0).abs() < 1e-9);
+        assert_eq!(e.rpc_max_in_flight, Some(PUBLIC_MAX_IN_FLIGHT));
+        // A dedicated endpoint lifts it.
+        let dedicated = Chain {
+            rpc_max_in_flight: Some(512.0),
+            ..Chain::testnet()
+        };
+        assert_ne!(
+            estimate(&spec, &dedicated, &cal).bottleneck,
+            Some(Limit::Rpc)
+        );
+        // The local bound never binds at the measured scales.
+        let local = estimate(&preset("x2000").expect("preset"), &Chain::local(), &cal);
+        let rpc = local
+            .headroom
+            .iter()
+            .find(|h| h.limit == Limit::Rpc)
+            .expect("rpc headroom");
+        assert!(rpc.utilisation < 0.5, "{}", rpc.detail);
     }
 
     #[test]

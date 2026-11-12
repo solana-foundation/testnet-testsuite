@@ -4,3 +4,8 @@
 [rpc]
 http_url = "https://api.devnet.solana.com"
 ws_url = "wss://api.devnet.solana.com"
+# Per process, and every service on the host shares the public endpoint's
+# per-IP limits (about 40 concurrent connections, 100 requests / 10 s): 8
+# each keeps flow, mm, arb and scenario together under the connection cap.
+# Raise it with a dedicated RPC (MTM_RPC__MAX_IN_FLIGHT).
+max_in_flight = 8
