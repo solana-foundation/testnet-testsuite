@@ -22,7 +22,7 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use thiserror::Error;
-use tracing::{info, info_span};
+use tracing::{Instrument, info, info_span};
 
 const MINT_BASE_LEN: usize = 82;
 const MINT_AUTHORITY_OPTION_OFFSET: usize = 0;
@@ -238,21 +238,25 @@ impl RaydiumClmmOrchestrator {
             mint_b = %params.mint_b,
             payer = %self.payer(),
         );
-        let _entered = span.enter();
-
-        self.validate_prerequisites(params.amm_config).await?;
-        let create_pool = self
-            .client
-            .create_pool(CreatePoolParams {
-                amm_config: params.amm_config,
-                mint_a: params.mint_a,
-                mint_b: params.mint_b,
-                initial_price: params.initial_price,
-                open_time: params.open_time,
-            })
-            .await?;
-        info!(pool = %create_pool.accounts.pool, "Raydium CLMM pool created");
-        Ok(PoolCreationOutcome { create_pool })
+        // `.instrument` rather than `span.enter()`: an entered guard held across
+        // `.await` attributes other tasks' events to this span.
+        async {
+            self.validate_prerequisites(params.amm_config).await?;
+            let create_pool = self
+                .client
+                .create_pool(CreatePoolParams {
+                    amm_config: params.amm_config,
+                    mint_a: params.mint_a,
+                    mint_b: params.mint_b,
+                    initial_price: params.initial_price,
+                    open_time: params.open_time,
+                })
+                .await?;
+            info!(pool = %create_pool.accounts.pool, "Raydium CLMM pool created");
+            Ok(PoolCreationOutcome { create_pool })
+        }
+        .instrument(span)
+        .await
     }
 
     /// Fund the user, exercise an existing pool, then withdraw, collect, and
@@ -267,87 +271,90 @@ impl RaydiumClmmOrchestrator {
             mint_b = %params.mint_b,
             payer = %self.payer(),
         );
-        let _entered = span.enter();
+        async {
+            self.validate_prerequisites(params.amm_config).await?;
+            self.validate_pool(params)?;
 
-        self.validate_prerequisites(params.amm_config).await?;
-
-        let funding = self
-            .fund_payer(
+            let funding = self
+                .fund_payer(
+                    params.mint_a,
+                    params.funding_a,
+                    params.mint_b,
+                    params.funding_b,
+                )
+                .await?;
+            let (lower_price, upper_price) = normalized_range(
                 params.mint_a,
-                params.funding_a,
                 params.mint_b,
-                params.funding_b,
-            )
-            .await?;
-        let (lower_price, upper_price) = normalized_range(
-            params.mint_a,
-            params.mint_b,
-            params.lower_price,
-            params.upper_price,
-        )?;
-        let open_position = self
-            .client
-            .open_position(OpenPositionParams {
-                pool: params.pool,
-                lower_price,
-                upper_price,
-                input: TokenAmount {
-                    mint: params.mint_a,
-                    amount: params.open_amount,
-                },
-                with_metadata: params.with_metadata,
-            })
-            .await?;
-        let position_mint = open_position.accounts.position_nft_mint;
-        let increase_liquidity = self
-            .client
-            .increase_liquidity(IncreaseLiquidityParams {
-                position_mint,
-                input: TokenAmount {
-                    mint: params.mint_a,
-                    amount: params.increase_amount,
-                },
-            })
-            .await?;
-        let swap_exact_in = self
-            .client
-            .swap_exact_in(SwapExactInParams {
-                pool: params.pool,
-                input_mint: params.mint_a,
-                output_mint: params.mint_b,
-                amount_in: params.exact_in_amount,
-            })
-            .await?;
-        let swap_exact_out = self
-            .client
-            .swap_exact_out(SwapExactOutParams {
-                pool: params.pool,
-                input_mint: params.mint_b,
-                output_mint: params.mint_a,
-                amount_out: params.exact_out_amount,
-            })
-            .await?;
-        let decrease_liquidity = self
-            .client
-            .decrease_liquidity(DecreaseLiquidityParams {
-                position_mint,
-                amount: None,
-            })
-            .await?;
-        let collect_position = self.client.collect_position(position_mint).await?;
-        let close_position = self.client.close_position(position_mint).await?;
+                params.lower_price,
+                params.upper_price,
+            )?;
+            let open_position = self
+                .client
+                .open_position(OpenPositionParams {
+                    pool: params.pool,
+                    lower_price,
+                    upper_price,
+                    input: TokenAmount {
+                        mint: params.mint_a,
+                        amount: params.open_amount,
+                    },
+                    with_metadata: params.with_metadata,
+                })
+                .await?;
+            let position_mint = open_position.accounts.position_nft_mint;
+            let increase_liquidity = self
+                .client
+                .increase_liquidity(IncreaseLiquidityParams {
+                    position_mint,
+                    input: TokenAmount {
+                        mint: params.mint_a,
+                        amount: params.increase_amount,
+                    },
+                })
+                .await?;
+            let swap_exact_in = self
+                .client
+                .swap_exact_in(SwapExactInParams {
+                    pool: params.pool,
+                    input_mint: params.mint_a,
+                    output_mint: params.mint_b,
+                    amount_in: params.exact_in_amount,
+                })
+                .await?;
+            let swap_exact_out = self
+                .client
+                .swap_exact_out(SwapExactOutParams {
+                    pool: params.pool,
+                    input_mint: params.mint_b,
+                    output_mint: params.mint_a,
+                    amount_out: params.exact_out_amount,
+                })
+                .await?;
+            let decrease_liquidity = self
+                .client
+                .decrease_liquidity(DecreaseLiquidityParams {
+                    position_mint,
+                    amount: None,
+                })
+                .await?;
+            let collect_position = self.client.collect_position(position_mint).await?;
+            let close_position = self.client.close_position(position_mint).await?;
 
-        info!(pool = %params.pool, %position_mint, "Raydium CLMM user flow complete");
-        Ok(UserFlowOutcome {
-            funding,
-            open_position,
-            increase_liquidity,
-            swap_exact_in,
-            swap_exact_out,
-            decrease_liquidity,
-            collect_position,
-            close_position,
-        })
+            info!(pool = %params.pool, %position_mint, "Raydium CLMM user flow complete");
+            Ok(UserFlowOutcome {
+                funding,
+                open_position,
+                increase_liquidity,
+                swap_exact_in,
+                swap_exact_out,
+                decrease_liquidity,
+                collect_position,
+                close_position,
+            })
+        }
+        .instrument(span)
+        .await
     }
 
     pub async fn fund_payer(
@@ -436,6 +443,24 @@ impl RaydiumClmmOrchestrator {
             amount_a_raw,
             amount_b_raw,
         })
+    }
+
+    /// The pool must be the canonical pool of `amm_config` for the flow's mint
+    /// pair; otherwise the AMM-config check above says nothing about it.
+    fn validate_pool(&self, params: UserFlowParams) -> Result<()> {
+        let (mint_0, mint_1) = if params.mint_a < params.mint_b {
+            (params.mint_a, params.mint_b)
+        } else {
+            (params.mint_b, params.mint_a)
+        };
+        let expected = self.client.pool_address(params.amm_config, mint_0, mint_1);
+        if expected != params.pool {
+            return Err(OrchestrationError::InvalidInput(format!(
+                "pool {} is not the AMM config {} pool for these mints (expected {expected})",
+                params.pool, params.amm_config
+            )));
+        }
+        Ok(())
     }
 
     async fn validate_prerequisites(&self, amm_config: Pubkey) -> Result<()> {
@@ -699,4 +724,42 @@ pub enum OrchestrationError {
     FundingSubmission(#[from] SubmissionError),
     #[error(transparent)]
     Raydium(#[from] RaydiumClmmError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(byte: u8) -> Pubkey {
+        Pubkey::new_from_array([byte; 32])
+    }
+
+    #[test]
+    fn normalized_range_inverts_only_for_reverse_mint_order() {
+        let (lower, upper) = (Decimal::new(5, 1), Decimal::TWO);
+        assert_eq!(
+            normalized_range(key(1), key(2), lower, upper).expect("valid test input"),
+            (lower, upper)
+        );
+        // Quoted as B per A with A > B: pool order (B, A) prices are 1/upper..1/lower.
+        assert_eq!(
+            normalized_range(key(2), key(1), lower, upper).expect("valid test input"),
+            (Decimal::new(5, 1), Decimal::TWO)
+        );
+        assert_eq!(
+            normalized_range(key(2), key(1), Decimal::new(25, 2), Decimal::TWO)
+                .expect("valid test input"),
+            (Decimal::new(5, 1), Decimal::from(4))
+        );
+    }
+
+    #[test]
+    fn ui_to_raw_scales_and_rejects_bad_input() {
+        assert_eq!(
+            ui_to_raw(Decimal::new(125, 2), 6).expect("valid test input"),
+            1_250_000
+        );
+        assert!(ui_to_raw(Decimal::new(1, 7), 6).is_err());
+        assert!(ui_to_raw(Decimal::ONE, 20).is_err());
+    }
 }

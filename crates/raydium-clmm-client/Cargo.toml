@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+mtm-math = { workspace = true }
 anchor-lang = { workspace = true }
 metrics = { workspace = true }
 mtm-chain = { workspace = true }

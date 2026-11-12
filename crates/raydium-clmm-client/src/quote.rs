@@ -49,15 +49,23 @@ pub(crate) fn quote_swap(
         liquidity: pool.liquidity,
     };
 
+    let fee_on_input = pool.is_fee_on_input(zero_for_one);
     // A legacy transaction cannot carry an unbounded number of arrays. The
     // caller separately enforces the stricter account-budget cap.
     for _ in 0..64 {
-        if state.remaining == 0
-            || state.sqrt_price_x64 == sqrt_price_limit_x64
+        if state.remaining == 0 {
+            return Ok((state.calculated, used));
+        }
+        // The swap instruction is sent without a price limit, and the program
+        // then requires the whole specified amount to fill.
+        if state.sqrt_price_x64 == sqrt_price_limit_x64
             || state.tick >= tick_math::MAX_TICK
             || state.tick <= tick_math::MIN_TICK
         {
-            return Ok((state.calculated, used));
+            return Err(format!(
+                "pool liquidity fills only part of the swap ({} of {amount_specified} atoms unfilled)",
+                state.remaining
+            ));
         }
 
         let mut next_tick = current_array
@@ -121,32 +129,16 @@ pub(crate) fn quote_swap(
             config.trade_fee_rate,
             exact_in,
             zero_for_one,
-            pool.is_fee_on_input(zero_for_one),
+            fee_on_input,
         )
         .map_err(|error| error.to_string())?;
-        let step_total_in = step
-            .amount_in
-            .checked_add(step.fee_amount)
-            .ok_or_else(|| "swap input overflow".to_owned())?;
-        if exact_in {
-            state.remaining = state
-                .remaining
-                .checked_sub(step_total_in)
-                .ok_or_else(|| "swap input underflow".to_owned())?;
-            state.calculated = state
-                .calculated
-                .checked_add(step.amount_out)
-                .ok_or_else(|| "swap output overflow".to_owned())?;
-        } else {
-            state.remaining = state
-                .remaining
-                .checked_sub(step.amount_out)
-                .ok_or_else(|| "swap output underflow".to_owned())?;
-            state.calculated = state
-                .calculated
-                .checked_add(step_total_in)
-                .ok_or_else(|| "swap input overflow".to_owned())?;
-        }
+        (state.remaining, state.calculated) = apply_step(
+            state.remaining,
+            state.calculated,
+            (step.amount_in, step.amount_out, step.fee_amount),
+            exact_in,
+            fee_on_input,
+        )?;
 
         let prior_sqrt_price = state.sqrt_price_x64;
         state.sqrt_price_x64 = step.sqrt_price_next_x64;
@@ -176,4 +168,74 @@ pub(crate) fn quote_swap(
         }
     }
     Err("swap quote exceeded the traversal limit".to_owned())
+}
+
+/// One step's effect on `(remaining, calculated)`, as the program's
+/// `SwapState::apply_swap_amounts`: the trader pays the fee on top of
+/// `amount_in` only when the fee is charged on the input side; with the fee
+/// on the output, `amount_out` is already net of it.
+fn apply_step(
+    remaining: u64,
+    calculated: u64,
+    (amount_in, amount_out, fee_amount): (u64, u64, u64),
+    exact_in: bool,
+    fee_on_input: bool,
+) -> Result<(u64, u64), String> {
+    let consumed = if fee_on_input {
+        amount_in
+            .checked_add(fee_amount)
+            .ok_or_else(|| "swap input overflow".to_owned())?
+    } else {
+        amount_in
+    };
+    let (spent, gained) = if exact_in {
+        (consumed, amount_out)
+    } else {
+        (amount_out, consumed)
+    };
+    Ok((
+        remaining
+            .checked_sub(spent)
+            .ok_or_else(|| "swap amount underflow".to_owned())?,
+        calculated
+            .checked_add(gained)
+            .ok_or_else(|| "swap amount overflow".to_owned())?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_step;
+
+    #[test]
+    fn fee_on_input_is_paid_on_top_of_amount_in() {
+        // exact in: 1000 remaining, step takes 990 + 10 fee for 500 out.
+        assert_eq!(
+            apply_step(1000, 0, (990, 500, 10), true, true),
+            Ok((0, 500))
+        );
+        // exact out: 500 wanted, step delivers 500 for 990 + 10 fee in.
+        assert_eq!(
+            apply_step(500, 0, (990, 500, 10), false, true),
+            Ok((0, 1000))
+        );
+    }
+
+    #[test]
+    fn fee_on_output_is_not_deducted_from_the_input() {
+        // The fee comes out of the gross output; the trader pays amount_in only.
+        assert_eq!(
+            apply_step(1000, 0, (1000, 495, 5), true, false),
+            Ok((0, 495))
+        );
+        assert_eq!(
+            apply_step(495, 0, (1000, 495, 5), false, false),
+            Ok((0, 1000))
+        );
+    }
+
+    #[test]
+    fn overspending_the_remaining_amount_is_an_error() {
+        assert!(apply_step(100, 0, (100, 50, 1), true, true).is_err());
+    }
 }
