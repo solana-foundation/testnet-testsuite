@@ -18,10 +18,19 @@ pub struct RpcConfig {
     pub ws_url: String,
     #[serde(default = "default_commitment")]
     pub commitment: String,
+    /// RPC requests one chain client keeps in flight at once (flow: per
+    /// shard); the rest queue.
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight: usize,
 }
 
 fn default_commitment() -> String {
     "confirmed".to_string()
+}
+
+/// `mtm_chain::DEFAULT_MAX_IN_FLIGHT`.
+fn default_max_in_flight() -> usize {
+    128
 }
 
 pub fn load<T: for<'de> Deserialize<'de>>() -> Result<T, Box<figment::Error>> {

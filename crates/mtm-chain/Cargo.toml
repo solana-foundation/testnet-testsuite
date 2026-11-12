@@ -20,10 +20,11 @@ solana-transaction = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
-serde_json = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

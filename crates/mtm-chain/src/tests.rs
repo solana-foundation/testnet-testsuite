@@ -1,5 +1,10 @@
 //! The submission state machine against a scripted RPC ([`MockRpc`]).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use futures::future::join_all;
 use serde_json::{Value, json};
 use solana_commitment_config::CommitmentConfig;
 use solana_instruction::Instruction;
@@ -11,7 +16,7 @@ use solana_transaction::Transaction;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::mock::{self, MockRpc};
-use crate::{ChainClient, SubmissionConfig, SubmissionError, VersionedSendConfig};
+use crate::{ChainClient, ChainOptions, SubmissionConfig, SubmissionError, VersionedSendConfig};
 
 const CUSTOM_ERROR: &str = r#"{"InstructionError":[0,{"Custom":1}]}"#;
 
@@ -20,7 +25,11 @@ fn custom_error() -> Value {
 }
 
 fn client(mock: &MockRpc) -> ChainClient {
-    ChainClient::from_sender(mock.clone(), CommitmentConfig::confirmed())
+    ChainClient::from_sender(
+        mock.clone(),
+        CommitmentConfig::confirmed(),
+        ChainOptions::default(),
+    )
 }
 
 fn noop(payer: &Keypair) -> Instruction {
@@ -47,7 +56,6 @@ fn node(status: Value) -> impl Fn(&str, &Value) -> ClientResult<Value> + Send + 
         "sendTransaction" => Ok(mock::sent_signature(params)),
         "getSignatureStatuses" => Ok(mock::statuses(params, &status)),
         "getBlockHeight" => Ok(json!(10)),
-        "isBlockhashValid" => Ok(mock::with_context(json!(true))),
         other => panic!("unexpected {other}"),
     }
 }
@@ -146,4 +154,334 @@ async fn send_versioned_lost_response_lets_the_status_decide() {
         .await
         .expect("landed although the response was lost");
     assert_eq!(outcome.confirmation_slot, 9);
+}
+
+/// A node whose `n`th status read (from 0) answers `status(n)` for every
+/// signature, whose block height grows one per 400 ms from 10, and whose
+/// blockhash is valid until `last_valid`.
+fn scripted(
+    last_valid: u64,
+    status: impl Fn(usize) -> Value + Send + Sync + 'static,
+) -> impl Fn(&str, &Value) -> ClientResult<Value> + Send + Sync + 'static {
+    let reads = AtomicUsize::new(0);
+    let start = tokio::time::Instant::now();
+    move |method, params| match method {
+        "getLatestBlockhash" => Ok(mock::latest_blockhash(last_valid)),
+        "simulateTransaction" => Ok(mock::simulation(40_000, None)),
+        "sendTransaction" => Ok(mock::sent_signature(params)),
+        "getSignatureStatuses" => Ok(mock::statuses(
+            params,
+            &status(reads.fetch_add(1, Ordering::SeqCst)),
+        )),
+        "getBlockHeight" => Ok(json!(10 + start.elapsed().as_millis() / 400)),
+        other => panic!("unexpected {other}"),
+    }
+}
+
+fn after(reads: usize, status: Value) -> impl Fn(usize) -> Value + Send + Sync + 'static {
+    move |read| {
+        if read >= reads {
+            status.clone()
+        } else {
+            Value::Null
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_sends_share_batched_polls() {
+    // Two rounds of reads: nothing, then confirmed. 500 signatures need
+    // two status requests per round and one height read.
+    let landed = mock::status(5, "confirmed", None);
+    let mock = MockRpc::new(scripted(1000, move |read| {
+        if read >= 2 {
+            landed.clone()
+        } else {
+            Value::Null
+        }
+    }));
+    let chain = client(&mock);
+    let transactions: Vec<_> = (0..500).map(|_| signed(&Keypair::new())).collect();
+    let results = join_all(
+        transactions
+            .iter()
+            .map(|tx| chain.send_versioned(tx, VersionedSendConfig::default())),
+    )
+    .await;
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(mock.count("sendTransaction"), 500);
+    assert_eq!(mock.count("getSignatureStatuses"), 4);
+    assert_eq!(mock.count("getBlockHeight"), 2);
+    assert!(
+        mock.calls("getSignatureStatuses")
+            .iter()
+            .all(|params| params[0].as_array().map_or(0, Vec::len) <= 256)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_in_flight_are_bounded() {
+    let mock = MockRpc::new(|_, _| Ok(json!(1))).with_delay(Duration::from_millis(10));
+    let options = ChainOptions {
+        max_in_flight: 4,
+        ..ChainOptions::default()
+    };
+    let chain = ChainClient::from_sender(mock.clone(), CommitmentConfig::confirmed(), options);
+    let view = chain.with_commitment(CommitmentConfig::processed());
+    let reads = (0..20).map(|n| {
+        let chain = if n % 2 == 0 { &chain } else { &view };
+        chain.rpc().get_slot()
+    });
+    assert!(join_all(reads).await.iter().all(Result::is_ok));
+    assert_eq!(mock.peak_in_flight(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn submit_rebroadcasts_the_same_bytes_until_it_lands() {
+    // The first copy is dropped: nothing lands until the third send.
+    let sends = Arc::new(AtomicUsize::new(0));
+    let landed = mock::status(8, "confirmed", None);
+    let inner = scripted(1000, |_| Value::Null);
+    let mock = MockRpc::new({
+        let sends = Arc::clone(&sends);
+        move |method, params| match method {
+            "sendTransaction" => {
+                sends.fetch_add(1, Ordering::SeqCst);
+                inner(method, params)
+            }
+            "getSignatureStatuses" if sends.load(Ordering::SeqCst) >= 3 => {
+                Ok(mock::statuses(params, &landed))
+            }
+            _ => inner(method, params),
+        }
+    });
+    let payer = Keypair::new();
+    let outcome = client(&mock)
+        .submit(vec![noop(&payer)], &payer, &[], SubmissionConfig::default())
+        .await
+        .expect("landed after a rebroadcast");
+    assert_eq!(outcome.confirmation_slot, 8);
+    let sent = mock.calls("sendTransaction");
+    assert!(sent.len() >= 3);
+    assert!(sent.iter().all(|params| params[0] == sent[0][0]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn submit_expires_when_the_blockhash_does() {
+    // Valid until height 20: four seconds of 400 ms blocks from 10.
+    let mock = MockRpc::new(scripted(20, |_| Value::Null));
+    let payer = Keypair::new();
+    let started = tokio::time::Instant::now();
+    let error = client(&mock)
+        .submit(vec![noop(&payer)], &payer, &[], SubmissionConfig::default())
+        .await
+        .expect_err("never lands");
+    assert!(
+        matches!(error, SubmissionError::Expired { .. }),
+        "{error:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // Rebroadcast about every 2 s until then.
+    assert!(mock.count("sendTransaction") >= 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_landing_seen_in_the_expiry_tick_is_not_expired() {
+    // The status read that follows the first height past expiry finds it.
+    let landed = mock::status(30, "confirmed", None);
+    let mock = MockRpc::new(scripted(20, move |read| {
+        // Heights 11, 12, ...: height 21 is read in the 11th tick.
+        if read >= 10 {
+            landed.clone()
+        } else {
+            Value::Null
+        }
+    }));
+    let outcome = client(&mock)
+        .send_versioned(
+            &signed(&Keypair::new()),
+            VersionedSendConfig {
+                last_valid_block_height: Some(20),
+                ..VersionedSendConfig::default()
+            },
+        )
+        .await
+        .expect("landed just before expiry");
+    assert_eq!(outcome.confirmation_slot, 30);
+}
+
+#[tokio::test(start_paused = true)]
+async fn submit_tolerates_failed_status_reads() {
+    let reads = AtomicUsize::new(0);
+    let healthy = node(mock::status(7, "confirmed", None));
+    let mock = MockRpc::new(move |method, params| match method {
+        "getSignatureStatuses" if reads.fetch_add(1, Ordering::SeqCst) < 2 => Err(mock::io_error()),
+        _ => healthy(method, params),
+    });
+    let payer = Keypair::new();
+    let outcome = client(&mock)
+        .submit(vec![noop(&payer)], &payer, &[], SubmissionConfig::default())
+        .await
+        .expect("two failed reads are not final");
+    assert_eq!(outcome.confirmation_slot, 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_status_failures_are_ambiguous() {
+    let healthy = node(Value::Null);
+    let mock = MockRpc::new(move |method, params| match method {
+        "getSignatureStatuses" => Err(mock::io_error()),
+        _ => healthy(method, params),
+    });
+    let error = client(&mock)
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect_err("ambiguous");
+    assert!(
+        matches!(error, SubmissionError::AmbiguousConfirmation { .. }),
+        "{error:?}"
+    );
+    assert_eq!(mock.count("getSignatureStatuses"), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejection_after_a_lost_response_still_waits_for_the_status() {
+    // Attempt 1 may have reached the node; attempt 2 is refused (e.g. as
+    // already processed). The first copy lands.
+    let sends = AtomicUsize::new(0);
+    let healthy = node(mock::status(7, "confirmed", None));
+    let mock = MockRpc::new(move |method, params| match method {
+        "sendTransaction" => match sends.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(mock::io_error()),
+            1 => Err(mock::rpc_error(-32005, "Node is behind")),
+            _ => healthy(method, params),
+        },
+        _ => healthy(method, params),
+    });
+    let payer = Keypair::new();
+    let outcome = client(&mock)
+        .submit(vec![noop(&payer)], &payer, &[], SubmissionConfig::default())
+        .await
+        .expect("never `Submission` once a copy may be out");
+    assert_eq!(outcome.confirmation_slot, 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_validity_is_not_expired_early() {
+    // No `last_valid_block_height` and no isBlockhashValid: a transaction
+    // still pending after several polls lands at the seventh.
+    let mock = MockRpc::new(scripted(1000, after(6, mock::status(9, "confirmed", None))));
+    let outcome = client(&mock)
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect("landed");
+    assert_eq!(outcome.confirmation_slot, 9);
+    assert_eq!(mock.count("isBlockhashValid"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_validity_still_expires() {
+    let mock = MockRpc::new(scripted(1000, |_| Value::Null));
+    let error = client(&mock)
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect_err("never lands");
+    assert!(
+        matches!(error, SubmissionError::Expired { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failure_below_the_commitment_is_not_final() {
+    // Failed on a processed fork, then landed on the confirmed one.
+    let failed = mock::status(5, "processed", Some(custom_error()));
+    let landed = mock::status(6, "confirmed", None);
+    let mock = MockRpc::new(scripted(1000, move |read| {
+        if read == 0 {
+            failed.clone()
+        } else {
+            landed.clone()
+        }
+    }));
+    let outcome = client(&mock)
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect("the confirmed status decides");
+    assert_eq!(outcome.confirmation_slot, 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn execution_errors_wait_for_the_commitment() {
+    let processed = mock::status(5, "processed", Some(custom_error()));
+    let confirmed = mock::status(5, "confirmed", Some(custom_error()));
+    let mock = MockRpc::new(scripted(1000, move |read| {
+        if read < 2 {
+            processed.clone()
+        } else {
+            confirmed.clone()
+        }
+    }));
+    let error = client(&mock)
+        .send_versioned(&signed(&Keypair::new()), VersionedSendConfig::default())
+        .await
+        .expect_err("failed");
+    assert!(
+        matches!(error, SubmissionError::Execution { slot: 5, .. }),
+        "{error:?}"
+    );
+    assert_eq!(mock.count("getSignatureStatuses"), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn submit_uses_its_commitment_throughout() {
+    let mock = MockRpc::new(node(mock::status(7, "finalized", None)));
+    let payer = Keypair::new();
+    let config = SubmissionConfig {
+        commitment: CommitmentConfig::finalized(),
+        ..SubmissionConfig::default()
+    };
+    client(&mock)
+        .submit(vec![noop(&payer)], &payer, &[], config)
+        .await
+        .expect("finalized");
+    for method in [
+        "getLatestBlockhash",
+        "simulateTransaction",
+        "getBlockHeight",
+    ] {
+        let calls = mock.calls(method);
+        assert!(!calls.is_empty(), "{method}");
+        assert!(
+            calls
+                .iter()
+                .all(|params| params.to_string().contains(r#""commitment":"finalized""#)),
+            "{method}: {calls:?}"
+        );
+    }
+    assert!(
+        mock.calls("sendTransaction")
+            .iter()
+            .all(|params| params[1]["preflightCommitment"] == "finalized")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_hard_cap_ends_the_wait() {
+    // Landed below the commitment and never confirmed: only the cap ends it.
+    let mock = MockRpc::new(scripted(1000, |_| mock::status(5, "processed", None)));
+    let error = client(&mock)
+        .send_versioned(
+            &signed(&Keypair::new()),
+            VersionedSendConfig {
+                confirmation_timeout: Duration::from_secs(5),
+                ..VersionedSendConfig::default()
+            },
+        )
+        .await
+        .expect_err("capped");
+    assert!(
+        matches!(error, SubmissionError::AmbiguousConfirmation { .. }),
+        "{error:?}"
+    );
 }

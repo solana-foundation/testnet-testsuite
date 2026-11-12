@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use metrics::{counter, gauge, histogram};
-use mtm_chain::ChainClient;
+use mtm_chain::{ChainClient, ChainOptions};
 use mtm_common::config::RpcConfig;
 use mtm_scenario::{Scenario, ScenarioConfig};
 use serde::Deserialize;
@@ -62,7 +62,14 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     mtm_telemetry::init("arb", cfg.arb.metrics_addr)?;
-    let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    let chain = ChainClient::with_options(
+        &cfg.rpc.http_url,
+        &cfg.rpc.commitment,
+        ChainOptions {
+            max_in_flight: cfg.rpc.max_in_flight,
+            ..ChainOptions::default()
+        },
+    )?;
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let arb = scenario
         .config

@@ -5,6 +5,8 @@
 http_url = "http://127.0.0.1:8899"
 ws_url = "ws://127.0.0.1:8900"
 commitment = "confirmed"
+# RPC requests one chain client keeps in flight (flow: per shard); the rest queue.
+max_in_flight = 128
 
 # --- oracle service -----------------------------------------------------------
 

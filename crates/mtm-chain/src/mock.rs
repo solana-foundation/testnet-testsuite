@@ -3,7 +3,9 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{Value, json};
@@ -21,6 +23,10 @@ type Handler = dyn Fn(&str, &Value) -> ClientResult<Value> + Send + Sync;
 pub struct MockRpc {
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     handler: Arc<Handler>,
+    /// Every answer takes this long.
+    delay: Duration,
+    in_flight: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl MockRpc {
@@ -30,7 +36,20 @@ impl MockRpc {
         Self {
             calls: Arc::default(),
             handler: Arc::new(handler),
+            delay: Duration::ZERO,
+            in_flight: Arc::default(),
+            peak: Arc::default(),
         }
+    }
+
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// Most requests that were ever in flight at once.
+    pub fn peak_in_flight(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
     }
 
     /// Requests made so far for `method`, with their params.
@@ -65,7 +84,15 @@ impl RpcSender for MockRpc {
             .expect("calls lock")
             .push((method.clone(), params.clone()));
         let result = (self.handler)(&method, &params);
-        Box::pin(async move { result })
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        Box::pin(async move {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        })
     }
 
     fn get_transport_stats(&self) -> RpcTransportStats {

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mtm_chain::ChainClient;
+use mtm_chain::{ChainClient, ChainOptions};
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::{keypair_from_environment, signer_from_environment};
 use mtm_scenario::funding::{Funding, LAMPORTS_PER_SOL, balances, top_up};
@@ -98,7 +98,14 @@ async fn main() -> Result<()> {
     // Parse first: `--help` and argument errors need neither RPC nor secrets.
     let cli = Cli::parse();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
-    let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    let chain = ChainClient::with_options(
+        &cfg.rpc.http_url,
+        &cfg.rpc.commitment,
+        ChainOptions {
+            max_in_flight: cfg.rpc.max_in_flight,
+            ..ChainOptions::default()
+        },
+    )?;
     let rpc = rpc::JsonRpc::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let report = match cli.command {

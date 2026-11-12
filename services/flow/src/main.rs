@@ -30,7 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use metrics::{counter, gauge, histogram};
-use mtm_chain::{ChainClient, SubmissionError, VersionedSendConfig};
+use mtm_chain::{ChainClient, ChainOptions, SubmissionError, VersionedSendConfig};
 use mtm_common::config::RpcConfig;
 use mtm_dex_harness::cli::signer_from_environment;
 use mtm_scenario::funding::{Funding, LAMPORTS_PER_SOL, top_up, wallet_balances};
@@ -80,7 +80,14 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cfg: AppConfig = mtm_common::config::load().map_err(|error| anyhow::anyhow!("{error}"))?;
     mtm_telemetry::init("flow", cfg.flow.metrics_addr)?;
-    let chain = ChainClient::new(&cfg.rpc.http_url, &cfg.rpc.commitment)?;
+    let chain = ChainClient::with_options(
+        &cfg.rpc.http_url,
+        &cfg.rpc.commitment,
+        ChainOptions {
+            max_in_flight: cfg.rpc.max_in_flight,
+            ..ChainOptions::default()
+        },
+    )?;
     let scenario = Scenario::resolve(cfg.scenario, &chain).await?;
     let flow = scenario
         .config
@@ -156,7 +163,14 @@ async fn main() -> Result<()> {
                             let engine = Flow {
                                 router: RouterClient::new(&scenario.config.router_url),
                                 oracle: OracleClient::new(&scenario.config.oracle_url),
-                                chain: ChainClient::new(&rpc.http_url, &rpc.commitment)?,
+                                chain: ChainClient::with_options(
+                                    &rpc.http_url,
+                                    &rpc.commitment,
+                                    ChainOptions {
+                                        max_in_flight: rpc.max_in_flight,
+                                        ..ChainOptions::default()
+                                    },
+                                )?,
                                 scenario,
                                 flow,
                                 refill,
