@@ -34,8 +34,10 @@ pub struct ChainWatchConfig {
     /// `getBlock` calls in flight.
     #[serde(default = "default_block_concurrency")]
     pub block_concurrency: usize,
-    /// Further behind the confirmed tip than this, skip ahead (recording a
-    /// `gap` event) rather than fall behind for good. 3000 = 10 min at 200 ms.
+    /// Further behind the confirmed tip than this, record the slots up to
+    /// the tip in `slots` mode (produced or skipped and the leader, no block
+    /// details) and a `gap` event, then read blocks again from there, rather
+    /// than fall behind for good. 3000 = 10 min at 200 ms.
     #[serde(default = "default_max_lag_slots")]
     pub max_lag_slots: u64,
     /// Attempts for a block that is not available yet.

@@ -18,31 +18,43 @@ use tracing::{info, warn};
 use crate::block::{self, BlockSummary, percentile};
 use crate::cluster::ensure_leaders;
 use crate::config::RawBlocks;
-use crate::rpc::{is_not_yet, is_skipped};
+use crate::rpc::{is_missing, is_not_yet};
 use crate::state::Shared;
 use crate::store::Write;
 
 /// Slots per `getBlocks` range.
 const RANGE: u64 = 500;
+/// A `getBlocks` range that lists no block at all is taken as skipped only
+/// once the confirmed tip is this far past its end; before that the node
+/// answering is more likely behind than the cluster silent.
+const EMPTY_RANGE_MARGIN: u64 = RANGE;
+/// Widest gap recorded in `slots` mode after falling behind (about 100
+/// `getBlocks` calls); a wider one is dropped with only a `gap` event.
+const MAX_BACKFILL_SLOTS: u64 = 50_000;
+/// Wait before asking again when the RPC has not caught up with the tip.
+const NOT_YET_WAIT: Duration = Duration::from_millis(400);
 
+#[derive(Debug, PartialEq)]
 enum Fetched {
     Produced(Value),
-    /// Produced, block not fetched (`slots` mode).
+    /// Produced, block not fetched (`slots` mode, or a backfilled gap).
     Unread,
     Skipped,
     Unavailable,
 }
 
 pub async fn run(shared: Arc<Shared>, raw_dir: PathBuf) {
+    // Last slot of a gap being recorded in `slots` mode (0: none).
+    let mut backfill_to = 0;
     loop {
-        if let Err(error) = step(&shared, &raw_dir).await {
+        if let Err(error) = step(&shared, &raw_dir, &mut backfill_to).await {
             warn!(error = %format!("{error:#}"), "block pipeline step failed");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
 
-async fn step(shared: &Shared, raw_dir: &Path) -> Result<()> {
+async fn step(shared: &Shared, raw_dir: &Path, backfill_to: &mut u64) -> Result<()> {
     let tip = shared.confirmed();
     let mut cursor = shared.cursor.load(Ordering::Relaxed);
     if tip == 0 {
@@ -74,13 +86,22 @@ async fn step(shared: &Shared, raw_dir: &Path) -> Result<()> {
     }
     let lag = tip - cursor;
     gauge!("chain_block_lag_slots").set(lag as f64);
-    if lag > shared.cfg.max_lag_slots {
+    if lag > shared.cfg.max_lag_slots && *backfill_to < cursor {
+        // Fell behind: record the gap in `slots` mode (produced or skipped
+        // and the leader, one `getBlocks` per range) and resume reading
+        // blocks at the tip. Only a gap too wide for that is dropped.
+        let backfilled = lag <= MAX_BACKFILL_SLOTS;
         warn!(
             from = cursor,
             to = tip,
+            backfilled,
             "block pipeline fell behind; skipping ahead"
         );
-        counter!("chain_block_gap_slots_total").increment(lag);
+        if backfilled {
+            counter!("chain_block_backfill_slots_total").increment(lag);
+        } else {
+            counter!("chain_block_gap_slots_total").increment(lag);
+        }
         shared
             .store
             .event(
@@ -89,37 +110,46 @@ async fn step(shared: &Shared, raw_dir: &Path) -> Result<()> {
                 kind::GAP,
                 &format!("{cursor}-{tip}"),
                 json!({
-                    "from": cursor, "to": tip, "slots": lag,
+                    "from": cursor, "to": tip, "slots": lag, "backfilled": backfilled,
                 }),
             )
             .await?;
-        shared.cursor.store(tip, Ordering::Relaxed);
-        return Ok(());
+        if !backfilled {
+            shared.cursor.store(tip, Ordering::Relaxed);
+            return Ok(());
+        }
+        *backfill_to = tip;
     }
-    let end = tip.min(cursor + RANGE - 1);
-    let produced: BTreeSet<u64> = shared
+    let backfilling = cursor <= *backfill_to;
+    let mut end = tip.min(cursor + RANGE - 1);
+    if backfilling {
+        end = end.min(*backfill_to);
+    }
+    let listed = shared
         .rpc
         .call(
             "getBlocks",
             json!([cursor, end, { "commitment": "confirmed" }]),
         )
-        .await?
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_u64)
-        .collect();
-    if let Err(error) = ensure_leaders(shared, cursor, end).await {
+        .await?;
+    let produced = produced_set(&listed);
+    let Some(until) = decided_until(end, tip, &produced) else {
+        // The node that answered is behind the tip: ask again shortly.
+        tokio::time::sleep(NOT_YET_WAIT).await;
+        return Ok(());
+    };
+    if let Err(error) = ensure_leaders(shared, cursor, until).await {
         warn!(error = %format!("{error:#}"), "leader schedule unavailable");
     }
-    let mut blocks = stream::iter(cursor..=end)
+    let slots_only = backfilling || shared.block_details == BlockDetails::Slots;
+    let mut blocks = stream::iter(cursor..=until)
         .map(|slot| {
             let produced = produced.contains(&slot);
             async move {
-                let fetched = if produced {
-                    fetch(shared, slot).await
-                } else {
-                    Fetched::Skipped
+                let fetched = match (produced, slots_only) {
+                    (false, _) => Fetched::Skipped,
+                    (true, true) => Fetched::Unread,
+                    (true, false) => fetch(shared, slot).await,
                 };
                 (slot, fetched)
             }
@@ -133,6 +163,30 @@ async fn step(shared: &Shared, raw_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Slots a `getBlocks` reply lists as produced.
+fn produced_set(listed: &Value) -> BTreeSet<u64> {
+    listed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect()
+}
+
+/// The last slot of `cursor..=end` that a `getBlocks` reply lets us decide
+/// (`None`: none yet). `getSlot` and `getBlocks` may be answered by different
+/// nodes behind a load balancer, so a slot missing from the list is skipped
+/// only below the newest block the list holds: the tail after it may just be
+/// missing from a node that is behind, and is left for the next step. An
+/// empty list is accepted only once the tip is well past the range.
+fn decided_until(end: u64, tip: u64, produced: &BTreeSet<u64>) -> Option<u64> {
+    match produced.last() {
+        Some(&last) => Some(last.min(end)),
+        None if tip >= end.saturating_add(EMPTY_RANGE_MARGIN) => Some(end),
+        None => None,
+    }
+}
+
 async fn fetch(shared: &Shared, slot: u64) -> Fetched {
     let details = match shared.block_details {
         BlockDetails::Full => "full",
@@ -143,23 +197,44 @@ async fn fetch(shared: &Shared, slot: u64) -> Fetched {
         "encoding": "json", "transactionDetails": details, "rewards": false,
         "maxSupportedTransactionVersion": 1, "commitment": "confirmed",
     }]);
-    for attempt in 1..=shared.cfg.block_attempts.max(1) {
-        match shared.rpc.call("getBlock", params.clone()).await {
-            Ok(block) if block.is_null() => return Fetched::Skipped,
-            Ok(block) => return Fetched::Produced(block),
-            Err(error) if is_skipped(&error) => return Fetched::Skipped,
-            Err(error) if is_not_yet(&error) || attempt < 3 => {
-                tracing::debug!(slot, attempt, error = %format!("{error:#}"), "block not ready");
-                tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+    let attempts = shared.cfg.block_attempts.max(1);
+    for attempt in 1..=attempts {
+        let result = shared.rpc.call("getBlock", params.clone()).await;
+        let error = match &result {
+            Ok(block) if block.is_null() => "not confirmed on this node yet".to_owned(),
+            Ok(_) => String::new(),
+            Err(error) => format!("{error:#}"),
+        };
+        if let Some(fetched) = outcome(result, attempt, attempts) {
+            if fetched == Fetched::Unavailable {
+                warn!(slot, attempt, error, "block unavailable");
             }
-            Err(error) => {
-                warn!(slot, error = %format!("{error:#}"), "getBlock failed");
-                return Fetched::Unavailable;
-            }
+            return fetched;
         }
+        tracing::debug!(slot, attempt, error, "block not ready");
+        tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
     }
-    warn!(slot, "block still unavailable after retries");
     Fetched::Unavailable
+}
+
+/// One `getBlock` attempt for a slot `getBlocks` listed as produced (`None`:
+/// try again). Such a slot is never recorded as skipped: `null` means the
+/// answering node has not confirmed it yet (retried like "not available
+/// yet"), and -32007/-32009 that it is missing from that node's ledger
+/// (retried like any other error, since another node may serve it); both
+/// end up `Unavailable`.
+fn outcome(result: Result<Value>, attempt: u32, attempts: u32) -> Option<Fetched> {
+    let retry = match result {
+        Ok(block) if !block.is_null() => return Some(Fetched::Produced(block)),
+        Ok(_) => true,
+        Err(error) if is_not_yet(&error) => true,
+        // Never `Skipped`: only `getBlocks` decides that. Three attempts,
+        // like any other error (behind a load balancer another node may
+        // have it).
+        Err(error) if is_missing(&error) => attempt < 3,
+        Err(_) => attempt < 3,
+    };
+    (!retry || attempt >= attempts).then_some(Fetched::Unavailable)
 }
 
 fn record(shared: &Shared, raw_dir: &Path, slot: u64, fetched: Fetched, tip: u64) {
@@ -288,5 +363,69 @@ fn observe(shared: &Shared, summary: &BlockSummary, leader_client: &str) {
         if let Some(price) = tx.prio_price {
             histogram!("chain_prio_price_micro_lamports", "scope" => "ours").record(price as f64);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::RpcError;
+
+    fn rpc_error(code: i64) -> Result<Value> {
+        Err(RpcError {
+            code,
+            message: format!("error {code}"),
+        }
+        .into())
+    }
+
+    #[test]
+    fn a_tail_missing_from_get_blocks_waits_for_the_next_step() {
+        // getSlot says 1_003, the getBlocks node only has up to 1_000.
+        let produced = produced_set(&json!([998, 1_000]));
+        assert_eq!(decided_until(1_003, 1_003, &produced), Some(1_000));
+        // Next step (cursor 1_001): that node is still behind, nothing listed.
+        let empty = produced_set(&json!([]));
+        assert_eq!(decided_until(1_003, 1_003, &empty), None);
+        assert_eq!(
+            decided_until(1_003, 1_003 + EMPTY_RANGE_MARGIN - 1, &empty),
+            None
+        );
+        // It caught up: 1_001 and 1_002 were skipped, 1_003 produced.
+        let produced = produced_set(&json!([1_003]));
+        assert_eq!(decided_until(1_003, 1_004, &produced), Some(1_003));
+    }
+
+    #[test]
+    fn an_empty_range_is_skipped_once_the_tip_is_well_past_it() {
+        let empty = produced_set(&json!([]));
+        assert_eq!(
+            decided_until(1_499, 1_499 + EMPTY_RANGE_MARGIN, &empty),
+            Some(1_499)
+        );
+        assert_eq!(produced_set(&Value::Null), BTreeSet::new());
+    }
+
+    #[test]
+    fn a_listed_slot_is_never_recorded_as_skipped() {
+        // `null`: not confirmed on the node that answered; retried, then unavailable.
+        assert_eq!(outcome(Ok(Value::Null), 1, 6), None);
+        assert_eq!(outcome(Ok(Value::Null), 6, 6), Some(Fetched::Unavailable));
+        // Missing from that node's ledger / long-term storage.
+        for code in [-32007, -32009] {
+            assert_eq!(outcome(rpc_error(code), 2, 6), None);
+            assert_eq!(outcome(rpc_error(code), 3, 6), Some(Fetched::Unavailable));
+        }
+        // Not available yet: retried up to the last attempt.
+        assert_eq!(outcome(rpc_error(-32004), 5, 6), None);
+        assert_eq!(outcome(rpc_error(-32004), 6, 6), Some(Fetched::Unavailable));
+        // Other errors: three attempts.
+        assert_eq!(outcome(rpc_error(-32600), 2, 6), None);
+        assert_eq!(outcome(rpc_error(-32600), 3, 6), Some(Fetched::Unavailable));
+        let block = json!({ "blockHeight": 5 });
+        assert_eq!(
+            outcome(Ok(block.clone()), 1, 6),
+            Some(Fetched::Produced(block))
+        );
     }
 }

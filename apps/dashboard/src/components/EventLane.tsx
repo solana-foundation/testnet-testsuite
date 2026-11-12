@@ -58,7 +58,9 @@ export function describe(e: TimelineEvent): string {
     case "majority_version":
       return `stake majority now ${e.event.subject} (was ${text("previous")})`;
     case "gap":
-      return `chain-watch skipped slots ${e.event.subject}`;
+      return d.backfilled === true
+        ? `chain-watch fell behind: slots ${e.event.subject} have no block details`
+        : `chain-watch skipped slots ${e.event.subject}`;
     case "job_started":
       return `job started: ${e.event.subject}`;
     case "job_finished":

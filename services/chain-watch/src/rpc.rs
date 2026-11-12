@@ -173,9 +173,9 @@ pub fn redact(text: &str, url: &str) -> String {
     out
 }
 
-/// `getBlock` error codes that mean the slot has no block: skipped, or
-/// missing from the ledger / long-term storage.
-pub fn is_skipped(error: &anyhow::Error) -> bool {
+/// `getBlock` error codes for "skipped, or missing from this node's ledger /
+/// long-term storage". For a slot `getBlocks` listed, it is the latter.
+pub fn is_missing(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<RpcError>()
         .is_some_and(|e| matches!(e.code, -32007 | -32009))
