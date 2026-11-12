@@ -114,4 +114,6 @@ endpoint for sustained runs. `SCENARIO_SEED` is mandatory there.
 | `flow_cost_vs_oracle_bps`, `flow_slippage_bps`                                       | pair                        | cost to uninformed flow vs oracle; landed vs quoted |
 | `flow_route_legs_total`, `flow_notional_micro_usd_total`, `flow_refills_total`       | venue / pair                | routing mix, volume (µUSD), refills                 |
 | `router_quote_seconds`, `router_quote_errors_total`, `router_quotes_total`           | execution, status           | router latency and failures                         |
+| `router_snapshot_age_seconds`, `router_snapshot_load_seconds`                        | — / result                  | pool data age when planned (from load start); loads |
+| `router_snapshot_skipped_total`, `router_chain_tip_refresh_failures_total`           | reason / —                  | pools left out of a quote; failed tip refreshes     |
 | `oracle_price_updates_total`, `{orca_whirlpool,raydium_clmm,manifest}_actions_total` | —                           | feed health and per-venue transactions              |

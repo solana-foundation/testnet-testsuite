@@ -984,6 +984,143 @@
         }
       ],
       "id": 28
+    },
+    {
+      "type": "timeseries",
+      "title": "Router snapshot age when planned (s)",
+      "description": "age of the pool data a quote was planned on, from the start of its load; pools past snapshot_max_age_ms are skipped",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 81
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "router_snapshot_age_seconds{quantile=\"0.5\"}",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "router_snapshot_age_seconds{quantile=\"0.95\"}",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "router_snapshot_age_seconds{quantile=\"1\"}",
+          "legendFormat": "max"
+        }
+      ],
+      "id": 29
+    },
+    {
+      "type": "timeseries",
+      "title": "Router snapshot loads (s)",
+      "description": "per pool load, ok or error (errors include loads abandoned at snapshot_load_timeout_ms)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 89
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "router_snapshot_load_seconds{quantile=\"0.5\"}",
+          "legendFormat": "p50 {{result}}"
+        },
+        {
+          "refId": "B",
+          "expr": "router_snapshot_load_seconds{quantile=\"0.95\"}",
+          "legendFormat": "p95 {{result}}"
+        }
+      ],
+      "id": 30
+    },
+    {
+      "type": "timeseries",
+      "title": "Router snapshot skips and tip failures / min",
+      "description": "pools left out of a quote (too_old / unavailable), and failed slot+blockhash refreshes (quotes answer 502 once the tip is chain_tip_max_age_ms old)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 89
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(router_snapshot_skipped_total[5m])) * 60",
+          "legendFormat": "skipped {{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(router_chain_tip_refresh_failures_total[5m])) * 60",
+          "legendFormat": "tip refresh failures"
+        }
+      ],
+      "id": 31
     }
   ]
 }

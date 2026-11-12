@@ -85,6 +85,20 @@ nl(8)
 ts("Router quotes and errors / min", [
     ("sum by (execution) (rate(router_quotes_total[5m])) * 60", "quotes {{execution}}"),
     ("sum by (status) (rate(router_quote_errors_total[5m])) * 60", "errors {{status}}")], x=0)
+ts("Router snapshot age when planned (s)", [
+    ('router_snapshot_age_seconds{quantile="0.5"}', "p50"),
+    ('router_snapshot_age_seconds{quantile="0.95"}', "p95"),
+    ('router_snapshot_age_seconds{quantile="1"}', "max")], unit="s", x=12,
+   desc="age of the pool data a quote was planned on, from the start of its load; pools past snapshot_max_age_ms are skipped")
+nl(8)
+ts("Router snapshot loads (s)", [
+    ('router_snapshot_load_seconds{quantile="0.5"}', "p50 {{result}}"),
+    ('router_snapshot_load_seconds{quantile="0.95"}', "p95 {{result}}")], unit="s", x=0,
+   desc="per pool load, ok or error (errors include loads abandoned at snapshot_load_timeout_ms)")
+ts("Router snapshot skips and tip failures / min", [
+    ("sum by (reason) (rate(router_snapshot_skipped_total[5m])) * 60", "skipped {{reason}}"),
+    ("sum(rate(router_chain_tip_refresh_failures_total[5m])) * 60", "tip refresh failures")], x=12,
+   desc="pools left out of a quote (too_old / unavailable), and failed slot+blockhash refreshes (quotes answer 502 once the tip is chain_tip_max_age_ms old)")
 nl(8)
 
 dash = {"uid": "mtm-scenario", "title": "mtm — market-making scenario", "tags": ["mtm"], "timezone": "browser",
