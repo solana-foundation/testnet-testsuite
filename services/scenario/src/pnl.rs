@@ -31,7 +31,6 @@ use solana_signer::null_signer::NullSigner;
 
 use crate::rpc::{JsonRpc, RpcError, backoff};
 
-const D18: u128 = 1_000_000_000_000_000_000;
 /// A maker's wallet token atoms (in `scenario.tokens` order) and its venue
 /// holdings, read consistently.
 type MakerRead = (Vec<u64>, Option<(String, BTreeMap<String, Decimal>)>);
@@ -331,11 +330,9 @@ fn manifest_holdings(
     }
     let mut quote = u128::from(quote_withdrawable);
     for (price_raw, base_atoms) in bids {
-        let locked = price_raw
-            .checked_mul(u128::from(base_atoms))
-            .ok_or_else(overflow)?
-            .div_ceil(D18);
-        quote = quote.checked_add(locked).ok_or_else(overflow)?;
+        let locked = manifest_dex_client::book::locked_quote_atoms(price_raw, base_atoms)
+            .map_err(|_| overflow())?;
+        quote = quote.checked_add(u128::from(locked)).ok_or_else(overflow)?;
     }
     Ok((
         u64::try_from(base).map_err(|_| overflow())?,
@@ -1270,6 +1267,7 @@ mod tests {
 
     #[test]
     fn manifest_holdings_add_locked_orders_and_refuse_overflow() {
+        const D18: u128 = 1_000_000_000_000_000_000;
         // a bid for 3 base atoms at 1.5 quote/base locks ceil(4.5) = 5
         let price = D18 * 3 / 2;
         let (base, quote) = manifest_holdings(
