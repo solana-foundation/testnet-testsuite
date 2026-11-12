@@ -685,8 +685,65 @@ pub async fn vaults(
     Ok((out, authorities))
 }
 
-/// Burn and close every scenario-mint token account held by one of the
-/// venues' PDAs. Returns the report and the lamports recovered.
+/// Found vaults, split by holder and mint.
+struct VaultClasses<'v> {
+    /// Held by a venue PDA: the ones the janitor closes.
+    held: Vec<&'v Vault>,
+    /// Held by anyone else: left alone.
+    not_held: usize,
+    /// Of `held`, the ones whose mint is no scenario mint: another
+    /// operator's pool on a shared program ID (closed all the same).
+    other_mints: usize,
+}
+
+fn classify_vaults<'v>(
+    found: &'v [Vault],
+    authorities: &HashMap<Pubkey, VaultAuthority>,
+    mints: &[Pubkey],
+) -> VaultClasses<'v> {
+    let (held, not_held): (Vec<&Vault>, Vec<&Vault>) = found
+        .iter()
+        .partition(|vault| authorities.contains_key(&vault.owner));
+    let other_mints = held
+        .iter()
+        .filter(|vault| !mints.contains(&vault.mint))
+        .count();
+    VaultClasses {
+        held,
+        not_held: not_held.len(),
+        other_mints,
+    }
+}
+
+/// What a janitor run would close, read before any program is upgraded:
+/// the vault classes and each program's account count. Changes nothing.
+pub async fn plan(rpc: &JsonRpc, scenario: &Scenario) -> Result<Value> {
+    let mints: Vec<Pubkey> = scenario.tokens.values().map(|token| token.mint).collect();
+    let (found, authorities) = vaults(rpc, &scenario.programs, &mints).await?;
+    let classes = classify_vaults(&found, &authorities, &mints);
+    let programs = &scenario.programs;
+    let mut counts = serde_json::Map::new();
+    for (name, program) in [
+        ("orca-whirlpool", programs.orca_whirlpool),
+        ("raydium-clmm", programs.raydium_clmm),
+        ("manifest", programs.manifest),
+    ] {
+        counts.insert(name.to_owned(), json!(owned(rpc, &program).await?.len()));
+    }
+    Ok(json!({
+        "vaults": {
+            "heldByTheVenue": classes.held.len(),
+            "notHeldByTheVenue": classes.not_held,
+            "ofOtherMints": classes.other_mints,
+        },
+        "accounts": counts,
+    }))
+}
+
+/// Burn and close every token account held by one of the venues' PDAs:
+/// the vaults of every pool and market on the program IDs, whatever their
+/// mints (`vaultsOfOtherMints` counts those of non-scenario mints). Returns
+/// the report and the lamports recovered.
 async fn close_vaults(
     chain: &ChainClient,
     rpc: &JsonRpc,
@@ -699,17 +756,13 @@ async fn close_vaults(
     // (pda, token program) -> [(vault, mint)]
     let mut groups: BTreeMap<(Pubkey, Pubkey), Vec<(Pubkey, Pubkey)>> = BTreeMap::new();
     let mut lamports_of: HashMap<Pubkey, u64> = HashMap::new();
-    let mut foreign = 0_usize;
-    for vault in found {
-        if authorities.contains_key(&vault.owner) {
-            lamports_of.insert(vault.address, vault.lamports);
-            groups
-                .entry((vault.owner, vault.token_program))
-                .or_default()
-                .push((vault.address, vault.mint));
-        } else {
-            foreign += 1;
-        }
+    let classes = classify_vaults(&found, &authorities, &mints);
+    for vault in &classes.held {
+        lamports_of.insert(vault.address, vault.lamports);
+        groups
+            .entry((vault.owner, vault.token_program))
+            .or_default()
+            .push((vault.address, vault.mint));
     }
     let mut by_venue: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
     let mut total = 0_u64;
@@ -742,7 +795,8 @@ async fn close_vaults(
             .into_iter()
             .map(|(venue, (count, lamports))| (venue.to_owned(), json!({ "closed": count, "sol": lamports as f64 / LAMPORTS_PER_SOL })))
             .collect::<serde_json::Map<_, _>>(),
-        "vaultsNotHeldByTheVenue": foreign,
+        "vaultsNotHeldByTheVenue": classes.not_held,
+        "vaultsOfOtherMints": classes.other_mints,
     });
     Ok((report, total))
 }
@@ -1410,5 +1464,62 @@ mod tests {
                         .any(|program| program.to_string() == *first)),
             "{calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn vaults_of_pools_without_scenario_mints_are_counted_as_other_mints() {
+        let mut fixture = fixture();
+        // Another operator's Whirlpool on the same program ID, trading two
+        // mints the scenario does not know.
+        let (c, d) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let (c, d) = if c < d { (c, d) } else { (d, c) };
+        let config = Pubkey::new_unique();
+        let (pool, _) = Pubkey::find_program_address(
+            &[
+                b"whirlpool",
+                config.as_ref(),
+                c.as_ref(),
+                d.as_ref(),
+                &8_u16.to_le_bytes(),
+            ],
+            &fixture.programs.orca_whirlpool,
+        );
+        let (vault_c, vault_d) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut data = vec![0; 653];
+        data[..8].copy_from_slice(&WHIRLPOOL);
+        put(&mut data, 8, &config);
+        data[43..45].copy_from_slice(&8_u16.to_le_bytes());
+        put(&mut data, 101, &c);
+        put(&mut data, 133, &vault_c);
+        put(&mut data, 181, &d);
+        put(&mut data, 213, &vault_d);
+        let token = spl::TOKEN_PROGRAM_ID;
+        fixture
+            .accounts
+            .insert(pool, (fixture.programs.orca_whirlpool, 7, data));
+        fixture
+            .accounts
+            .insert(vault_c, (token, 8, token_account(&c, &pool)));
+        fixture
+            .accounts
+            .insert(vault_d, (token, 9, token_account(&d, &pool)));
+        let (url, _) = accounts_rpc(fixture.accounts.clone()).await;
+        let rpc = JsonRpc::new(url, "confirmed").expect("client");
+        let (found, authorities) = vaults(&rpc, &fixture.programs, &fixture.mints)
+            .await
+            .expect("vaults");
+        let classes = classify_vaults(&found, &authorities, &fixture.mints);
+        // The fixture's 5 venue-held vaults, plus the foreign pool's 2.
+        assert_eq!(classes.held.len(), 7);
+        assert_eq!(classes.not_held, 1);
+        assert_eq!(classes.other_mints, 2);
+        let other: Vec<Pubkey> = classes
+            .held
+            .iter()
+            .filter(|vault| !fixture.mints.contains(&vault.mint))
+            .map(|vault| vault.address)
+            .collect();
+        assert_eq!(other.len(), 2);
+        assert!(other.contains(&vault_c) && other.contains(&vault_d));
     }
 }

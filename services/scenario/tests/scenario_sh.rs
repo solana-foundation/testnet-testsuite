@@ -41,7 +41,8 @@ fn write(path: &Path, text: &str, executable: bool) {
 /// last deployed there successfully (their fork, initially), or exits
 /// `$CHECK_STATUS` when set (except a `--record`); with `--require-artifact` the artifact file
 /// must exist, with `--require-verified` it or a `--lock` entry must.
-/// `scenario janitor` prints `$JANITOR_OUTPUT` and exits `$JANITOR_STATUS`.
+/// `scenario janitor` prints `$JANITOR_OUTPUT` and exits `$JANITOR_STATUS`;
+/// `scenario janitor-plan` prints `$JANITOR_PLAN`.
 fn tree(name: &str) -> Option<Tree> {
     for tool in ["bash", "jq"] {
         if Command::new(tool).arg("--version").output().is_err() {
@@ -122,6 +123,7 @@ case "$1" in
       shift
     done
     exit 0 ;;
+  janitor-plan) echo "${JANITOR_PLAN:-"{}"}" ;;
   janitor)
     if [[ -n "${JANITOR_SLEEP:-}" ]]; then sleep "$JANITOR_SLEEP"; fi
     [[ -n "${JANITOR_OUTPUT:-}" ]] && echo "$JANITOR_OUTPUT"
@@ -524,4 +526,28 @@ fn up_refuses_before_starting_anything() {
         "{calls}"
     );
     assert!(calls.contains("--janitor-so"), "{calls}");
+}
+
+#[test]
+fn vaults_of_other_mints_are_reported_before_the_first_upgrade() {
+    let Some(tree) = tree("plan") else {
+        return;
+    };
+    let (output, deploys) = teardown_in(
+        &tree,
+        &[("JANITOR_PLAN", r#"{"vaults":{"ofOtherMints":2}}"#)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(deploys, [JANITOR, FORKS].concat());
+    assert!(
+        stderr(&output).contains("2 vaults on the DEX programs hold non-scenario mints"),
+        "{}",
+        stderr(&output)
+    );
+    let calls = std::fs::read_to_string(tree.root.join("scenario.log")).expect("log");
+    let plan = calls.find("janitor-plan").expect("planned");
+    assert!(
+        plan < calls.find("janitor --janitor-so").expect("ran"),
+        "{calls}"
+    );
 }

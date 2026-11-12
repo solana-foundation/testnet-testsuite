@@ -441,6 +441,10 @@ unwind, which still needs the real code) and runs `scenario janitor`, which:
    (`vaultsNotHeldByTheVenue`);
 3. closes every account the programs own.
 
+Before the first upgrade, `scenario janitor-plan` reads what the run will
+close (`.scenario/janitor-plan.json`) and the script warns when vaults hold
+non-scenario mints (another operator's pools on shared program IDs).
+
 It then upgrades the forks back, empty: `bootstrap` re-creates configs, pools and
 markets on the same chain. The restore runs on every exit once the first
 upgrade to the janitor has started: a failed or interrupted `scenario

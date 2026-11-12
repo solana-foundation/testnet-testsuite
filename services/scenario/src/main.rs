@@ -164,6 +164,9 @@ enum Command {
         #[arg(long, default_value = "KEYPAIR_FAUCET")]
         authority_keypair_env: String,
     },
+    /// What `janitor` would close (vaults by holder and mint, accounts per
+    /// program), read without changing anything: run before the upgrade.
+    JanitorPlan,
 }
 
 /// Operator keypairs the bootstrap funds (each is skipped when unset).
@@ -333,6 +336,7 @@ async fn main() -> Result<()> {
             let authority = keypair_from_environment(&authority_keypair_env)?;
             janitor::run(&chain, &rpc, &scenario, &authority, &elf).await?
         }
+        Command::JanitorPlan => janitor::plan(&rpc, &scenario).await?,
         Command::Leftovers {
             faucet_keypair_env,
             operator_envs,

@@ -387,6 +387,13 @@ janitor() (
   done < <(artifacts)
   if [[ "$live" == 0 ]]; then echo "janitor: the DEX programs are already closed" >&2; exit 0; fi
   [[ "$live" == 3 ]] || { echo "janitor: only $live of 3 DEX programs exist; refusing a partial run" >&2; exit 1; }
+  # Read-only, before any upgrade: what the run will close.
+  "$bin/scenario" janitor-plan >"$state/janitor-plan.json"
+  other="$(jq -s '[.[] | .vaults.ofOtherMints // 0] | add // 0' "$state/janitor-plan.json")"
+  if [[ "$other" != 0 ]]; then
+    echo "janitor: $other vaults on the DEX programs hold non-scenario mints (another operator's" \
+      "pools?); they are closed too (.scenario/janitor-plan.json)" >&2
+  fi
   upgraded=1 # from here on, `finish` restores the forks
   while IFS= read -r spec; do
     attempted+=("${spec%%:*}") # before the attempt: a failed deploy may still have landed
