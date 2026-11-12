@@ -354,6 +354,11 @@ impl ManifestClient {
                 "compute_unit_limit must be greater than zero".to_owned(),
             ));
         }
+        // Register at zero so `increase()` sees the first trim. `increment`,
+        // not `absolute`: a second client must not reset the count.
+        for side in ["bid", "ask"] {
+            counter!("manifest_orders_trimmed_total", "side" => side).increment(0);
+        }
         Ok(Self {
             chain,
             program_id,
