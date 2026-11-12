@@ -5,6 +5,7 @@
 //! atomically replaces the ladder when the mid has moved by `refresh_bps`
 //! or any of its orders filled.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -16,8 +17,6 @@ use solana_commitment_config::CommitmentConfig;
 use tracing::info;
 
 use crate::maker::Ctx;
-
-const D18: u128 = 1_000_000_000_000_000_000;
 
 pub struct Clob {
     client: ManifestClient,
@@ -76,6 +75,14 @@ impl Clob {
         else {
             unreachable!("clob maker with a non-clob strategy");
         };
+        let params = LadderParams {
+            levels: u32::from(levels),
+            spread_bps,
+            step_bps,
+            level_size,
+            skew_bps,
+            target_base_ratio,
+        };
         let prices = ctx.prices().await?;
         let mid = match prices.pair(&ctx.base, &ctx.quote) {
             Ok(mid) => mid,
@@ -104,21 +111,7 @@ impl Clob {
         let mine: Vec<_> = snapshot.book.orders_of(seat.index).copied().collect();
 
         // Seat inventory = withdrawable + what our resting orders lock.
-        let mut base_atoms = seat.base_withdrawable;
-        let mut quote_atoms = seat.quote_withdrawable;
-        for order in &mine {
-            if snapshot
-                .book
-                .asks
-                .iter()
-                .any(|ask| ask.index == order.index)
-            {
-                base_atoms = base_atoms.saturating_add(order.base_atoms);
-            } else {
-                let locked = (order.price_raw * u128::from(order.base_atoms)).div_ceil(D18);
-                quote_atoms = quote_atoms.saturating_add(u64::try_from(locked).unwrap_or(u64::MAX));
-            }
-        }
+        let (base_atoms, quote_atoms) = snapshot.book.holdings(&seat)?;
         ctx.record_inventory(&prices, base_atoms, quote_atoms);
         let best_bid = snapshot.book.bids.first().map(|o| o.price_raw);
         let best_ask = snapshot.book.asks.first().map(|o| o.price_raw);
@@ -149,49 +142,30 @@ impl Clob {
             return Ok(());
         }
 
-        let base = to_ui(&ctx.base, base_atoms);
-        let quote = to_ui(&ctx.quote, quote_atoms);
-        let value = base * mid + quote;
-        let ratio = if value.is_zero() {
-            target_base_ratio
-        } else {
-            base * mid / value
-        };
-        // Long base → shift quotes down to sell it; short base → shift up.
-        let span = target_base_ratio.max(Decimal::ONE - target_base_ratio);
-        let lean = ((ratio - target_base_ratio) / span).clamp(-Decimal::ONE, Decimal::ONE);
-        let skewed = mid * (Decimal::ONE - lean * Decimal::from(skew_bps) / Decimal::from(10_000));
-
-        let levels = Decimal::from(levels.max(1));
-        let ask_size = level_size.min(base / levels);
-        let mut orders = Vec::new();
-        for level in 0..u32::try_from(levels.mantissa()).unwrap_or(1) {
-            let offset = Decimal::from(spread_bps + level * step_bps) / Decimal::from(10_000);
-            // Significant figures, not decimal places: 8 places is ~5 bps
-            // at BONK's price, enough to collapse levels onto one price.
-            let round = |price: Decimal| price.round_sf(8).unwrap_or(price);
-            let bid = round(skewed * (Decimal::ONE - offset));
-            let ask = round(skewed * (Decimal::ONE + offset));
-            let bid_size = level_size.min(quote / levels / bid);
-            for (side, price, size) in [(Side::Bid, bid, bid_size), (Side::Ask, ask, ask_size)] {
-                let size = size
-                    .round_dp_with_strategy(u32::from(ctx.base.decimals), RoundingStrategy::ToZero);
-                if size > Decimal::ZERO && price > Decimal::ZERO {
-                    orders.push(OrderSpec {
-                        side,
-                        price,
-                        base_amount: size,
-                    });
-                }
-            }
-        }
-        if orders.is_empty() {
+        let decimals = (ctx.base.decimals, ctx.quote.decimals);
+        if ladder(mid, base_atoms, quote_atoms, decimals, &params)
+            .orders
+            .is_empty()
+        {
             return Ok(());
         }
-        let outcome = self.client.replace_orders(ctx.pool, &orders).await?;
+        // Size from the snapshot the batch is built on (again on its
+        // stale-cancel retry, after the fill that caused it), not this one.
+        let lean = Cell::new(Decimal::ZERO);
+        let outcome = self
+            .client
+            .replace_orders_with(ctx.pool, |snapshot, seat| {
+                let Ok((base_atoms, quote_atoms)) = snapshot.book.holdings(seat) else {
+                    return vec![];
+                };
+                let ladder = ladder(mid, base_atoms, quote_atoms, decimals, &params);
+                lean.set(ladder.lean);
+                ladder.orders
+            })
+            .await?;
         ctx.action("requote");
         metrics::gauge!("mm_skew_bps", "maker" => ctx.name()).set(
-            rust_decimal::prelude::ToPrimitive::to_f64(&(lean * Decimal::from(skew_bps)))
+            rust_decimal::prelude::ToPrimitive::to_f64(&(lean.get() * Decimal::from(skew_bps)))
                 .unwrap_or_default(),
         );
         self.last = Some((
@@ -203,5 +177,256 @@ impl Clob {
                 .collect(),
         ));
         Ok(())
+    }
+}
+
+/// Share of each side's inventory the ladder quotes: the rest absorbs a
+/// fill between the read and landing and the bids' per-order rounding.
+const HEADROOM: Decimal = Decimal::from_parts(98, 0, 0, false, 2);
+/// Smallest level, as a share of `level_size`, before outer levels are
+/// dropped instead of shrinking further.
+const MIN_LEVEL_SHARE: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
+/// Quote atoms reserved per bid: its lock rounds up by up to one, and the
+/// client keeps one more as margin.
+const BID_RESERVE_ATOMS: i64 = 2;
+
+/// The `clob-ladder` strategy's shape.
+#[derive(Debug, Clone)]
+struct LadderParams {
+    levels: u32,
+    spread_bps: u32,
+    step_bps: u32,
+    level_size: Decimal,
+    skew_bps: u32,
+    target_base_ratio: Decimal,
+}
+
+#[derive(Debug)]
+struct Ladder {
+    orders: Vec<OrderSpec>,
+    /// Inventory lean in [-1, 1]: positive is long base (quotes shift down).
+    lean: Decimal,
+}
+
+/// The ladder for a seat holding `base_atoms` / `quote_atoms` (decimals
+/// `(base, quote)`) around `mid` (quote per base). Each side quotes at most
+/// [`HEADROOM`] of its inventory (bids less [`BID_RESERVE_ATOMS`] each), so
+/// a batch funded from the same holdings always fits; a side too thin for
+/// every level at [`MIN_LEVEL_SHARE`] of `level_size` drops its outer
+/// levels first.
+fn ladder(
+    mid: Decimal,
+    base_atoms: u64,
+    quote_atoms: u64,
+    (base_decimals, quote_decimals): (u8, u8),
+    params: &LadderParams,
+) -> Ladder {
+    let ui = |atoms: u64, decimals: u8| {
+        Decimal::from_i128_with_scale(i128::from(atoms), u32::from(decimals))
+    };
+    let base = ui(base_atoms, base_decimals);
+    let quote = ui(quote_atoms, quote_decimals);
+    let value = base * mid + quote;
+    let ratio = if value.is_zero() {
+        params.target_base_ratio
+    } else {
+        base * mid / value
+    };
+    // Long base → shift quotes down to sell it; short base → shift up.
+    let target = params.target_base_ratio;
+    let span = target.max(Decimal::ONE - target);
+    let lean = if span.is_zero() {
+        Decimal::ZERO
+    } else {
+        ((ratio - target) / span).clamp(-Decimal::ONE, Decimal::ONE)
+    };
+    let skewed =
+        mid * (Decimal::ONE - lean * Decimal::from(params.skew_bps) / Decimal::from(10_000));
+
+    let levels = params.levels.max(1);
+    // Significant figures, not decimal places: 8 places is ~5 bps at
+    // BONK's price, enough to collapse levels onto one price.
+    let round = |price: Decimal| price.round_sf(8).unwrap_or(price);
+    let prices: Vec<(Decimal, Decimal)> = (0..levels)
+        .map(|level| {
+            let offset =
+                Decimal::from(params.spread_bps + level * params.step_bps) / Decimal::from(10_000);
+            (
+                round(skewed * (Decimal::ONE - offset)),
+                round(skewed * (Decimal::ONE + offset)),
+            )
+        })
+        .collect();
+    let truncate = |size: Decimal| {
+        size.max(Decimal::ZERO)
+            .round_dp_with_strategy(u32::from(base_decimals), RoundingStrategy::ToZero)
+    };
+    let min_size = params.level_size * MIN_LEVEL_SHARE;
+    // Sizes for the first `n` levels of a side, widening the ladder only
+    // while every level stays at the minimum size.
+    let side = |size_at: &dyn Fn(u32, usize) -> Decimal| -> Vec<Decimal> {
+        for n in (1..=levels).rev() {
+            let sizes: Vec<Decimal> = (0..n as usize)
+                .map(|level| truncate(params.level_size.min(size_at(n, level))))
+                .collect();
+            if n == 1 || sizes.iter().all(|size| *size >= min_size) {
+                return sizes;
+            }
+        }
+        vec![]
+    };
+    let ask_budget = base * HEADROOM;
+    let asks = side(&|n, _| ask_budget / Decimal::from(n));
+    let bid_budget = |n: u32| {
+        quote * HEADROOM - Decimal::new(BID_RESERVE_ATOMS * i64::from(n), u32::from(quote_decimals))
+    };
+    let bids = side(&|n, level| {
+        let price = prices[level].0;
+        if price <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        bid_budget(n) / Decimal::from(n) / price
+    });
+
+    let mut orders = Vec::new();
+    for (level, (bid, ask)) in prices.iter().enumerate() {
+        for (side, price, size) in [
+            (Side::Bid, *bid, bids.get(level)),
+            (Side::Ask, *ask, asks.get(level)),
+        ] {
+            if let Some(&size) = size
+                && size > Decimal::ZERO
+                && price > Decimal::ZERO
+            {
+                orders.push(OrderSpec {
+                    side,
+                    price,
+                    base_amount: size,
+                });
+            }
+        }
+    }
+    Ladder { orders, lean }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use rust_decimal::prelude::ToPrimitive;
+
+    use super::*;
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).expect("decimal")
+    }
+
+    fn params(levels: u32, level_size: &str) -> LadderParams {
+        LadderParams {
+            levels,
+            spread_bps: 10,
+            step_bps: 10,
+            level_size: d(level_size),
+            skew_bps: 50,
+            target_base_ratio: d("0.5"),
+        }
+    }
+
+    /// Quote atoms the bids lock (rounded up, plus the client's margin) and
+    /// base atoms the asks lock.
+    fn locks(ladder: &Ladder, (base_decimals, quote_decimals): (u8, u8)) -> (u64, u64) {
+        let scale = |decimals: u8| Decimal::from(10_u64.pow(u32::from(decimals)));
+        let (mut base, mut quote) = (0_u64, 0_u64);
+        for order in &ladder.orders {
+            match order.side {
+                Side::Ask => {
+                    base += (order.base_amount * scale(base_decimals))
+                        .to_u64()
+                        .expect("atoms");
+                }
+                Side::Bid => {
+                    let lock = (order.price * order.base_amount * scale(quote_decimals)).ceil();
+                    quote += lock.to_u64().expect("atoms") + 1;
+                }
+            }
+        }
+        (base, quote)
+    }
+
+    #[test]
+    fn a_drained_side_keeps_headroom_and_fits() {
+        // The review's case: 10 USDC of quote over 3 levels near 0.5.
+        let ladder = ladder(d("0.4990"), 0, 10_000_000, (6, 6), &params(3, "10"));
+        let bids: Vec<_> = ladder
+            .orders
+            .iter()
+            .filter(|o| o.side == Side::Bid)
+            .collect();
+        assert_eq!(bids.len(), 3);
+        let (_, quote) = locks(&ladder, (6, 6));
+        assert!(quote <= 9_800_000, "{quote} past the 98% headroom");
+        assert!(quote > 9_700_000, "{quote}: the side is still used");
+        assert!(ladder.orders.iter().all(|o| o.side == Side::Bid));
+    }
+
+    #[test]
+    fn outer_levels_go_before_sizes_shrink_below_the_minimum() {
+        // 1,000 base per level wanted; 1,000 base held → 980 quotable.
+        // Five levels would be 196 each (< 250 minimum): three of 326.
+        let ladder = ladder(d("1"), 1_000_000_000, 0, (6, 6), &params(5, "1000"));
+        let asks: Vec<_> = ladder
+            .orders
+            .iter()
+            .filter(|o| o.side == Side::Ask)
+            .collect();
+        assert_eq!(asks.len(), 3);
+        assert!(asks.iter().all(|o| o.base_amount == d("326.666666")));
+        // A side too thin for even one minimum level still quotes one.
+        let ladder = ladder_with(d("1"), 100_000_000, 0);
+        assert_eq!(ladder.orders.len(), 1);
+        assert_eq!(ladder.orders[0].base_amount, d("98"));
+        // A well-funded side quotes every level at full size.
+        let ladder = ladder_with(d("1"), 100_000_000_000, 100_000_000_000);
+        assert_eq!(ladder.orders.len(), 10);
+        assert!(ladder.orders.iter().all(|o| o.base_amount == d("1000")));
+    }
+
+    fn ladder_with(mid: Decimal, base_atoms: u64, quote_atoms: u64) -> Ladder {
+        ladder(mid, base_atoms, quote_atoms, (6, 6), &params(5, "1000"))
+    }
+
+    #[test]
+    fn ladders_never_lock_more_than_the_seat_holds() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound.max(1)
+        };
+        for _ in 0..3_000 {
+            let decimals = [(6, 6), (9, 6), (5, 6), (6, 9), (8, 6)][next(5) as usize];
+            let base_atoms = next(10_u64.pow(14));
+            let quote_atoms = next(10_u64.pow(14));
+            // Prices from ~1e-5 (BONK) to ~2e4, several significant figures.
+            let mid = Decimal::new(1 + next(99_999) as i64, 0)
+                * Decimal::new(1, u32::try_from(next(10)).expect("small"));
+            let mut p = params(1 + next(6) as u32, "1");
+            p.level_size = Decimal::new(
+                1 + next(1_000_000) as i64,
+                u32::try_from(next(4)).expect("small"),
+            );
+            p.spread_bps = next(200) as u32;
+            p.step_bps = next(100) as u32;
+            p.skew_bps = next(300) as u32;
+            let ladder = ladder(mid, base_atoms, quote_atoms, decimals, &p);
+            let (base, quote) = locks(&ladder, decimals);
+            assert!(base <= base_atoms, "asks {base} > {base_atoms}");
+            assert!(
+                quote <= quote_atoms,
+                "bids {quote} > {quote_atoms} at {mid}"
+            );
+            assert!(ladder.orders.len() <= 2 * p.levels as usize);
+        }
     }
 }
