@@ -603,134 +603,141 @@ impl ManifestClient {
     }
 
     /// Place resting limit orders funded from the payer's seat balance.
+    /// Orders the seat cannot fund are trimmed (see [`replace_orders_with`]).
+    ///
+    /// [`replace_orders_with`]: Self::replace_orders_with
     pub async fn place_orders(
         &self,
         market: Pubkey,
         orders: &[OrderSpec],
     ) -> Result<OrdersOutcome> {
-        self.run("place_orders", market, self.batch(market, orders, false))
+        let build = |_: &MarketSnapshot, _: &Seat| orders.to_vec();
+        self.run("place_orders", market, self.batch(market, &build, false))
             .await
     }
 
     /// Cancel every resting order of the payer's seat and place `orders`, in
-    /// one atomic `BatchUpdate` so the book never shows a gap.
+    /// one atomic `BatchUpdate` so the book never shows a gap. Orders the
+    /// seat cannot fund are trimmed (see [`replace_orders_with`]).
+    ///
+    /// [`replace_orders_with`]: Self::replace_orders_with
     pub async fn replace_orders(
         &self,
         market: Pubkey,
         orders: &[OrderSpec],
     ) -> Result<OrdersOutcome> {
-        self.run("replace_orders", market, self.batch(market, orders, true))
+        let build = |_: &MarketSnapshot, _: &Seat| orders.to_vec();
+        self.run("replace_orders", market, self.batch(market, &build, true))
+            .await
+    }
+
+    /// [`replace_orders`](Self::replace_orders) with orders sized by `build`
+    /// from the market snapshot and seat the batch is built on. `build` runs
+    /// once per attempt, so the stale-cancel retry (a fill moved the seat's
+    /// inventory) re-sizes from the post-fill seat.
+    ///
+    /// The client never sends a batch the seat cannot fund: each side's
+    /// budget is the seat's withdrawable balance plus what the batch's
+    /// cancels refund; bids lock [`book::locked_quote_atoms`] plus one atom
+    /// of rounding margin. Each side is funded best price first; the first
+    /// order that does not fit is shrunk to what is left and worse ones are
+    /// dropped. [`OrdersOutcome::placed`] holds what was actually sent. When
+    /// nothing fits the batch only cancels; with nothing to cancel either it
+    /// fails with [`ManifestError::InsufficientBalance`] before sending.
+    pub async fn replace_orders_with<F>(&self, market: Pubkey, build: F) -> Result<OrdersOutcome>
+    where
+        F: Fn(&MarketSnapshot, &Seat) -> Vec<OrderSpec>,
+    {
+        self.run("replace_orders", market, self.batch(market, &build, true))
             .await
     }
 
     /// A batch that cancels is rebuilt from a fresh book and retried once
     /// when one of its cancels went stale (see [`ManifestError::is_stale_cancel`]).
-    async fn batch(
+    async fn batch<F>(
         &self,
         market: Pubkey,
-        orders: &[OrderSpec],
+        build: &F,
         cancel_existing: bool,
-    ) -> Result<OrdersOutcome> {
-        let mut attempt = 1;
-        loop {
-            match self.batch_once(market, orders, cancel_existing).await {
-                Err(error)
-                    if cancel_existing
-                        && error.is_stale_cancel()
-                        && attempt < STALE_CANCEL_ATTEMPTS =>
-                {
-                    counter!("manifest_stale_cancel_retries_total", "action" => "replace_orders")
-                        .increment(1);
-                    warn!(%market, error = %error, "a cancelled order was filled first; retrying on a fresh book");
-                    attempt += 1;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    async fn batch_once(
-        &self,
-        market: Pubkey,
-        orders: &[OrderSpec],
-        cancel_existing: bool,
-    ) -> Result<OrdersOutcome> {
-        if orders.is_empty() {
-            return Err(ManifestError::InvalidInput(
-                "at least one order is required".to_owned(),
-            ));
-        }
-        let snapshot = self.load_market(market).await?;
-        let seat = snapshot
-            .book
-            .seat(&self.payer())
-            .ok_or(ManifestError::MissingSeat {
-                market,
-                trader: self.payer(),
-            })?;
-        let book = &snapshot.book;
-        let params = orders
-            .iter()
-            .map(|order| {
-                ensure_positive(order.price, "order price")?;
-                let (mantissa, exponent) = price_to_mantissa(
-                    order.price,
-                    book.base_decimals,
-                    book.quote_decimals,
-                    order.side == Side::Bid,
-                )?;
-                Ok(PlaceOrderParams {
-                    base_atoms: ui_to_raw(order.base_amount, book.base_decimals)?,
-                    price_mantissa: mantissa,
-                    price_exponent: exponent,
-                    is_bid: order.side == Side::Bid,
-                    last_valid_slot: 0,
-                    order_type: OrderType::Limit,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let cancels = if cancel_existing {
-            book.orders_of(seat.index)
-                .map(|order| CancelOrderParams {
-                    order_sequence_number: order.sequence_number,
-                    order_index_hint: Some(order.index),
-                })
-                .collect()
+    ) -> Result<OrdersOutcome>
+    where
+        F: Fn(&MarketSnapshot, &Seat) -> Vec<OrderSpec>,
+    {
+        let attempts = if cancel_existing {
+            STALE_CANCEL_ATTEMPTS
         } else {
-            vec![]
+            1
         };
-        let ix = self.batch_update(market, seat.index, cancels, params);
-        let transaction = self.submit(vec![ix], &[]).await?;
-        let after = self.load_market_after(market, &transaction).await?;
-        let resting = after.book.orders_of(seat.index).copied().collect();
-        Ok(OrdersOutcome {
-            transaction: Some(transaction),
-            resting,
-        })
-    }
-
-    /// Cancel every resting order owned by the payer's seat.
-    pub async fn cancel_all_orders(&self, market: Pubkey) -> Result<OrdersOutcome> {
-        self.run("cancel_all_orders", market, async move {
-            let mut attempt = 1;
-            loop {
-                match self.cancel_all_once(market).await {
-                    Err(error) if error.is_stale_cancel() && attempt < STALE_CANCEL_ATTEMPTS => {
-                        counter!("manifest_stale_cancel_retries_total", "action" => "cancel_all_orders")
-                            .increment(1);
-                        warn!(%market, error = %error, "a cancelled order was filled first; retrying on a fresh book");
-                        attempt += 1;
-                    }
-                    result => return result,
-                }
-            }
+        retry_stale("replace_orders", market, attempts, |min_context_slot| {
+            self.batch_once(market, build, cancel_existing, min_context_slot)
         })
         .await
     }
 
-    async fn cancel_all_once(&self, market: Pubkey) -> Result<OrdersOutcome> {
-        {
-            let snapshot = self.load_market(market).await?;
+    /// One batch attempt; also returns the slot the market was read at.
+    async fn batch_once<F>(
+        &self,
+        market: Pubkey,
+        build: &F,
+        cancel_existing: bool,
+        min_context_slot: Option<u64>,
+    ) -> (Result<OrdersOutcome>, Option<u64>)
+    where
+        F: Fn(&MarketSnapshot, &Seat) -> Vec<OrderSpec>,
+    {
+        let snapshot =
+            match MarketSnapshot::load_at(&self.chain, self.program_id, market, min_context_slot)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => return (Err(error), None),
+            };
+        let loaded = Some(snapshot.slot);
+        let result = async {
+            let plan = plan_batch(&snapshot, self.payer(), build, cancel_existing)?;
+            let ix = self.batch_update(market, plan.seat.index, plan.cancels, plan.orders);
+            let transaction = self.submit(vec![ix], &[]).await?;
+            let after = self.load_market_after(market, &transaction).await?;
+            let resting = after.book.orders_of(plan.seat.index).copied().collect();
+            Ok(OrdersOutcome {
+                transaction: Some(transaction),
+                resting,
+                placed: plan.placed,
+            })
+        }
+        .await;
+        (result, loaded)
+    }
+
+    /// Cancel every resting order owned by the payer's seat.
+    pub async fn cancel_all_orders(&self, market: Pubkey) -> Result<OrdersOutcome> {
+        self.run(
+            "cancel_all_orders",
+            market,
+            retry_stale(
+                "cancel_all_orders",
+                market,
+                STALE_CANCEL_ATTEMPTS,
+                |min_context_slot| self.cancel_all_once(market, min_context_slot),
+            ),
+        )
+        .await
+    }
+
+    async fn cancel_all_once(
+        &self,
+        market: Pubkey,
+        min_context_slot: Option<u64>,
+    ) -> (Result<OrdersOutcome>, Option<u64>) {
+        let snapshot =
+            match MarketSnapshot::load_at(&self.chain, self.program_id, market, min_context_slot)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => return (Err(error), None),
+            };
+        let loaded = Some(snapshot.slot);
+        let result = async {
             let seat = snapshot
                 .book
                 .seat(&self.payer())
@@ -738,18 +745,12 @@ impl ManifestClient {
                     market,
                     trader: self.payer(),
                 })?;
-            let cancels: Vec<CancelOrderParams> = snapshot
-                .book
-                .orders_of(seat.index)
-                .map(|order| CancelOrderParams {
-                    order_sequence_number: order.sequence_number,
-                    order_index_hint: Some(order.index),
-                })
-                .collect();
+            let cancels = cancels_of(&snapshot.book, seat.index);
             if cancels.is_empty() {
                 return Ok(OrdersOutcome {
                     transaction: None,
                     resting: vec![],
+                    placed: vec![],
                 });
             }
             let ix = self.batch_update(market, seat.index, cancels, vec![]);
@@ -758,8 +759,11 @@ impl ManifestClient {
             Ok(OrdersOutcome {
                 transaction: Some(transaction),
                 resting: after.book.orders_of(seat.index).copied().collect(),
+                placed: vec![],
             })
         }
+        .await;
+        (result, loaded)
     }
 
     pub async fn swap_exact_in(&self, params: SwapExactInParams) -> Result<SwapOutcome> {
@@ -1133,6 +1137,9 @@ pub struct OrdersOutcome {
     pub transaction: Option<TransactionOutcome>,
     /// The seat's resting orders after the transaction.
     pub resting: Vec<BookOrder>,
+    /// The orders the batch placed, after fitting them to the seat's
+    /// balance: sizes can be smaller than requested and orders dropped.
+    pub placed: Vec<OrderSpec>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1169,6 +1176,218 @@ pub struct SwapOutcome {
     pub quote: SwapQuote,
     pub executed: ExecutedSwap,
     pub accounts: SwapAccounts,
+}
+
+/// Quote atoms each placed bid keeps in reserve beyond its lock: a bid that
+/// matches resting asks before it rests pays per-fill rounding.
+pub const BID_MARGIN_ATOMS: u64 = 1;
+
+/// Run `attempt` up to `attempts` times while it fails with a stale cancel.
+/// Each attempt gets the minimum context slot its market read must reach,
+/// and returns the slot it read the market at (if it got that far): a
+/// retry must not read the pre-fill book from a lagging node again.
+async fn retry_stale<T, F, Fut>(
+    action: &'static str,
+    market: Pubkey,
+    attempts: usize,
+    mut attempt: F,
+) -> Result<T>
+where
+    F: FnMut(Option<u64>) -> Fut,
+    Fut: std::future::Future<Output = (Result<T>, Option<u64>)>,
+{
+    let mut min_context_slot = None;
+    let mut tries = 1;
+    loop {
+        match attempt(min_context_slot).await {
+            (Err(error), loaded_slot) if error.is_stale_cancel() && tries < attempts => {
+                counter!("manifest_stale_cancel_retries_total", "action" => action).increment(1);
+                warn!(%market, error = %error, "a cancelled order was filled first; retrying on a fresh book");
+                min_context_slot = retry_min_context_slot(&error, loaded_slot);
+                tries += 1;
+            }
+            (result, _) => return result,
+        }
+    }
+}
+
+/// Where a retry after `error` must read from: a landed failure's slot
+/// (the fill is in an earlier slot), else past the slot the failed attempt
+/// read (preflight gives no slot; the fill was not in that read).
+fn retry_min_context_slot(error: &ManifestError, loaded_slot: Option<u64>) -> Option<u64> {
+    match error {
+        ManifestError::ExecutionFailure { slot, .. } => Some(*slot),
+        _ => loaded_slot.map(|slot| slot.saturating_add(1)),
+    }
+}
+
+fn cancels_of(book: &Book, trader_index: u32) -> Vec<CancelOrderParams> {
+    book.orders_of(trader_index)
+        .map(|order| CancelOrderParams {
+            order_sequence_number: order.sequence_number,
+            order_index_hint: Some(order.index),
+        })
+        .collect()
+}
+
+/// A batch ready to send: the seat, its cancels, and the fitted orders.
+struct BatchPlan {
+    seat: Seat,
+    cancels: Vec<CancelOrderParams>,
+    orders: Vec<PlaceOrderParams>,
+    placed: Vec<OrderSpec>,
+}
+
+/// Size, convert and fit the orders `build` asks for on `snapshot`.
+fn plan_batch<F>(
+    snapshot: &MarketSnapshot,
+    payer: Pubkey,
+    build: &F,
+    cancel_existing: bool,
+) -> Result<BatchPlan>
+where
+    F: Fn(&MarketSnapshot, &Seat) -> Vec<OrderSpec>,
+{
+    let book = &snapshot.book;
+    let seat = book.seat(&payer).ok_or(ManifestError::MissingSeat {
+        market: snapshot.market,
+        trader: payer,
+    })?;
+    let requested = build(snapshot, &seat);
+    if requested.is_empty() {
+        return Err(ManifestError::InvalidInput(
+            "at least one order is required".to_owned(),
+        ));
+    }
+    let params = requested
+        .iter()
+        .map(|order| {
+            ensure_positive(order.price, "order price")?;
+            let (mantissa, exponent) = price_to_mantissa(
+                order.price,
+                book.base_decimals,
+                book.quote_decimals,
+                order.side == Side::Bid,
+            )?;
+            Ok(PlaceOrderParams {
+                base_atoms: ui_to_raw(order.base_amount, book.base_decimals)?,
+                price_mantissa: mantissa,
+                price_exponent: exponent,
+                is_bid: order.side == Side::Bid,
+                last_valid_slot: 0,
+                order_type: OrderType::Limit,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (cancels, (base_budget, quote_budget)) = if cancel_existing {
+        let (base, quote) = book.locked_by(seat.index).map_err(quote_error)?;
+        (
+            cancels_of(book, seat.index),
+            (
+                seat.base_withdrawable.saturating_add(base),
+                seat.quote_withdrawable.saturating_add(quote),
+            ),
+        )
+    } else {
+        (vec![], (seat.base_withdrawable, seat.quote_withdrawable))
+    };
+    let fitted = fit_orders(&params, base_budget, quote_budget)?;
+    let mut orders = Vec::with_capacity(params.len());
+    let mut placed = Vec::with_capacity(params.len());
+    for ((mut param, spec), base_atoms) in params.into_iter().zip(&requested).zip(fitted) {
+        if base_atoms < param.base_atoms {
+            let side = if param.is_bid { "bid" } else { "ask" };
+            counter!("manifest_orders_trimmed_total", "side" => side).increment(1);
+        }
+        if base_atoms == 0 {
+            continue;
+        }
+        param.base_atoms = base_atoms;
+        orders.push(param);
+        placed.push(OrderSpec {
+            base_amount: Decimal::from_i128_with_scale(
+                i128::from(base_atoms),
+                u32::from(book.base_decimals),
+            ),
+            ..*spec
+        });
+    }
+    if orders.is_empty() && cancels.is_empty() {
+        let (mint, available) = match requested[0].side {
+            Side::Bid => (book.quote_mint, quote_budget),
+            Side::Ask => (book.base_mint, base_budget),
+        };
+        return Err(ManifestError::InsufficientBalance {
+            mint,
+            required: available.saturating_add(1),
+            available,
+        });
+    }
+    Ok(BatchPlan {
+        seat,
+        cancels,
+        orders,
+        placed,
+    })
+}
+
+/// Base atoms each of `orders` can keep so the batch is fundable from
+/// `base_budget` (asks lock their base) and `quote_budget` (bids lock
+/// [`book::locked_quote_atoms`] plus [`BID_MARGIN_ATOMS`]). Each side is
+/// funded best price first; the first order that does not fit is shrunk
+/// to what is left and every worse one gets 0.
+fn fit_orders(
+    orders: &[PlaceOrderParams],
+    base_budget: u64,
+    quote_budget: u64,
+) -> Result<Vec<u64>> {
+    let prices = orders
+        .iter()
+        .map(|order| book::price_raw(order.price_mantissa, order.price_exponent))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(quote_error)?;
+    let mut fitted = vec![0_u64; orders.len()];
+    for is_bid in [true, false] {
+        let mut side: Vec<usize> = (0..orders.len())
+            .filter(|&index| orders[index].is_bid == is_bid)
+            .collect();
+        // Best first: highest bid, lowest ask (stable on ties).
+        side.sort_by(|&a, &b| {
+            if is_bid {
+                prices[b].cmp(&prices[a])
+            } else {
+                prices[a].cmp(&prices[b])
+            }
+        });
+        let mut remaining = if is_bid { quote_budget } else { base_budget };
+        for index in side {
+            let wanted = orders[index].base_atoms;
+            let base = if is_bid {
+                let room = remaining.saturating_sub(BID_MARGIN_ATOMS);
+                let base = wanted.min(book::max_bid_base_atoms(prices[index], room));
+                if base > 0 {
+                    let lock =
+                        book::locked_quote_atoms(prices[index], base).map_err(quote_error)?;
+                    remaining = remaining.saturating_sub(lock.saturating_add(BID_MARGIN_ATOMS));
+                }
+                base
+            } else {
+                let base = wanted.min(remaining);
+                remaining -= base;
+                base
+            };
+            fitted[index] = base;
+            if base < wanted {
+                // Budget exhausted: nothing worse is placed.
+                remaining = 0;
+            }
+        }
+    }
+    Ok(fitted)
+}
+
+fn quote_error(error: BookError) -> ManifestError {
+    ManifestError::Quote(error.to_string())
 }
 
 /// Attempts for a batch that cancels resting orders. A taker can fill one
@@ -1546,5 +1765,317 @@ mod quote_tests {
         let bids = snapshot(vec![order_at(2 * D18, 100)], vec![]);
         assert!(bids.quote(base, quote, 150, true, 50).is_err());
         assert!(bids.quote(base, quote, 100, true, 50).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::str::FromStr;
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+
+    /// Drive a future that never waits (the fakes here are all ready).
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("fake future is not ready"),
+        }
+    }
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).expect("decimal")
+    }
+
+    fn param(
+        is_bid: bool,
+        price: Decimal,
+        base_atoms: u64,
+        decimals: (u8, u8),
+    ) -> PlaceOrderParams {
+        let (price_mantissa, price_exponent) =
+            price_to_mantissa(price, decimals.0, decimals.1, is_bid).expect("price");
+        PlaceOrderParams {
+            base_atoms,
+            price_mantissa,
+            price_exponent,
+            is_bid,
+            last_valid_slot: 0,
+            order_type: OrderType::Limit,
+        }
+    }
+
+    /// Quote and base the fitted orders need, bid margin included.
+    fn needs(orders: &[PlaceOrderParams], fitted: &[u64]) -> (u64, u64) {
+        let (mut base, mut quote) = (0_u64, 0_u64);
+        for (order, &atoms) in orders.iter().zip(fitted) {
+            if atoms == 0 {
+                continue;
+            }
+            if order.is_bid {
+                let price =
+                    book::price_raw(order.price_mantissa, order.price_exponent).expect("in range");
+                quote +=
+                    book::locked_quote_atoms(price, atoms).expect("in range") + BID_MARGIN_ATOMS;
+            } else {
+                base += atoms;
+            }
+        }
+        (base, quote)
+    }
+
+    #[test]
+    fn a_drained_bid_ladder_is_fitted_to_the_quote() {
+        // 6/6 decimals, Q = 10 USDC over 3 levels, each sized as
+        // floor(Q / L / p): unfitted, the locks round up past Q.
+        let quote = 10_000_000_u64;
+        let orders: Vec<_> = ["0.4990", "0.4983", "0.4975"]
+            .iter()
+            .map(|price| {
+                let base = (Decimal::from(quote / 3) / d(price)).floor();
+                param(
+                    true,
+                    d(price),
+                    u64::try_from(base.mantissa()).expect("in range"),
+                    (6, 6),
+                )
+            })
+            .collect();
+        let unfitted: Vec<u64> = orders.iter().map(|o| o.base_atoms).collect();
+        assert!(
+            needs(&orders, &unfitted).1 > quote,
+            "the bug: over-committed"
+        );
+        let fitted = fit_orders(&orders, 0, quote).expect("fits");
+        assert!(needs(&orders, &fitted).1 <= quote);
+        // Best two untouched, the worst shrunk rather than dropped.
+        assert_eq!(fitted[..2], unfitted[..2]);
+        assert!(fitted[2] > 0 && fitted[2] < unfitted[2]);
+    }
+
+    #[test]
+    fn fitting_never_exceeds_the_budget() {
+        // Deterministic pseudo-random cases (no property-test dependency).
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound.max(1)
+        };
+        for _ in 0..5_000 {
+            let decimals = [(6, 6), (9, 6), (5, 6), (6, 9)][next(4) as usize];
+            let base_budget = next(1_000_000_000_000);
+            let quote_budget = next(1_000_000_000_000);
+            let levels = 1 + next(8);
+            let mut orders = Vec::new();
+            for _ in 0..levels {
+                // p in (0, 2), four to eight significant figures.
+                let price = Decimal::new(1 + next(199_999_999) as i64, 8).normalize();
+                let wanted_quote = Decimal::from(next(quote_budget.max(1) * 2));
+                let bid_base = (wanted_quote / price)
+                    .floor()
+                    .min(Decimal::from(u64::MAX / 4));
+                let bid_base =
+                    u64::try_from(bid_base.mantissa()).unwrap_or(0) / 10_u64.pow(bid_base.scale());
+                orders.push(param(true, price, bid_base, decimals));
+                orders.push(param(
+                    false,
+                    price * d("1.01"),
+                    next(base_budget.max(1) * 2),
+                    decimals,
+                ));
+            }
+            let fitted = fit_orders(&orders, base_budget, quote_budget).expect("fits");
+            let (base, quote) = needs(&orders, &fitted);
+            assert!(base <= base_budget, "asks {base} > {base_budget}");
+            assert!(quote <= quote_budget, "bids {quote} > {quote_budget}");
+            for (order, &atoms) in orders.iter().zip(&fitted) {
+                assert!(atoms <= order.base_atoms);
+            }
+            // Worst-price-first: a trimmed order has nothing worse behind it.
+            for (i, order) in orders.iter().enumerate() {
+                if fitted[i] < order.base_atoms {
+                    let price = book::price_raw(order.price_mantissa, order.price_exponent)
+                        .expect("in range");
+                    for (j, other) in orders.iter().enumerate() {
+                        let other_price =
+                            book::price_raw(other.price_mantissa, other.price_exponent)
+                                .expect("in range");
+                        let worse = if order.is_bid {
+                            other_price < price
+                        } else {
+                            other_price > price
+                        };
+                        if other.is_bid == order.is_bid && worse {
+                            assert_eq!(fitted[j], 0, "worse order kept past a trimmed one");
+                        }
+                    }
+                }
+            }
+            // A batch that already fits is left alone.
+            let full: Vec<u64> = orders.iter().map(|o| o.base_atoms).collect();
+            let (base, quote) = needs(&orders, &full);
+            if base <= base_budget && quote <= quote_budget {
+                assert_eq!(fitted, full);
+            }
+        }
+    }
+
+    fn snapshot(seat: Seat, bids: Vec<BookOrder>, slot: u64) -> MarketSnapshot {
+        MarketSnapshot {
+            program_id: Pubkey::default(),
+            market: Pubkey::new_from_array([5; 32]),
+            book: Book {
+                base_mint: Pubkey::new_from_array([1; 32]),
+                quote_mint: Pubkey::new_from_array([2; 32]),
+                base_vault: Pubkey::default(),
+                quote_vault: Pubkey::default(),
+                base_decimals: 6,
+                quote_decimals: 6,
+                bids,
+                asks: vec![],
+                seats: vec![seat],
+                has_free_block: false,
+            },
+            base_token_program: Pubkey::default(),
+            quote_token_program: Pubkey::default(),
+            slot,
+        }
+    }
+
+    fn stale(slot: u64) -> ManifestError {
+        ManifestError::ExecutionFailure {
+            signature: Signature::default(),
+            slot,
+            error: "InstructionError(0, Custom(10))".to_owned(),
+        }
+    }
+
+    #[test]
+    fn cancels_refund_into_the_budget() {
+        let trader = Pubkey::new_from_array([9; 32]);
+        let seat = Seat {
+            index: 80,
+            trader,
+            base_withdrawable: 0,
+            quote_withdrawable: 1_000,
+        };
+        // A resting bid of 4_000 base at 0.5 locks 2_000 quote.
+        let resting = BookOrder {
+            index: 160,
+            price_raw: 500_000_000_000_000_000,
+            base_atoms: 4_000,
+            sequence_number: 7,
+            trader_index: 80,
+            last_valid_slot: 0,
+            is_global: false,
+        };
+        let market = snapshot(seat, vec![resting], 10);
+        let build = |_: &MarketSnapshot, _: &Seat| {
+            vec![OrderSpec {
+                side: Side::Bid,
+                price: d("0.5"),
+                base_amount: d("0.01"),
+            }]
+        };
+        // Replacing: 1_000 free + 2_000 refunded, less the margin.
+        let plan = plan_batch(&market, trader, &build, true).expect("plan");
+        assert_eq!(plan.cancels.len(), 1);
+        assert_eq!(plan.orders[0].base_atoms, 5_998);
+        assert_eq!(plan.placed[0].base_amount, d("0.005998"));
+        // Placing alongside: only the free 1_000.
+        let plan = plan_batch(&market, trader, &build, false).expect("plan");
+        assert_eq!(plan.orders[0].base_atoms, 1_998);
+        // Nothing fundable and nothing to cancel is an error, not a send.
+        let empty = snapshot(
+            Seat {
+                quote_withdrawable: 0,
+                ..seat
+            },
+            vec![],
+            10,
+        );
+        assert!(matches!(
+            plan_batch(&empty, trader, &build, true),
+            Err(ManifestError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[test]
+    fn a_stale_retry_resizes_from_a_pinned_post_fill_read() {
+        let trader = Pubkey::new_from_array([9; 32]);
+        let seat = |quote| Seat {
+            index: 80,
+            trader,
+            base_withdrawable: 0,
+            quote_withdrawable: quote,
+        };
+        // Attempt 1 sees 10 USDC; a fill then leaves 4.
+        let books = [
+            snapshot(seat(10_000_000), vec![], 70),
+            snapshot(seat(4_000_000), vec![], 78),
+        ];
+        let seen = RefCell::new(Vec::new());
+        let reads = RefCell::new(Vec::new());
+        let build = |_: &MarketSnapshot, seat: &Seat| {
+            seen.borrow_mut().push(seat.quote_withdrawable);
+            vec![OrderSpec {
+                side: Side::Bid,
+                price: d("1"),
+                base_amount: d("10"),
+            }]
+        };
+        let outcome = ready(retry_stale(
+            "replace_orders",
+            Pubkey::default(),
+            2,
+            |min_slot| {
+                let attempt = reads.borrow().len();
+                reads.borrow_mut().push(min_slot);
+                let market = &books[attempt];
+                let result = plan_batch(market, trader, &build, true).and_then(|plan| {
+                    if attempt == 0 {
+                        Err(stale(77))
+                    } else {
+                        Ok(plan)
+                    }
+                });
+                async move { (result, Some(market.slot)) }
+            },
+        ))
+        .expect("second attempt");
+        assert_eq!(*seen.borrow(), vec![10_000_000, 4_000_000]);
+        assert_eq!(*reads.borrow(), vec![None, Some(77)]);
+        assert_eq!(outcome.orders[0].base_atoms, 3_999_999);
+    }
+
+    #[test]
+    fn a_preflight_stale_cancel_reads_past_the_failed_snapshot() {
+        let simulated = ManifestError::SimulationFailure {
+            error: "InstructionError(0, Custom(10))".to_owned(),
+            logs: vec![],
+        };
+        assert_eq!(retry_min_context_slot(&simulated, Some(70)), Some(71));
+        assert_eq!(retry_min_context_slot(&stale(77), Some(70)), Some(77));
+        // The retry budget still caps attempts.
+        let calls = RefCell::new(0);
+        let result: Result<()> = ready(retry_stale(
+            "cancel_all_orders",
+            Pubkey::default(),
+            2,
+            |_| {
+                *calls.borrow_mut() += 1;
+                async { (Err(stale(5)), Some(4)) }
+            },
+        ));
+        assert!(result.expect_err("fails").is_stale_cancel());
+        assert_eq!(*calls.borrow(), 2);
     }
 }

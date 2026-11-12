@@ -384,6 +384,69 @@ fn quote_for_base(price_raw: u128, base_atoms: u64, round_up: bool) -> Result<u6
     u64::try_from(quote).map_err(|_| BookError::Overflow)
 }
 
+/// Quote atoms a resting bid of `base_atoms` at `price_raw` locks in the
+/// seat: `ceil(price × base)`, as the program rounds against the maker.
+pub fn locked_quote_atoms(price_raw: u128, base_atoms: u64) -> Result<u64, BookError> {
+    quote_for_base(price_raw, base_atoms, true)
+}
+
+/// The largest base amount whose bid lock at `price_raw` fits in
+/// `quote_atoms` (the inverse of [`locked_quote_atoms`]).
+pub fn max_bid_base_atoms(price_raw: u128, quote_atoms: u64) -> u64 {
+    if price_raw == 0 {
+        return 0;
+    }
+    // floor(quote × 1e18 / price) never locks more than `quote`:
+    // price × floor(q·D/p) ≤ q·D, so its ceil is ≤ q.
+    base_for_quote(price_raw, quote_atoms, false).unwrap_or(u64::MAX)
+}
+
+/// The program's price (quote atoms per base atom × 10^18) for an order's
+/// `mantissa × 10^exponent`.
+pub fn price_raw(mantissa: u32, exponent: i8) -> Result<u128, BookError> {
+    let shift = i32::from(exponent) + 18;
+    if shift < 0 {
+        return Err(BookError::Overflow);
+    }
+    10_u128
+        .checked_pow(shift.unsigned_abs())
+        .and_then(|scale| scale.checked_mul(u128::from(mantissa)))
+        .ok_or(BookError::Overflow)
+}
+
+impl Book {
+    /// `(base, quote)` atoms the resting orders of the seat at
+    /// `trader_index` lock: asks lock their base, bids their
+    /// [`locked_quote_atoms`]. Withdrawable plus this is what the seat holds.
+    pub fn locked_by(&self, trader_index: u32) -> Result<(u64, u64), BookError> {
+        let mut base = 0_u64;
+        for ask in self.asks.iter().filter(|o| o.trader_index == trader_index) {
+            base = base
+                .checked_add(ask.base_atoms)
+                .ok_or(BookError::Overflow)?;
+        }
+        let mut quote = 0_u64;
+        for bid in self.bids.iter().filter(|o| o.trader_index == trader_index) {
+            quote = quote
+                .checked_add(locked_quote_atoms(bid.price_raw, bid.base_atoms)?)
+                .ok_or(BookError::Overflow)?;
+        }
+        Ok((base, quote))
+    }
+
+    /// `(base, quote)` atoms the seat holds: withdrawable plus locked.
+    pub fn holdings(&self, seat: &Seat) -> Result<(u64, u64), BookError> {
+        let (base, quote) = self.locked_by(seat.index)?;
+        Ok((
+            base.checked_add(seat.base_withdrawable)
+                .ok_or(BookError::Overflow)?,
+            quote
+                .checked_add(seat.quote_withdrawable)
+                .ok_or(BookError::Overflow)?,
+        ))
+    }
+}
+
 fn base_for_quote(price_raw: u128, quote_atoms: u64, round_up: bool) -> Option<u64> {
     if price_raw == 0 {
         return Some(0);
@@ -690,5 +753,60 @@ mod tests {
         let mut wrong = borsh::to_vec(&fixed).expect("serializes");
         wrong.extend_from_slice(&dynamic);
         assert!(Book::parse(&wrong).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn bid_locks_round_up_and_invert() {
+        // 3 base at 0.5 quote/base locks 2 quote atoms, not 1.5.
+        assert_eq!(locked_quote_atoms(D18 / 2, 3), Ok(2));
+        assert_eq!(max_bid_base_atoms(D18 / 2, 2), 4);
+        assert_eq!(max_bid_base_atoms(D18 / 3, 1), 3);
+        for quote in 0..200 {
+            for price in [D18 / 3, D18 / 7 * 2, 3 * D18 / 2, 17] {
+                let base = max_bid_base_atoms(price, quote);
+                assert!(locked_quote_atoms(price, base).expect("in range") <= quote);
+                assert!(locked_quote_atoms(price, base + 1).expect("in range") > quote);
+            }
+        }
+        assert_eq!(price_raw(1_500_000_000, -12), Ok(1_500_000_000_000_000));
+        assert_eq!(price_raw(5, 0), Ok(5 * D18));
+    }
+
+    #[test]
+    fn holdings_add_what_orders_lock() {
+        let order = |index, price_raw, base_atoms, trader_index| BookOrder {
+            index,
+            price_raw,
+            base_atoms,
+            sequence_number: 0,
+            trader_index,
+            last_valid_slot: 0,
+            is_global: false,
+        };
+        let book = Book {
+            base_mint: Pubkey::default(),
+            quote_mint: Pubkey::default(),
+            base_vault: Pubkey::default(),
+            quote_vault: Pubkey::default(),
+            base_decimals: 6,
+            quote_decimals: 6,
+            bids: vec![order(0, D18 / 2, 3, 1), order(80, D18 / 2, 9, 2)],
+            asks: vec![order(160, D18, 5, 1)],
+            seats: vec![],
+            has_free_block: false,
+        };
+        let seat = Seat {
+            index: 1,
+            trader: Pubkey::default(),
+            base_withdrawable: 10,
+            quote_withdrawable: 20,
+        };
+        assert_eq!(book.locked_by(1), Ok((5, 2)));
+        assert_eq!(book.holdings(&seat), Ok((15, 22)));
     }
 }
